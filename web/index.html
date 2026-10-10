@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>公文智脑 · 企业公文知识库平台</title>
+<style>
+/* =========================================================
+   设计令牌 (Design Tokens) — 深墨蓝科技主题
+   全部系统字体栈，零外部依赖，契合纯内网部署
+   ========================================================= */
+:root{
+  /* 底色 — 深墨蓝，非纯黑 */
+  --ink-950:#070B14;
+  --ink-900:#0A0F1C;
+  --ink-850:#0D1424;
+  --ink-800:#111B30;
+  --ink-750:#16223B;
+  --ink-700:#1C2A47;
+  --ink-600:#243456;
+
+  /* 线条 */
+  --line:rgba(150,178,220,.10);
+  --line-2:rgba(150,178,220,.18);
+  --line-strong:rgba(150,178,220,.30);
+
+  /* 文本 */
+  --t1:#EAF1FB;     /* 主文本 */
+  --t2:#A6B7D2;     /* 次文本 */
+  --t3:#6E81A2;     /* 弱文本 */
+  --t4:#4E6081;     /* 极弱 */
+
+  /* 品牌 — 智蓝（唯一主色） */
+  --brand:#3D7EFF;
+  --brand-600:#2F6AE0;
+  --brand-soft:rgba(61,126,255,.14);
+  --brand-line:rgba(61,126,255,.42);
+  --brand-glow:rgba(61,126,255,.35);
+
+  /* 公文红 — 仅作品牌印章 / 文头 */
+  --seal:#C0392B;
+  --seal-soft:rgba(192,57,43,.14);
+
+  /* 语义色 — 仅密级 / 状态 */
+  --ok:#2FBF71;
+  --ok-soft:rgba(47,191,113,.14);
+  --warn:#F2B53C;
+  --warn-soft:rgba(242,181,60,.14);
+  --danger:#E5484D;
+  --danger-soft:rgba(229,72,77,.14);
+  --info:#3D7EFF;
+
+  /* 字体 */
+  --f-display:"Source Han Serif SC","Noto Serif SC","Songti SC","SimSun",serif;
+  --f-ui:"PingFang SC","Microsoft YaHei","Source Han Sans SC","Noto Sans SC",system-ui,sans-serif;
+  --f-mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+
+  /* 间距 (4px 基准) */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px;
+  --s6:24px; --s8:32px; --s10:40px; --s12:48px; --s16:64px;
+
+  /* 圆角 */
+  --r-s:8px; --r:12px; --r-l:16px; --r-xl:20px; --r-pill:999px;
+
+  /* 阴影 */
+  --sh-1:0 1px 2px rgba(0,0,0,.3);
+  --sh-2:0 6px 18px -6px rgba(0,0,0,.5);
+  --sh-3:0 18px 50px -18px rgba(0,0,0,.65);
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--f-ui);
+  background:var(--ink-900);
+  color:var(--t1);
+  font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  overflow:hidden;
+}
+/* 背景：深墨蓝 + 顶部品牌辉光 + 极淡网格 */
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(900px 520px at 18% -8%, var(--brand-glow), transparent 60%),
+    radial-gradient(700px 500px at 105% 110%, rgba(192,57,43,.07), transparent 55%),
+    linear-gradient(180deg,var(--ink-900),var(--ink-950));
+}
+body::after{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.45;
+  background-image:
+    linear-gradient(rgba(150,178,220,.04) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(150,178,220,.04) 1px,transparent 1px);
+  background-size:46px 46px;
+  -webkit-mask-image:radial-gradient(circle at 50% 30%,#000,transparent 75%);
+  mask-image:radial-gradient(circle at 50% 30%,#000,transparent 75%);
+}
+
+/* ============ 应用外壳 ============ */
+.app{position:relative;z-index:1;display:grid;grid-template-columns:248px 1fr;height:100dvh}
+/* 侧栏 */
+.side{background:linear-gradient(180deg,var(--ink-850),var(--ink-900));border-right:1px solid var(--line);display:flex;flex-direction:column;padding:var(--s4) var(--s3);gap:var(--s2)}
+.brand{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) var(--s2) var(--s5);border-bottom:1px solid var(--line)}
+.brand .mark{width:40px;height:40px;flex:0 0 40px;border-radius:11px;background:linear-gradient(150deg,var(--brand),#2456c8);display:grid;place-items:center;box-shadow:0 6px 18px -4px var(--brand-glow)}
+.brand .mark svg{width:22px;height:22px}
+.brand .name{font-family:var(--f-display);font-size:18px;letter-spacing:1px;color:var(--t1);font-weight:600}
+.brand .sub{font-size:11px;color:var(--t3);letter-spacing:.5px;margin-top:1px}
+
+.nav{display:flex;flex-direction:column;gap:3px;margin-top:var(--s3)}
+.nav .grp{font-size:11px;color:var(--t4);letter-spacing:1px;padding:var(--s4) var(--s3) var(--s2);text-transform:uppercase}
+.nav a{display:flex;align-items:center;gap:var(--s3);padding:10px var(--s3);border-radius:var(--r-s);color:var(--t2);text-decoration:none;font-size:13.5px;position:relative;transition:background .18s var(--ease),color .18s var(--ease)}
+.nav a svg{width:18px;height:18px;flex:0 0 18px;opacity:.8}
+.nav a:hover{background:var(--ink-750);color:var(--t1)}
+.nav a.active{background:var(--brand-soft);color:#fff}
+.nav a.active svg{opacity:1;color:var(--brand)}
+.nav a.active::before{content:"";position:absolute;left:-12px;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--brand);box-shadow:0 0 12px var(--brand-glow)}
+.nav .tag{margin-left:auto;font-size:10px;background:var(--ink-700);color:var(--t3);padding:2px 7px;border-radius:var(--r-pill);font-family:var(--f-mono)}
+
+.side-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:var(--s4);display:flex;flex-direction:column;gap:var(--s3)}
+.env{display:flex;align-items:center;gap:var(--s2);font-size:12px;color:var(--t2);background:var(--ink-800);border:1px solid var(--line);border-radius:var(--r-s);padding:10px var(--s3)}
+.env .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft);animation:breathe 2.6s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.45}}
+.usr{display:flex;align-items:center;gap:var(--s3)}
+.usr .av{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--ink-600),var(--brand-600));display:grid;place-items:center;font-size:13px;color:#fff;font-family:var(--f-display)}
+.usr .meta b{font-size:13px;color:var(--t1);font-weight:600;display:block}
+.usr .meta span{font-size:11px;color:var(--t3)}
+
+/* 主区 */
+.main{display:flex;flex-direction:column;min-width:0;height:100dvh}
+.topbar{height:62px;flex:0 0 62px;display:flex;align-items:center;gap:var(--s4);padding:0 var(--s6);border-bottom:1px solid var(--line);background:rgba(13,20,36,.6);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.crumb{font-size:13px;color:var(--t3)}
+.crumb b{color:var(--t1);font-weight:600;font-family:var(--f-display);letter-spacing:.5px}
+.search{flex:1;max-width:460px;margin:0 auto;position:relative}
+.search input{width:100%;height:40px;background:var(--ink-800);border:1px solid var(--line-2);border-radius:var(--r-pill);padding:0 var(--s5) 0 42px;color:var(--t1);font-size:13.5px;font-family:var(--f-ui);transition:border .18s,box-shadow .18s}
+.search input:focus{outline:none;border-color:var(--brand-line);box-shadow:0 0 0 4px var(--brand-soft)}
+.search svg{position:absolute;left:14px;top:11px;width:18px;height:18px;color:var(--t3)}
+.search .kbd{position:absolute;right:12px;top:9px;font-size:11px;color:var(--t4);border:1px solid var(--line-2);border-radius:6px;padding:2px 7px;font-family:var(--f-mono)}
+.topact{display:flex;align-items:center;gap:var(--s2)}
+.iconbtn{width:38px;height:38px;border-radius:var(--r-s);background:var(--ink-800);border:1px solid var(--line);display:grid;place-items:center;color:var(--t2);cursor:pointer;transition:.18s var(--ease)}
+.iconbtn:hover{color:var(--t1);border-color:var(--line-2);background:var(--ink-750)}
+.iconbtn svg{width:18px;height:18px}
+
+.content{flex:1;overflow-y:auto;padding:var(--s6) var(--s6) var(--s10);scroll-behavior:smooth}
+.content::-webkit-scrollbar{width:10px}
+.content::-webkit-scrollbar-thumb{background:var(--ink-700);border-radius:10px;border:2px solid transparent;background-clip:padding-box}
+.content::-webkit-scrollbar-thumb:hover{background:var(--ink-600);background-clip:padding-box}
+
+/* 视图切换 */
+.view{display:none;animation:fade .4s var(--ease)}
+.view.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.vhead{display:flex;align-items:flex-end;justify-content:space-between;gap:var(--s4);margin-bottom:var(--s5)}
+.vhead h1{font-family:var(--f-display);font-size:26px;font-weight:600;letter-spacing:.5px}
+.vhead .desc{color:var(--t3);font-size:13px;margin-top:6px;max-width:60ch}
+.vhead .acts{display:flex;gap:var(--s2);flex-shrink:0}
+
+/* 按钮 */
+.btn{display:inline-flex;align-items:center;gap:8px;height:38px;padding:0 16px;border-radius:var(--r-s);font-size:13.5px;font-family:var(--f-ui);cursor:pointer;border:1px solid var(--line-2);background:var(--ink-750);color:var(--t1);transition:.18s var(--ease);white-space:nowrap}
+.btn svg{width:16px;height:16px}
+.btn:hover{background:var(--ink-700);border-color:var(--line-strong)}
+.btn.primary{background:var(--brand);border-color:transparent;color:#fff;box-shadow:0 8px 20px -8px var(--brand-glow)}
+.btn.primary:hover{background:var(--brand-600)}
+.btn.ghost{background:transparent}
+.btn.sm{height:32px;padding:0 12px;font-size:12.5px}
+
+/* 卡片 / 表面 */
+.card{background:linear-gradient(180deg,var(--ink-800),var(--ink-850));border:1px solid var(--line);border-radius:var(--r-l);padding:var(--s5);box-shadow:var(--sh-1)}
+.card.hov{transition:transform .2s var(--ease),border-color .2s,box-shadow .2s}
+.card.hov:hover{transform:translateY(-3px);border-color:var(--line-2);box-shadow:var(--sh-2)}
+
+/* 网格 */
+.grid{display:grid;gap:var(--s4)}
+.bento{grid-template-columns:repeat(12,1fr)}
+.span3{grid-column:span 3}.span4{grid-column:span 4}.span5{grid-column:span 5}
+.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span9{grid-column:span 9}.span12{grid-column:span 12}
+
+/* KPI */
+.kpi{display:flex;flex-direction:column;gap:var(--s2)}
+.kpi .lab{font-size:12.5px;color:var(--t3);display:flex;align-items:center;gap:8px}
+.kpi .lab svg{width:15px;height:15px;color:var(--brand)}
+.kpi .val{font-family:var(--f-mono);font-size:30px;font-weight:600;letter-spacing:-.5px;color:var(--t1);line-height:1.1}
+.kpi .val small{font-size:14px;color:var(--t3);font-family:var(--f-ui);margin-left:4px}
+.kpi .trend{font-size:12px;display:flex;align-items:center;gap:5px}
+.kpi .trend.up{color:var(--ok)}.kpi .trend.down{color:var(--danger)}
+
+/* 徽标 / 密级 */
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-family:var(--f-ui);padding:3px 9px;border-radius:var(--r-pill);border:1px solid transparent;white-space:nowrap}
+.badge .d{width:6px;height:6px;border-radius:50%}
+.b-public{background:var(--ok-soft);color:#7fe0ab;border-color:rgba(47,191,113,.3)}
+.b-internal{background:var(--brand-soft);color:#9cc0ff;border-color:var(--brand-line)}
+.b-restricted{background:var(--warn-soft);color:#f4cd7e;border-color:rgba(242,181,60,.3)}
+.b-secret{background:var(--danger-soft);color:#f29aa0;border-color:rgba(229,72,77,.35)}
+.b-ok{background:var(--ok-soft);color:#7fe0ab}.b-warn{background:var(--warn-soft);color:#f4cd7e}.b-danger{background:var(--danger-soft);color:#f29aa0}
+
+/* 状态点 */
+.st{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--t2)}
+.st .d{width:8px;height:8px;border-radius:50%}
+.st .d.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.st .d.warn{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+.st .d.danger{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.st .d.run{background:var(--brand);box-shadow:0 0 0 3px var(--brand-soft);animation:breathe 2s infinite}
+
+/* 章节标题 */
+.sec-t{font-size:13px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin:var(--s6) 0 var(--s4);display:flex;align-items:center;gap:var(--s3)}
+.sec-t::after{content:"";flex:1;height:1px;background:var(--line)}
+
+/* 表格 */
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;color:var(--t3);font-weight:500;font-size:12px;letter-spacing:.5px;padding:0 var(--s4) var(--s3);border-bottom:1px solid var(--line-2)}
+.tbl td{padding:var(--s4);border-bottom:1px solid var(--line);color:var(--t2);vertical-align:middle}
+.tbl tr:hover td{background:var(--ink-800)}
+.tbl td .tt{color:var(--t1);font-weight:500}
+.tbl .mono{font-family:var(--f-mono);color:var(--t3);font-size:12px}
+.bar{height:6px;border-radius:6px;background:var(--ink-700);overflow:hidden;width:120px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--brand),#5b9bff);border-radius:6px}
+
+/* 标签 / chips */
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:var(--r-pill);background:var(--ink-750);border:1px solid var(--line);color:var(--t2)}
+.chip.on{background:var(--brand-soft);color:#9cc0ff;border-color:var(--brand-line)}
+.chip svg{width:13px;height:13px}
+
+/* 检索结果 / 问答 */
+.qa-wrap{display:grid;grid-template-columns:1fr 1fr;gap:var(--s4);align-items:start}
+.feed{display:flex;flex-direction:column;gap:var(--s3)}
+.rcard{background:var(--ink-800);border:1px solid var(--line);border-radius:var(--r);padding:var(--s4);cursor:pointer;transition:.18s var(--ease)}
+.rcard:hover{border-color:var(--brand-line);background:var(--ink-750)}
+.rcard .rt{display:flex;align-items:center;gap:var(--s2);margin-bottom:8px}
+.rcard .rt b{font-size:14px;color:var(--t1)}
+.rcard .rt .score{margin-left:auto;font-family:var(--f-mono);font-size:12px;color:var(--brand)}
+.rcard p{font-size:13px;color:var(--t2);line-height:1.65}
+.rcard p mark{background:var(--brand-soft);color:#bcd4ff;padding:0 3px;border-radius:3px}
+.rcard .meta{display:flex;align-items:center;gap:var(--s3);margin-top:10px;font-size:11.5px;color:var(--t4)}
+.ans{background:linear-gradient(180deg,var(--ink-800),var(--ink-850));border:1px solid var(--line-2);border-radius:var(--r-l);padding:var(--s5);position:sticky;top:0}
+.ans .q{font-family:var(--f-display);font-size:16px;color:var(--t1);margin-bottom:var(--s4);line-height:1.6}
+.ans .a{font-size:14px;color:var(--t2);line-height:1.85}
+.ans .a sup{color:var(--brand);font-family:var(--f-mono);font-size:11px;cursor:pointer;margin:0 1px}
+.ans .cite{margin-top:var(--s5);border-top:1px solid var(--line);padding-top:var(--s4)}
+.ans .cite h4{font-size:12px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin-bottom:var(--s3)}
+.ans .cite ol{list-style:none;display:flex;flex-direction:column;gap:8px}
+.ans .cite li{font-size:12.5px;color:var(--t2);display:flex;gap:10px;align-items:baseline}
+.ans .cite li .n{color:var(--brand);font-family:var(--f-mono);font-size:12px}
+.verify{margin-top:var(--s4);display:flex;flex-wrap:wrap;gap:var(--s2)}
+.vtag{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:5px 11px;border-radius:var(--r-pill);background:var(--ok-soft);color:#7fe0ab;border:1px solid rgba(47,191,113,.3)}
+.vtag svg{width:13px;height:13px}
+
+/* 起草 / 公文纸 */
+.doc-grid{display:grid;grid-template-columns:300px 1fr 280px;gap:var(--s4);align-items:start}
+.dtype{display:flex;flex-direction:column;gap:var(--s2)}
+.dtype .item{display:flex;align-items:center;gap:var(--s3);padding:12px;border-radius:var(--r-s);border:1px solid var(--line);background:var(--ink-800);cursor:pointer;transition:.18s var(--ease)}
+.dtype .item:hover{border-color:var(--line-2);background:var(--ink-750)}
+.dtype .item.on{border-color:var(--brand-line);background:var(--brand-soft)}
+.dtype .item .ic{width:34px;height:34px;border-radius:9px;background:var(--ink-700);display:grid;place-items:center;color:var(--brand);flex:0 0 34px}
+.dtype .item .ic svg{width:18px;height:18px}
+.dtype .item b{font-size:13.5px;color:var(--t1);display:block}
+.dtype .item span{font-size:11.5px;color:var(--t3)}
+/* 公文纸 */
+.paper{background:#FBF8F2;border:1px solid #e6ddc9;border-radius:10px;padding:46px 52px;color:#1c1c1c;box-shadow:var(--sh-3);min-height:560px;background-image:linear-gradient(180deg,#fffdf8,#f6f1e6)}
+.paper .head{text-align:center;border-bottom:3px double var(--seal);padding-bottom:18px;margin-bottom:26px}
+.paper .head .red{color:var(--seal);font-family:var(--f-display);font-size:30px;letter-spacing:6px;font-weight:700}
+.paper .head .docno{color:#555;font-size:13px;margin-top:10px;font-family:var(--f-mono)}
+.paper h2{text-align:center;font-family:var(--f-display);font-size:22px;font-weight:700;margin:8px 0 22px;letter-spacing:2px}
+.paper .body p{font-family:"Source Han Serif SC","SimSun",serif;font-size:15.5px;line-height:2.1;text-indent:2em;margin-bottom:10px;color:#222}
+.paper .body sup{color:#b00;font-size:11px;font-family:var(--f-mono)}
+.paper .sign{margin-top:40px;text-align:right;font-family:"Source Han Serif SC","SimSun",serif;font-size:15px;line-height:2}
+.paper .sign .seal{display:inline-block;margin-top:14px;width:96px;height:96px;border:3px solid var(--seal);border-radius:50%;color:var(--seal);display:grid;place-items:center;font-family:var(--f-display);font-size:13px;transform:rotate(-12deg);opacity:.85;line-height:1.3;text-align:center}
+/* 辅助面板 */
+.asst{display:flex;flex-direction:column;gap:var(--s3)}
+.asst .blk{background:var(--ink-800);border:1px solid var(--line);border-radius:var(--r);padding:var(--s4)}
+.asst .blk h4{font-size:12px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin-bottom:var(--s3);display:flex;align-items:center;gap:8px}
+.asst .blk h4 svg{width:14px;height:14px;color:var(--brand)}
+.asst .blk .row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;color:var(--t2)}
+.asst .blk .row:last-child{border-bottom:none}
+.asst .blk .row b{color:var(--t1);font-family:var(--f-mono);font-size:12.5px}
+
+/* 模板库 */
+.tpl-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s4)}
+.tpl{background:var(--ink-800);border:1px solid var(--line);border-radius:var(--r-l);overflow:hidden;transition:.2s var(--ease);cursor:pointer}
+.tpl:hover{transform:translateY(-4px);border-color:var(--brand-line);box-shadow:var(--sh-2)}
+.tpl .thumb{height:150px;background:#FBF8F2;padding:16px;border-bottom:1px solid var(--line);position:relative;overflow:hidden}
+.tpl .thumb .mini{background:#fff;border:1px solid #e6ddc9;border-radius:4px;height:100%;padding:10px;display:flex;flex-direction:column;gap:5px}
+.tpl .thumb .mini .mh{height:8px;width:60%;background:var(--seal);border-radius:2px;opacity:.8}
+.tpl .thumb .mini .ml{height:4px;background:#d8d0bd;border-radius:2px}
+.tpl .thumb .mini .ml.w{width:90%}.tpl .thumb .mini .ml.m{width:75%}.tpl .thumb .mini .ml.s{width:55%}
+.tpl .thumb .sealmini{position:absolute;right:18px;top:30px;width:42px;height:42px;border:2px solid var(--seal);border-radius:50%;color:var(--seal);display:grid;place-items:center;font-family:var(--f-display);font-size:9px;transform:rotate(-12deg);opacity:.7;text-align:center;line-height:1.2}
+.tpl .meta{padding:var(--s4)}
+.tpl .meta b{font-size:14px;color:var(--t1);font-family:var(--f-display);letter-spacing:1px}
+.tpl .meta .d{font-size:12px;color:var(--t3);margin-top:4px;line-height:1.5}
+.tpl .meta .ft{display:flex;align-items:center;justify-content:space-between;margin-top:12px;font-size:11.5px;color:var(--t4)}
+
+/* 配置 / 标签页 */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:var(--s5);flex-wrap:wrap}
+.tabs button{background:none;border:none;color:var(--t3);font-family:var(--f-ui);font-size:13.5px;padding:11px 16px;cursor:pointer;position:relative;transition:color .18s}
+.tabs button:hover{color:var(--t2)}
+.tabs button.on{color:var(--t1)}
+.tabs button.on::after{content:"";position:absolute;left:12px;right:12px;bottom:-1px;height:2px;background:var(--brand);border-radius:2px}
+.panel{display:none}.panel.on{display:block;animation:fade .3s var(--ease)}
+
+/* 模型接入卡片 */
+.prov{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--s4)}
+.prov .p{background:var(--ink-800);border:1px solid var(--line);border-radius:var(--r-l);padding:var(--s5);position:relative;overflow:hidden}
+.prov .p.cur{border-color:var(--brand-line);box-shadow:0 0 0 1px var(--brand-line)}
+.prov .p .ribbon{position:absolute;top:14px;right:-30px;transform:rotate(45deg);background:var(--brand);color:#fff;font-size:10px;padding:4px 36px;letter-spacing:1px}
+.prov .p h4{font-size:15px;color:var(--t1);margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.prov .p .k{font-family:var(--f-mono);font-size:11px;color:var(--brand);margin-bottom:14px}
+.prov .p ul{list-style:none;display:flex;flex-direction:column;gap:9px;font-size:12.5px;color:var(--t2)}
+.prov .p ul li{display:flex;gap:8px;align-items:flex-start}
+.prov .p ul li svg{width:14px;height:14px;color:var(--ok);flex:0 0 14px;margin-top:2px}
+
+/* 表单 */
+.field{display:flex;flex-direction:column;gap:7px;margin-bottom:var(--s4)}
+.field label{font-size:12.5px;color:var(--t2)}
+.field input,.field select,.field textarea{height:40px;background:var(--ink-850);border:1px solid var(--line-2);border-radius:var(--r-s);padding:0 var(--s3);color:var(--t1);font-size:13px;font-family:var(--f-ui);transition:.18s}
+.field textarea{height:auto;padding:10px var(--s3);resize:vertical;min-height:80px}
+.field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--brand-line);box-shadow:0 0 0 3px var(--brand-soft)}
+.field .hint{font-size:11.5px;color:var(--t4)}
+
+/* 开关 */
+.sw{position:relative;width:40px;height:22px;flex:0 0 40px}
+.sw input{opacity:0;width:0;height:0}
+.sw i{position:absolute;inset:0;background:var(--ink-600);border-radius:var(--r-pill);transition:.2s;cursor:pointer}
+.sw i::before{content:"";position:absolute;left:3px;top:3px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s var(--ease)}
+.sw input:checked + i{background:var(--brand)}
+.sw input:checked + i::before{transform:translateX(18px)}
+
+/* 运维 */
+.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s4)}
+.gauge{display:flex;flex-direction:column;align-items:center;gap:8px}
+.gauge .ring{position:relative;width:108px;height:108px}
+.gauge .ring svg{transform:rotate(-90deg)}
+.gauge .ring .pct{position:absolute;inset:0;display:grid;place-items:center;font-family:var(--f-mono);font-size:20px;color:var(--t1)}
+.gauge .ring .pct small{font-size:11px;color:var(--t3)}
+.log{font-family:var(--f-mono);font-size:12px;background:var(--ink-950);border:1px solid var(--line);border-radius:var(--r);padding:var(--s4);height:260px;overflow-y:auto;color:var(--t2);line-height:1.8}
+.log .t{color:var(--t4)}.log .ok{color:var(--ok)}.log .wn{color:var(--warn)}.log .er{color:var(--danger)}.log .br{color:var(--brand)}
+
+/* 空态 */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:60px;text-align:center;color:var(--t3)}
+.empty svg{width:46px;height:46px;color:var(--t4);opacity:.6}
+
+/* 抽屉 */
+.drawer{position:fixed;top:0;right:0;height:100dvh;width:440px;background:var(--ink-850);border-left:1px solid var(--line-2);box-shadow:var(--sh-3);transform:translateX(100%);transition:transform .35s var(--ease);z-index:50;padding:var(--s6);overflow-y:auto}
+.drawer.open{transform:none}
+.drawer .dh{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--s5)}
+.drawer .dh h3{font-family:var(--f-display);font-size:18px}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:.3s;z-index:40}
+.scrim.open{opacity:1;pointer-events:auto}
+
+@media (max-width:1200px){.doc-grid{grid-template-columns:1fr}.tpl-grid{grid-template-columns:repeat(2,1fr)}.qa-wrap{grid-template-columns:1fr}.prov{grid-template-columns:1fr}.metric-row{grid-template-columns:repeat(2,1fr)}.bento>*{grid-column:span 12 !important}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<!-- SVG 图标库 -->
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></symbol>
+<symbol id="i-pen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
+<symbol id="i-layout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 9v12"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3.4 14H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 7.6l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 3.4V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.4 1z"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 6 9 17l-5-5"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+<symbol id="i-db" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 4 6v6c0 5 3.4 8.4 8 9 4.6-.6 8-4 8-9V6z"/></symbol>
+<symbol id="i-export" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12M8 11l4 4 4-4M5 21h14"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18"/></symbol>
+<symbol id="i-quote" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 7h4v4c0 2-1 3-3 3M13 7h4v4c0 2-1 3-3 3"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M8 8l4-4 4 4M4 16v4h16v-4"/></symbol>
+</defs></svg>
+
+<div class="app">
+  <!-- ========== 侧边栏 ========== -->
+  <aside class="side">
+    <div class="brand">
+      <div class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4" stroke="#fff"/></svg></div>
+      <div>
+        <div class="name">公文智脑</div>
+        <div class="sub">ENTERPRISE DOC KNOWLEDGE</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="grp">工作台</div>
+      <a href="#" class="active" data-v="overview"><svg><use href="#i-grid"/></svg>平台概览</a>
+      <a href="#" data-v="docs"><svg><use href="#i-doc"/></svg>文档库<span class="tag">200K</span></a>
+      <a href="#" data-v="retrieve"><svg><use href="#i-search"/></svg>智能检索</a>
+      <a href="#" data-v="draft"><svg><use href="#i-pen"/></svg>智能起草</a>
+      <div class="grp">配置与运营</div>
+      <a href="#" data-v="templates"><svg><use href="#i-layout"/></svg>模板库</a>
+      <a href="#" data-v="config"><svg><use href="#i-gear"/></svg>配置中心</a>
+      <a href="#" data-v="ops"><svg><use href="#i-monitor"/></svg>运维台</a>
+    </nav>
+
+    <div class="side-foot">
+      <div class="env"><span class="dot"></span><div><div style="color:var(--t1);font-size:12.5px">内网部署 · 涉密不出网</div><div style="font-size:11px;color:var(--t4)">网络出口已封禁</div></div></div>
+      <div class="usr">
+        <div class="av">政</div>
+        <div class="meta"><b>政研室 · 管理员</b><span>role: knowledge_admin</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ========== 主区 ========== -->
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb">知识库平台 / <b id="crumb">平台概览</b></div>
+      <div class="search">
+        <svg><use href="#i-search"/></svg>
+        <input id="globalsearch" placeholder="全局检索公文 · 支持文号 / 标题 / 关键词…" />
+        <span class="kbd">⌘K</span>
+      </div>
+      <div class="topact">
+        <div class="iconbtn" title="通知"><svg><use href="#i-bell"/></svg></div>
+        <div class="iconbtn" title="安全"><svg><use href="#i-lock"/></svg></div>
+      </div>
+    </header>
+
+    <main class="content" id="content">
+
+      <!-- ===== 概览 ===== -->
+      <section class="view active" id="v-overview">
+        <div class="vhead">
+          <div><h1>平台概览</h1><div class="desc">知识库运行态势、检索质量与系统健康度的统一视图。数据实时来自解析入库流水线、检索推理服务与模型运行时。</div></div>
+          <div class="acts"><button class="btn ghost"><svg><use href="#i-export"/></svg>导出报表</button><button class="btn primary"><svg><use href="#i-plus"/></svg>接入文档</button></div>
+        </div>
+
+        <div class="grid bento">
+          <div class="card kpi span3"><div class="lab"><svg><use href="#i-doc"/></svg>文档总量</div><div class="val">200,000<small>篇</small></div><div class="trend up">▲ 本月 +8,412</div></div>
+          <div class="card kpi span3"><div class="lab"><svg><use href="#i-layout"/></svg>已入库切片</div><div class="val">1,932,418<small>片</small></div><div class="trend up">▲ 覆盖率 99.6%</div></div>
+          <div class="card kpi span3"><div class="lab"><svg><use href="#i-search"/></svg>检索准确率</div><div class="val">94.2<small>%</small></div><div class="trend up">▲ 较上周 +1.8pt</div></div>
+          <div class="card kpi span3"><div class="lab"><svg><use href="#i-spark"/></svg>今日问答</div><div class="val">1,284<small>次</small></div><div class="trend up">▲ 平均响应 0.8s</div></div>
+
+          <!-- 检索质量趋势 -->
+          <div class="card span8">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--s4)">
+              <h3 style="font-size:15px;font-family:var(--f-display)">检索准确率趋势</h3>
+              <div style="display:flex;gap:var(--s2)"><span class="chip on">近 14 天</span><span class="chip">本月</span><span class="chip">本季</span></div>
+            </div>
+            <svg viewBox="0 0 720 220" width="100%" height="220" preserveAspectRatio="none">
+              <defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgba(61,126,255,.35)"/><stop offset="1" stop-color="rgba(61,126,255,0)"/></linearGradient></defs>
+              <g stroke="rgba(150,178,220,.10)" stroke-width="1">
+                <line x1="0" y1="40" x2="720" y2="40"/><line x1="0" y1="90" x2="720" y2="90"/><line x1="0" y1="140" x2="720" y2="140"/><line x1="0" y1="190" x2="720" y2="190"/>
+              </g>
+              <path d="M0,150 L60,140 L120,148 L180,120 L240,128 L300,100 L360,108 L420,82 L480,90 L540,66 L600,72 L660,52 L720,46 L720,220 L0,220 Z" fill="url(#g1)"/>
+              <path d="M0,150 L60,140 L120,148 L180,120 L240,128 L300,100 L360,108 L420,82 L480,90 L540,66 L600,72 L660,52 L720,46" fill="none" stroke="var(--brand)" stroke-width="2.5" stroke-linejoin="round"/>
+              <circle cx="720" cy="46" r="4.5" fill="var(--brand)"/>
+            </svg>
+          </div>
+
+          <!-- 系统健康 -->
+          <div class="card span4">
+            <h3 style="font-size:15px;font-family:var(--f-display);margin-bottom:var(--s4)">系统健康</h3>
+            <div style="display:flex;flex-direction:column;gap:var(--s4)">
+              <div class="st"><span class="d ok"></span>生成模型服务 (Qwen3-32B) <span style="margin-left:auto;color:var(--ok);font-family:var(--f-mono);font-size:12px">健康</span></div>
+              <div class="st"><span class="d ok"></span>向量库 (pgvector) <span style="margin-left:auto;color:var(--ok);font-family:var(--f-mono);font-size:12px">健康</span></div>
+              <div class="st"><span class="d ok"></span>对象存储 (LocalFS) <span style="margin-left:auto;color:var(--ok);font-family:var(--f-mono);font-size:12px">健康</span></div>
+              <div class="st"><span class="d ok"></span>网络出口封禁策略 <span style="margin-left:auto;color:var(--ok);font-family:var(--f-mono);font-size:12px">已启用</span></div>
+              <div class="st"><span class="d run"></span>入库流水线 (8 进程) <span style="margin-left:auto;color:var(--brand);font-family:var(--f-mono);font-size:12px">运行中</span></div>
+            </div>
+          </div>
+
+          <!-- 文种分布 -->
+          <div class="card span4">
+            <h3 style="font-size:15px;font-family:var(--f-display);margin-bottom:var(--s4)">文种分布</h3>
+            <svg viewBox="0 0 120 120" width="150" height="150" style="margin:auto;display:block">
+              <circle cx="60" cy="60" r="50" fill="none" stroke="var(--ink-700)" stroke-width="14"/>
+              <circle cx="60" cy="60" r="50" fill="none" stroke="var(--brand)" stroke-width="14" stroke-dasharray="565" stroke-dashoffset="120" transform="rotate(-90 60 60)"/>
+              <circle cx="60" cy="60" r="50" fill="none" stroke="var(--ok)" stroke-width="14" stroke-dasharray="565" stroke-dashoffset="380" transform="rotate(120 60 60)"/>
+              <circle cx="60" cy="60" r="50" fill="none" stroke="var(--warn)" stroke-width="14" stroke-dasharray="565" stroke-dashoffset="470" transform="rotate(210 60 60)"/>
+            </svg>
+            <div style="display:flex;justify-content:center;gap:var(--s4);margin-top:var(--s3);font-size:12px;color:var(--t3)">
+              <span><span style="color:var(--brand)">■</span> 通知/发文 48%</span><span><span style="color:var(--ok)">■</span> 函 28%</span><span><span style="color:var(--warn)">■</span> 报告/请示 24%</span>
+            </div>
+          </div>
+
+          <!-- 最近接入 -->
+          <div class="card span8">
+            <div class="sec-t" style="margin-top:0">最近接入文档</div>
+            <table class="tbl">
+              <thead><tr><th>文件名</th><th>文种</th><th>密级</th><th>状态</th><th>切片</th><th>入库时间</th></tr></thead>
+              <tbody>
+                <tr><td class="tt">川府函〔2023〕12号 关于XX的复函.pdf</td><td>函</td><td><span class="badge b-internal"><span class="d"></span>INTERNAL</span></td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">214</td><td class="mono">10-09 09:12</td></tr>
+                <tr><td class="tt">川办发〔2023〕8号 关于做好XX工作的通知.pdf</td><td>通知</td><td><span class="badge b-public"><span class="d"></span>PUBLIC</span></td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">188</td><td class="mono">10-09 08:40</td></tr>
+                <tr><td class="tt">省政府令第342号.pdf</td><td>令</td><td><span class="badge b-restricted"><span class="d"></span>RESTRICTED</span></td><td><span class="st"><span class="d run"></span>解析中</span></td><td class="mono">—</td><td class="mono">10-09 08:31</td></tr>
+                <tr><td class="tt">川办规〔2022〕5号 规范性文件.pdf</td><td>规范</td><td><span class="badge b-internal"><span class="d"></span>INTERNAL</span></td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">156</td><td class="mono">10-08 17:05</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 文档库 ===== -->
+      <section class="view" id="v-docs">
+        <div class="vhead">
+          <div><h1>文档库</h1><div class="desc">管理公文系统导出的文档接入、解析与切片入库。密级与权限标签由我方标准定义，随文档元数据一并入库并在检索阶段下推过滤。</div></div>
+          <div class="acts"><button class="btn"><svg><use href="#i-filter"/></svg>筛选</button><button class="btn"><svg><use href="#i-upload"/></svg>批量接入</button></div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;gap:var(--s2);flex-wrap:wrap;margin-bottom:var(--s4)">
+            <span class="chip on">全部 200,000</span><span class="chip">通知 96,000</span><span class="chip">函 56,000</span><span class="chip">报告/请示 48,000</span>
+            <span class="chip">PUBLIC</span><span class="chip">INTERNAL</span><span class="chip">RESTRICTED</span><span class="chip">SECRET</span>
+            <span class="chip">解析中 12</span>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>文件名 / 文号</th><th>文种</th><th>密级</th><th>权限标签</th><th>状态</th><th>切片</th><th>入库进度</th><th></th></tr></thead>
+            <tbody>
+              <tr><td><div class="tt">川府函〔2023〕12号</div><div class="mono">关于XX事项的复函.pdf</div></td><td>函</td><td><span class="badge b-internal"><span class="d"></span>INTERNAL</span></td><td class="mono">dept:政研室</td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">214</td><td><div class="bar"><i style="width:100%"></i></div></td><td><a class="chip" onclick="openDrawer('川府函〔2023〕12号')">详情</a></td></tr>
+              <tr><td><div class="tt">川办发〔2023〕8号</div><div class="mono">关于做好XX工作的通知.pdf</div></td><td>通知</td><td><span class="badge b-public"><span class="d"></span>PUBLIC</span></td><td class="mono">dept:办公室</td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">188</td><td><div class="bar"><i style="width:100%"></i></div></td><td><a class="chip" onclick="openDrawer('川办发〔2023〕8号')">详情</a></td></tr>
+              <tr><td><div class="tt">省政府令第342号</div><div class="mono">XX管理办法.pdf</div></td><td>令</td><td><span class="badge b-restricted"><span class="d"></span>RESTRICTED</span></td><td class="mono">role:领导</td><td><span class="st"><span class="d run"></span>解析中</span></td><td class="mono">—</td><td><div class="bar"><i style="width:46%"></i></div></td><td><a class="chip">详情</a></td></tr>
+              <tr><td><div class="tt">川办规〔2022〕5号</div><div class="mono">规范性文件.pdf</div></td><td>规范</td><td><span class="badge b-secret"><span class="d"></span>SECRET</span></td><td class="mono">group:保密组</td><td><span class="st"><span class="d ok"></span>已入库</span></td><td class="mono">156</td><td><div class="bar"><i style="width:100%"></i></div></td><td><a class="chip">详情</a></td></tr>
+              <tr><td><div class="tt">XX工作会议纪要〔2023〕3号</div><div class="mono">会议纪要.pdf</div></td><td>纪要</td><td><span class="badge b-internal"><span class="d"></span>INTERNAL</span></td><td class="mono">dept:政研室</td><td><span class="st"><span class="d danger"></span>解析失败</span></td><td class="mono">—</td><td><div class="bar"><i style="width:12%"></i></div></td><td><a class="chip">重试</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===== 智能检索 / 问答 ===== -->
+      <section class="view" id="v-retrieve">
+        <div class="vhead">
+          <div><h1>智能检索与问答</h1><div class="desc">混合检索（BM25 + 向量 + RRF 融合 + Qwen3-Reranker 重排），密级与权限在检索阶段下推过滤。问答结果强制引用溯源，输出经敏感词校验。</div></div>
+        </div>
+
+        <div class="search" style="max-width:none;margin:0 0 var(--s5)">
+          <svg><use href="#i-search"/></svg>
+          <input placeholder="输入问题，例如：请检索近三年关于安全生产的通知，并归纳主要工作要求" />
+        </div>
+        <div style="display:flex;gap:var(--s2);flex-wrap:wrap;margin-bottom:var(--s5)">
+          <span class="chip on">可见范围：INTERNAL 及以下 (12,840 篇)</span>
+          <span class="chip">重排：Qwen3-Reranker-0.6B</span>
+          <span class="chip">融合：RRF k=60</span>
+          <span class="chip">向量：HNSW top-50</span>
+        </div>
+
+        <div class="qa-wrap">
+          <div class="feed">
+            <div class="rcard"><div class="rt"><b>川办发〔2023〕8号 关于做好安全生产工作的通知</b><span class="score">0.92</span></div><p>各部门要<mark>牢固树立安全发展理念</mark>，切实增强责任意识，于本月末前完成一次<mark>全面隐患排查</mark>并建立台账。</p><div class="meta"><span>来源：办公室</span><span>命中切片 #A3F2</span><span>RESTRICTED 以下可见</span></div></div>
+            <div class="rcard"><div class="rt"><b>川府函〔2022〕31号 关于报送安全总结的函</b><span class="score">0.87</span></div><p>请各单位<mark>每季度末</mark>前将安全生产工作总结书面报送至政研室，重大事项即时专报。</p><div class="meta"><span>来源：政研室</span><span>命中切片 #B1C9</span><span>INTERNAL 可见</span></div></div>
+            <div class="rcard"><div class="rt"><b>XX省安全生产条例（摘录）</b><span class="score">0.81</span></div><p>县级以上人民政府应当<mark>加强安全生产基础设施建设</mark>，将安全生产纳入国民经济和社会发展规划。</p><div class="meta"><span>来源：法规库</span><span>命中切片 #C7E0</span><span>PUBLIC 可见</span></div></div>
+          </div>
+
+          <div class="ans">
+            <div class="q">问：近三年关于安全生产的主要工作要求有哪些？</div>
+            <div class="a">综合检索结果，近三年安全生产工作的核心要求可归纳为以下三方面：<br><br>
+            一、<b>强化责任意识</b>。各部门须牢固树立安全发展理念，将安全生产纳入总体规划并层层压实责任<sup>[1]</sup>。<br>
+            二、<b>开展隐患排查</b>。要求于本月末前完成一次全面排查，建立台账并明确整改责任人与完成时限<sup>[1]</sup>；重大事项须即时专报<sup>[2]</sup>。<br>
+            三、<b>完善基础设施与报送机制</b>。加强安全生产基础设施建设，建立季度总结报送制度<sup>[2][3]</sup>。<br><br>
+            <span style="color:var(--t3);font-size:13px">注：以上内容均基于知识库可检索公文，未检索到依据的事项已省略，未做推测。</span></div>
+            <div class="verify">
+              <span class="vtag"><svg><use href="#i-check"/></svg>引用溯源 3 处</span>
+              <span class="vtag"><svg><use href="#i-shield"/></svg>敏感词校验 0 命中</span>
+              <span class="vtag"><svg><use href="#i-lock"/></svg>密级过滤已生效</span>
+            </div>
+            <div class="cite"><h4>引用来源</h4><ol>
+              <li><span class="n">[1]</span> 川办发〔2023〕8号 关于做好安全生产工作的通知 · 切片 #A3F2</li>
+              <li><span class="n">[2]</span> 川府函〔2022〕31号 关于报送安全总结的函 · 切片 #B1C9</li>
+              <li><span class="n">[3]</span> XX省安全生产条例（摘录） · 切片 #C7E0</li>
+            </ol></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 智能起草 ===== -->
+      <section class="view" id="v-draft">
+        <div class="vhead">
+          <div><h1>智能起草</h1><div class="desc">选择文种模板，基于知识库检索增强生成公文初稿。生成内容强制标注引用溯源，导出前完成格式合规与敏感词校验。</div></div>
+          <div class="acts"><button class="btn"><svg><use href="#i-spark"/></svg>一键润色</button><button class="btn primary"><svg><use href="#i-export"/></svg>导出 docx / pdf</button></div>
+        </div>
+
+        <div class="doc-grid">
+          <div class="dtype" id="dtype">
+            <div class="item on" data-t="通知"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>通知</b><span>批转、传达、告知</span></div></div>
+            <div class="item" data-t="通报"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>通报</b><span>表彰、批评、情况</span></div></div>
+            <div class="item" data-t="报告"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>报告</b><span>向上级汇报</span></div></div>
+            <div class="item" data-t="请示"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>请示</b><span>请求指示批准</span></div></div>
+            <div class="item" data-t="函"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>函</b><span>不相隶属商洽</span></div></div>
+            <div class="item" data-t="纪要"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>纪要</b><span>会议记载</span></div></div>
+            <div class="item" data-t="决定"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>决定</b><span>重大事项决策</span></div></div>
+            <div class="item" data-t="意见"><div class="ic"><svg><use href="#i-doc"/></svg></div><div><b>意见</b><span>指导、处理办法</span></div></div>
+          </div>
+
+          <div class="paper">
+            <div class="head"><div class="red">XX 省人民政府办公厅</div><div class="docno">川办发〔2026〕___号</div></div>
+            <h2>关于做好 2026 年度安全生产工作的通知</h2>
+            <div class="body">
+              <p>各市（州）人民政府，省政府各部门、各直属机构：</p>
+              <p>为深入贯彻习近平总书记关于安全生产的重要指示精神，牢固树立安全发展理念，现就做好 2026 年度安全生产工作通知如下<sup>[1]</sup>。</p>
+              <p>一、提高政治站位。各地区、各部门要切实增强责任意识，将安全生产纳入本地区国民经济和社会发展规划，层层压实责任链条<sup>[3]</sup>。</p>
+              <p>二、开展全面排查。各单位须于本月末前完成一次全面隐患排查，建立工作台账，明确整改责任人和完成时限，实行闭环管理<sup>[1]</sup>。</p>
+              <p>三、加强应急值守。严格执行领导带班和 24 小时值班制度，确保信息畅通，重大事项即时专报<sup>[2]</sup>。</p>
+            </div>
+            <div class="sign">XX 省人民政府办公厅<br>2026 年 ___ 月 ___ 日<br><span class="seal">公文智脑<br>生成草稿</span></div>
+          </div>
+
+          <div class="asst">
+            <div class="blk"><h4><svg><use href="#i-spark"/></svg>AI 辅助</h4>
+              <div class="row"><span>引用溯源</span><b style="color:var(--ok)">3 处已标注</b></div>
+              <div class="row"><span>格式合规</span><b style="color:var(--ok)">✓ 通过</b></div>
+              <div class="row"><span>敏感词</span><b style="color:var(--ok)">✓ 0 命中</b></div>
+              <div class="row"><span>预估字数</span><b>642 字</b></div>
+            </div>
+            <div class="blk"><h4><svg><use href="#i-quote"/></svg>检索增强</h4>
+              <div class="row"><span>召回切片</span><b>12 片</b></div>
+              <div class="row"><span>重排模型</span><b>Qwen3-Reranker</b></div>
+              <div class="row"><span>生成模型</span><b>Qwen3-32B</b></div>
+            </div>
+            <div class="blk"><h4><svg><use href="#i-shield"/></svg>合规校验</h4>
+              <p style="font-size:12.5px;color:var(--t3);line-height:1.7">草稿导出前将再次执行密级与敏感词校验，超权限引用不进入正文，确保涉密不出网。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 模板库 ===== -->
+      <section class="view" id="v-templates">
+        <div class="vhead">
+          <div><h1>模板库</h1><div class="desc">我方维护公文文种模板，第三方可导入自有版式（字体 / 落款 / 文头）。新增一种导出布局仅需配置，免改代码。</div></div>
+          <div class="acts"><button class="btn"><svg><use href="#i-upload"/></svg>导入模板</button><button class="btn primary"><svg><use href="#i-plus"/></svg>新建布局</button></div>
+        </div>
+        <div class="tpl-grid" id="tplgrid"></div>
+      </section>
+
+      <!-- ===== 配置中心 ===== -->
+      <section class="view" id="v-config">
+        <div class="vhead">
+          <div><h1>配置中心</h1><div class="desc">我方制定标准，第三方适配。以下密级枚举、权限标签语义、敏感词与模型接入标准已冻结为 v1，作为联调基线。</div></div>
+        </div>
+
+        <div class="tabs" id="ctabs">
+          <button class="on" data-p="p-level">密级标准</button>
+          <button data-p="p-perm">权限标签</button>
+          <button data-p="p-word">敏感词</button>
+          <button data-p="p-model">模型接入</button>
+          <button data-p="p-fmt">格式适配器</button>
+        </div>
+
+        <div class="panel on" id="p-level">
+          <div class="card">
+            <table class="tbl">
+              <thead><tr><th>枚举值</th><th>说明</th><th>颜色</th><th>导出审批</th><th>第三方映射</th></tr></thead>
+              <tbody>
+                <tr><td class="tt">PUBLIC</td><td>公开，可全员检索</td><td><span class="badge b-public"><span class="d"></span>绿</span></td><td>无需</td><td>公开 / 依申请公开</td></tr>
+                <tr><td class="tt">INTERNAL</td><td>内部，限本单位</td><td><span class="badge b-internal"><span class="d"></span>蓝</span></td><td>无需</td><td>内部资料 / 工作秘密</td></tr>
+                <tr><td class="tt">RESTRICTED</td><td>受限，限角色/部门</td><td><span class="badge b-restricted"><span class="d"></span>琥珀</span></td><td>部门负责人</td><td>涉密级（非国家秘密）</td></tr>
+                <tr><td class="tt">SECRET</td><td>秘密，限保密组</td><td><span class="badge b-secret"><span class="d"></span>红</span></td><td>分管领导</td><td>国家秘密（若适用）</td></tr>
+              </tbody>
+            </table>
+            <p style="margin-top:var(--s4);font-size:12.5px;color:var(--t3)">说明：密级过滤在检索 SQL 的 <span class="mono">WHERE</span> 子句下推，越权切片在数据库层排除，不进入模型上下文。</p>
+          </div>
+        </div>
+
+        <div class="panel" id="p-perm">
+          <div class="card">
+            <p style="color:var(--t2);margin-bottom:var(--s4)">权限标签采用 <span class="mono">scope:&lt;type&gt;:&lt;value&gt;</span> 规范，检索以数组交集 + 密级上限判定可见性。</p>
+            <div style="display:flex;flex-direction:column;gap:var(--s3)">
+              <div class="row" style="display:flex;gap:var(--s4);align-items:center"><span class="mono" style="color:var(--brand)">scope:dept:政研室</span><span style="color:var(--t3)">按部门授权</span></div>
+              <div class="row" style="display:flex;gap:var(--s4);align-items:center"><span class="mono" style="color:var(--brand)">scope:role:领导</span><span style="color:var(--t3)">按角色授权</span></div>
+              <div class="row" style="display:flex;gap:var(--s4);align-items:center"><span class="mono" style="color:var(--brand)">scope:user:zhangsan</span><span style="color:var(--t3)">按用户授权</span></div>
+              <div class="row" style="display:flex;gap:var(--s4);align-items:center"><span class="mono" style="color:var(--brand)">scope:group:保密组</span><span style="color:var(--t3)">按用户组授权</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" id="p-word">
+          <div class="card">
+            <div style="display:flex;gap:var(--s2);margin-bottom:var(--s4)"><span class="chip on">全部 1,284 条</span><span class="chip">政治类</span><span class="chip">违规类</span><span class="chip">内部禁用</span></div>
+            <table class="tbl">
+              <thead><tr><th>词条</th><th>分类</th><th>处置</th><th>状态</th><th></th></tr></thead>
+              <tbody>
+                <tr><td class="tt">（示例）内部代号 A</td><td>内部禁用</td><td>掩码 + 回报</td><td><span class="badge b-ok"><span class="d"></span>启用</span></td><td><label class="sw"><input type="checkbox" checked><i></i></label></td></tr>
+                <tr><td class="tt">（示例）非规范表述 B</td><td>违规类</td><td>提示替换</td><td><span class="badge b-ok"><span class="d"></span>启用</span></td><td><label class="sw"><input type="checkbox" checked><i></i></label></td></tr>
+                <tr><td class="tt">（示例）敏感词 C</td><td>政治类</td><td>阻断</td><td><span class="badge b-warn"><span class="d"></span>待审</span></td><td><label class="sw"><input type="checkbox"><i></i></label></td></tr>
+              </tbody>
+            </table>
+            <p style="margin-top:var(--s4);font-size:12.5px;color:var(--t3)">敏感词支持配置管理，同时接受第三方请求级覆盖；命中后在生成输出后处理（掩码 / 标记并回报 <span class="mono">sensitive_hits</span>），主库治理仍在第三方。</p>
+          </div>
+        </div>
+
+        <div class="panel" id="p-model">
+          <div class="prov">
+            <div class="p cur"><div class="ribbon">当前</div><h4><svg><use href="#i-cpu"/></svg>local 本地栈</h4><div class="k">默认 · 部署形态</div><ul>
+              <li><svg><use href="#i-check"/></svg> 生成 Qwen3-32B-INT4（~18GB）</li>
+              <li><svg><use href="#i-check"/></svg> Embedding Qwen3-Embedding-4B（离线）</li>
+              <li><svg><use href="#i-check"/></svg> Rerank Qwen3-Reranker-0.6B（在线）</li>
+              <li><svg><use href="#i-check"/></svg> 完全私有化，涉密不出网</li>
+            </ul></div>
+            <div class="p"><h4><svg><use href="#i-spark"/></svg>cloud 开发云</h4><div class="k">仅开发期验证</div><ul>
+              <li><svg><use href="#i-check"/></svg> 云端 API 验证形态</li>
+              <li><svg><use href="#i-check"/></svg> 数据不用于训练（条款确认）</li>
+              <li><svg><use href="#i-check"/></svg> 生产启动自检拒绝启用</li>
+            </ul></div>
+            <div class="p"><h4><svg><use href="#i-db"/></svg>std 算力中心</h4><div class="k">部署方自有模型</div><ul>
+              <li><svg><use href="#i-check"/></svg> 标准接口：Chat / Embeddings / Rerank</li>
+              <li><svg><use href="#i-check"/></svg> 兼容 OpenAI 风格，零改接入</li>
+              <li><svg><use href="#i-check"/></svg> 部署方暴露端点或兼容网关</li>
+            </ul></div>
+          </div>
+          <div class="card" style="margin-top:var(--s4)">
+            <h3 style="font-size:15px;font-family:var(--f-display);margin-bottom:var(--s4)">部署方算力中心接入配置</h3>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--s4)">
+              <div class="field"><label>端点地址 (Base URL)</label><input placeholder="https://gpu-center.internal/v1" /><div class="hint">部署方算力中心需实现 /chat/completions、/embeddings、/rerank</div></div>
+              <div class="field"><label>API 密钥</label><input type="password" placeholder="••••••••••••" /></div>
+              <div class="field"><label>生成模型名</label><input placeholder="qwen3-32b-instruct" /></div>
+              <div class="field"><label>Embedding 模型名</label><input placeholder="qwen3-embedding-4b" /></div>
+              <div class="field"><label>Rerank 模型名</label><input placeholder="qwen3-reranker-0.6b" /></div>
+              <div class="field"><label>连接状态</label><div class="st"><span class="d ok"></span>已连通 · 延迟 38ms</div></div>
+            </div>
+            <button class="btn primary">保存并校验连接</button>
+          </div>
+        </div>
+
+        <div class="panel" id="p-fmt">
+          <div class="card">
+            <table class="tbl">
+              <thead><tr><th>格式</th><th>布局名</th><th>字体方案</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr><td class="tt">docx</td><td>标准公文 A4</td><td>仿宋_GB2312 / 方正小标宋</td><td><span class="badge b-ok"><span class="d"></span>启用</span></td></tr>
+                <tr><td class="tt">pdf</td><td>标准公文 A4（打印）</td><td>同上 + 矢量文头</td><td><span class="badge b-ok"><span class="d"></span>启用</span></td></tr>
+                <tr><td class="tt">ofd</td><td>OFD 版式（二期）</td><td>国标字体</td><td><span class="badge b-warn"><span class="d"></span>规划中</span></td></tr>
+              </tbody>
+            </table>
+            <p style="margin-top:var(--s4);font-size:12.5px;color:var(--t3)">新增导出布局：在配置中心登记一条格式适配器记录即可，渲染引擎按布局渲染，无需改动代码。</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 运维台 ===== -->
+      <section class="view" id="v-ops">
+        <div class="vhead">
+          <div><h1>运维台</h1><div class="desc">模型运行时、资源水位、入库任务与系统日志的统一监控。生产环境启动自检拒绝云端 Provider，网络出口封禁策略常驻。</div></div>
+          <div class="acts"><button class="btn"><svg><use href="#i-monitor"/></svg>刷新</button></div>
+        </div>
+
+        <div class="metric-row" style="margin-bottom:var(--s5)">
+          <div class="card gauge"><div class="ring"><svg width="108" height="108"><circle cx="54" cy="54" r="46" fill="none" stroke="var(--ink-700)" stroke-width="10"/><circle cx="54" cy="54" r="46" fill="none" stroke="var(--brand)" stroke-width="10" stroke-linecap="round" stroke-dasharray="289" stroke-dashoffset="75"/></svg><div class="pct">74<small>%</small></div></div><div style="font-size:13px;color:var(--t2)">GPU 利用率</div></div>
+          <div class="card gauge"><div class="ring"><svg width="108" height="108"><circle cx="54" cy="54" r="46" fill="none" stroke="var(--ink-700)" stroke-width="10"/><circle cx="54" cy="54" r="46" fill="none" stroke="var(--ok)" stroke-width="10" stroke-linecap="round" stroke-dasharray="289" stroke-dashoffset="43"/></svg><div class="pct">85<small>%</small></div></div><div style="font-size:13px;color:var(--t2)">显存占用</div></div>
+          <div class="card gauge"><div class="ring"><svg width="108" height="108"><circle cx="54" cy="54" r="46" fill="none" stroke="var(--ink-700)" stroke-width="10"/><circle cx="54" cy="54" r="46" fill="none" stroke="var(--warn)" stroke-width="10" stroke-linecap="round" stroke-dasharray="289" stroke-dashoffset="120"/></svg><div class="pct">58<small>%</small></div></div><div style="font-size:13px;color:var(--t2)">入库队列</div></div>
+          <div class="card gauge"><div class="ring"><svg width="108" height="108"><circle cx="54" cy="54" r="46" fill="none" stroke="var(--ink-700)" stroke-width="10"/><circle cx="54" cy="54" r="46" fill="none" stroke="var(--brand)" stroke-width="10" stroke-linecap="round" stroke-dasharray="289" stroke-dashoffset="58"/></svg><div class="pct">80<small>%</small></div></div><div style="font-size:13px;color:var(--t2)">向量库容量</div></div>
+        </div>
+
+        <div class="grid bento">
+          <div class="card span8">
+            <div class="sec-t" style="margin-top:0">模型服务状态</div>
+            <table class="tbl">
+              <thead><tr><th>模型</th><th>角色</th><th>状态</th><th>延迟</th><th>显存</th></tr></thead>
+              <tbody>
+                <tr><td class="tt">Qwen3-32B-INT4</td><td>生成</td><td><span class="st"><span class="d ok"></span>健康</span></td><td class="mono">820ms</td><td class="mono">17.9 / 24 GB</td></tr>
+                <tr><td class="tt">Qwen3-Embedding-4B</td><td>离线 Embedding</td><td><span class="st"><span class="d run"></span>本轮任务</span></td><td class="mono">—</td><td class="mono">9.1 / 24 GB</td></tr>
+                <tr><td class="tt">Qwen3-Reranker-0.6B</td><td>在线重排</td><td><span class="st"><span class="d ok"></span>健康</span></td><td class="mono">46ms</td><td class="mono">1.2 / 24 GB</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card span4">
+            <div class="sec-t" style="margin-top:0">安全态势</div>
+            <div style="display:flex;flex-direction:column;gap:var(--s3)">
+              <div class="st"><span class="d ok"></span>启动自检（拒绝云端）通过</div>
+              <div class="st"><span class="d ok"></span>网络出口封禁 已启用</div>
+              <div class="st"><span class="d ok"></span>今日涉密外传拦截 0</div>
+              <div class="st"><span class="d warn"></span>待审敏感词 3 条</div>
+            </div>
+          </div>
+          <div class="card span7">
+            <div class="sec-t" style="margin-top:0">入库任务</div>
+            <table class="tbl">
+              <thead><tr><th>任务</th><th>进度</th><th>速率</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr><td class="tt">批量导入 2024 公文</td><td><div class="bar"><i style="width:72%"></i></div></td><td class="mono">210/s</td><td><span class="st"><span class="d run"></span>进行中</span></td></tr>
+                <tr><td class="tt">Embedding 重建</td><td><div class="bar"><i style="width:34%"></i></div></td><td class="mono">180/s</td><td><span class="st"><span class="d run"></span>进行中</span></td></tr>
+                <tr><td class="tt">会议纪要 OCR 补抽</td><td><div class="bar"><i style="width:100%"></i></div></td><td class="mono">—</td><td><span class="st"><span class="d ok"></span>完成</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card span5">
+            <div class="sec-t" style="margin-top:0">系统日志</div>
+            <div class="log" id="log">
+              <div><span class="t">[09:12:04]</span> <span class="br">RETRIEVE</span> 用户政研室 检索「安全生产」 命中 12,840 篇 耗时 0.8s</div>
+              <div><span class="t">[09:11:50]</span> <span class="ok">INGEST</span> 川府函〔2023〕12号 解析完成 214 切片</div>
+              <div><span class="t">[09:10:31]</span> <span class="ok">MODEL</span> Qwen3-32B 健康检查通过 p99=912ms</div>
+              <div><span class="t">[09:08:12]</span> <span class="wn">SECURITY</span> 拦截一次超密级检索请求 (SECRET) 调用方权限不足</div>
+              <div><span class="t">[09:05:00]</span> <span class="ok">BOOT</span> 启动自检通过：环境=production 拒绝云端 Provider=true</div>
+              <div><span class="t">[09:04:55]</span> <span class="br">NETWORK</span> 出口封禁策略已加载 0.0.0.0/0 → DROP</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- 抽屉 -->
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="dh"><h3 id="dh-t">文档详情</h3><button class="iconbtn" onclick="closeDrawer()"><svg><use href="#i-plus"/></svg></button></div>
+  <div class="card" style="margin-bottom:var(--s4)">
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">文号</span><span class="mono" id="d-no">—</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">文种</span><span>函</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">密级</span><span class="badge b-internal"><span class="d"></span>INTERNAL</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">权限标签</span><span class="mono">dept:政研室</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">切片数</span><span class="mono">214</span></div>
+      <div class="row" style="display:flex;justify-content:space-between"><span style="color:var(--t3)">状态</span><span class="st"><span class="d ok"></span>已入库</span></div>
+    </div>
+  </div>
+  <div class="card"><div class="sec-t" style="margin-top:0">切片预览</div><div id="d-chunks" style="display:flex;flex-direction:column;gap:8px"></div></div>
+</div>
+
+<script>
+/* 视图切换 */
+const nav=document.getElementById('nav');
+const crumb=document.getElementById('crumb');
+const names={overview:'平台概览',docs:'文档库',retrieve:'智能检索',draft:'智能起草',templates:'模板库',config:'配置中心',ops:'运维台'};
+nav.addEventListener('click',e=>{
+  const a=e.target.closest('a');if(!a)return;e.preventDefault();
+  nav.querySelectorAll('a').forEach(x=>x.classList.remove('active'));
+  a.classList.add('active');
+  const v=a.dataset.v;
+  document.querySelectorAll('.view').forEach(s=>s.classList.remove('active'));
+  document.getElementById('v-'+v).classList.add('active');
+  crumb.textContent=names[v];
+  document.getElementById('content').scrollTop=0;
+});
+
+/* 文种选择 */
+document.getElementById('dtype').addEventListener('click',e=>{
+  const it=e.target.closest('.item');if(!it)return;
+  document.querySelectorAll('#dtype .item').forEach(x=>x.classList.remove('on'));
+  it.classList.add('on');
+});
+
+/* 配置标签 */
+document.getElementById('ctabs').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  document.querySelectorAll('#ctabs button').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
+  document.getElementById(b.dataset.p).classList.add('on');
+});
+
+/* 模板库生成 */
+const TPL=[
+  {t:'通知',d:'批转、传达、告知事项',u:4821},{t:'通报',d:'表彰、批评、情况反映',u:2310},
+  {t:'报告',d:'向上级机关汇报工作',u:3960},{t:'请示',d:'请求上级指示批准',u:1870},
+  {t:'函',d:'不相隶属机关商洽',u:5640},{t:'纪要',d:'会议纪要记载',u:1420},
+  {t:'决定',d:'重大事项决策',u:980},{t:'意见',d:'指导意见与处理办法',u:2640},
+];
+const tg=document.getElementById('tplgrid');
+tg.innerHTML=TPL.map(x=>`
+  <div class="tpl">
+    <div class="thumb"><div class="mini">
+      <div class="mh"></div><div class="ml w"></div><div class="ml m"></div><div class="ml s"></div><div class="ml m"></div><div class="ml w"></div>
+    </div><div class="sealmini">${x.t}</div></div>
+    <div class="meta"><b>${x.t}</b><div class="d">${x.d}</div><div class="ft"><span>使用 ${x.u} 次</span><span class="badge b-ok"><span class="d"></span>内置</span></div></div>
+  </div>`).join('');
+
+/* 抽屉 */
+function openDrawer(no){document.getElementById('d-no').textContent=no;
+  const c=document.getElementById('d-chunks');
+  c.innerHTML=[1,2,3,4].map(i=>`<div class="chip" style="justify-content:flex-start"><span class="mono">#${no.slice(0,4)}${i}</span><span style="color:var(--t2)">本切片含正文第 ${i*2-1}–${i*2} 段，已关联来源元数据…</span></div>`).join('');
+  document.getElementById('drawer').classList.add('open');document.getElementById('scrim').classList.add('open');}
+function closeDrawer(){document.getElementById('drawer').classList.remove('open');document.getElementById('scrim').classList.remove('open');}
+
+/* 全局搜索快捷键 */
+document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='k'){e.preventDefault();document.getElementById('globalsearch').focus();}});
+</script>
+</body>
+</html>

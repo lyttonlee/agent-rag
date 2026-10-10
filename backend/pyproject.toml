@@ -1,0 +1,75 @@
+# =============================================================================
+# 企业公文知识库 · 后端服务 pyproject
+# 包管理：uv（https://docs.astral.sh/uv/）
+# Python 版本：3.11+（开发机使用隔离的 3.13.12 解释器）
+#
+# 国内镜像：在 [tool.uv] 中指定清华 PyPI 镜像，避免默认源拉取缓慢。
+# 如需切换，可改为阿里云：https://mirrors.aliyun.com/pypi/simple
+# =============================================================================
+[project]
+name = "gov-doc-rag"
+version = "1.2.0"
+description = "企业公文知识库 RAG 引擎服务（解析 + 切片入库 + 检索推理）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # ---- Web 框架 ----
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",          # 文件上传表单解析
+    # ---- 配置 / 校验 ----
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "pyyaml>=6.0.1",                    # 读取第三方下发的格式适配器 / 模板配置
+    # ---- 数据库（PostgreSQL + pgvector + asyncpg）----
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29.0",
+    "psycopg[binary]>=3.1.0",           # Alembic 同步迁移使用的 PG 驱动
+    "pgvector>=0.3.0",                  # pgvector 的 Python 客户端（Vector 类型 + 索引 DDL）
+    "alembic>=1.13.0",                  # 数据库迁移
+    # ---- 对象存储（抽象层：local 本地文件系统 / s3 兼容 SeaweedFS 等）----
+    "boto3>=1.34.0",                   # 仅 s3 模式需要（SeaweedFS/Ceph/国产对象存储）
+    # ---- 模型接入（OpenAI 兼容：local vLLM / cloud / std 部署方算力中心）----
+    "openai>=1.40.0",                   # 统一以 OpenAI 风格客户端对接三类 Provider
+    "httpx>=0.27.0",                    # 异步 HTTP（调用云端 / std 网关兜底）
+    # ---- 文档解析 ----
+    "pymupdf>=1.24.0",                  # PDF 解析（含文字层提取、扫描件判定）
+    "python-docx>=1.1.0",               # .docx 解析
+    "openpyxl>=3.1.5",                  # .xlsx / 表格解析（可选）
+    # ---- 缓存 / 队列 ----
+    "redis>=5.0.0",                     # 检索缓存、异步任务队列（可选组件）
+    # ---- 可观测 / 容错 ----
+    "loguru>=0.7.0",                    # 结构化日志
+    "tenacity>=8.4.0",                  # 模型调用重试
+]
+
+# -----------------------------------------------------------------------------
+# 开发 / 测试依赖（uv 依赖组，安装：uv sync --group dev）
+# -----------------------------------------------------------------------------
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.6.0",                      # 静态检查 / 格式化
+]
+
+# -----------------------------------------------------------------------------
+# uv 专用配置：指定国内 PyPI 镜像源
+# -----------------------------------------------------------------------------
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# 构建后端分发包时包含的模块
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# -----------------------------------------------------------------------------
+# Ruff 配置（代码风格与质量门禁）
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]   # 行长度交由格式化器处理

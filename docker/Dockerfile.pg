@@ -1,0 +1,66 @@
+FROM postgres:16-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---------- 1. 替换 Debian 源为清华源（先用 HTTP 避免证书问题） ----------
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g; s|https://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g; s|https://deb.debian.org|http://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list; \
+    fi
+
+# ---------- 2. 安装 ca-certificates 和 curl（为后续 HTTPS 做准备） ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- 3. 配置阿里云 PGDG 源（带 GPG 签名验证） ----------
+RUN install -d /usr/share/postgresql-common/pgdg && \
+    curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc && \
+    rm -f /etc/apt/sources.list.d/pgdg.list && \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+        https://mirrors.aliyun.com/postgresql/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list
+
+# ---------- 4. 安装构建依赖 ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        postgresql-server-dev-16 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- 5. 编译安装 pgvector（向量检索，HNSW） ----------
+COPY vendor/pgvector-0.8.0.tar.gz /tmp/
+RUN cd /tmp \
+    && tar xzf pgvector-0.8.0.tar.gz \
+    && cd pgvector-0.8.0 \
+    && make && make install \
+    && rm -rf /tmp/pgvector-0.8.0*
+
+# ---------- 6. 编译安装 scws（中文分词底层，zhparser 依赖） ----------
+COPY vendor/scws-1.2.3.tar.bz2 /tmp/
+RUN cd /tmp \
+    && tar xjf scws-1.2.3.tar.bz2 \
+    && cd scws-1.2.3 \
+    && ./configure --prefix=/usr/local \
+    && make && make install \
+    && echo "/usr/local/lib" > /etc/ld.so.conf.d/scws.conf \
+    && ldconfig \
+    && rm -rf /tmp/scws-1.2.3*
+
+# ---------- 7. 编译安装 zhparser（中文全文检索，master 分支） ----------
+COPY vendor/zhparser-master.tar.gz /tmp/
+RUN cd /tmp \
+    && tar xzf zhparser-master.tar.gz \
+    && cd zhparser-master \
+    && SCWS_HOME=/usr/local make && make install \
+    && cd /tmp \
+    && rm -rf /tmp/zhparser-master*
+
+# ---------- 8. 初始化脚本：自动创建扩展 ----------
+COPY initdb/01-extensions.sql /docker-entrypoint-initdb.d/01-extensions.sql
+
+EXPOSE 5432

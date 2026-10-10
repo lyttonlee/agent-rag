@@ -1,0 +1,71 @@
+# =============================================================================
+# 企业公文知识库 · 基础组件编排（开发 / 单机）
+# 镜像均为离线分发前提：先按 docker_pull_list.md 拉取 / 构建，再 docker compose up。
+# 生产环境请拆分为独立主机 + 信创 OS，本文件仅作本地联调与演示。
+# =============================================================================
+services:
+  # ---- PostgreSQL + pgvector + zhparser（自定义构建镜像）----
+  pg:
+    image: rag-pg:16-zh
+    container_name: rag-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-rag}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-rag123456}
+      POSTGRES_DB: ${PG_DATABASE:-gov_doc_rag}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- 对象存储（抽象层，默认 local 无需独立组件）----
+  # 默认 local 模式：原文直接写后端挂载卷（见下方 storage-data），无需独立服务、无镜像依赖。
+  # 若采用 s3 模式，可用 SeaweedFS 替代 MinIO（Apache 2.0，镜像可得），详见 docs/docker_pull_list.md。
+  # seaweedfs:
+  #   image: chrislusf/seaweedfs:latest
+  #   container_name: rag-seaweedfs
+  #   command: server -dir=/data -s3 -s3.port=8333
+  #   ports:
+  #     - "8333:8333"
+  #   volumes:
+  #     - seaweed-data:/data
+
+  # ---- Redis（检索缓存 / 异步任务队列，可选）----
+  redis:
+    image: redis:7-bookworm
+    container_name: rag-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  # ---- 模型服务（vLLM，OpenAI 兼容；需 GPU 主机）----
+  # 生产用 Qwen3-32B-INT4 / Embedding-4B / Reranker-0.6B；开发可换小模型冒烟。
+  # 取消注释前请确保宿主机有 N 卡并安装 nvidia-container-toolkit。
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: rag-vllm
+  #   runtime: nvidia
+  #   ipc: host
+  #   command: --model Qwen/Qwen3-0.6B --served-model-name qwen3-32b-instruct --port 8000
+  #   ports:
+  #     - "8000:8000"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+volumes:
+  pg-data:
+  redis-data:
+  storage-data:        # local 模式：后端容器挂载此卷作为 STORAGE_ROOT
+  # seaweed-data:      # s3 模式（SeaweedFS）使用

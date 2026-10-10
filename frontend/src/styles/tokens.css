@@ -1,0 +1,88 @@
+/* =========================================================================
+ * 设计令牌（与《UI设计系统规范 V1.0》一致）
+ * 深墨蓝底 + 单一智蓝主色 + 公文红印章点缀；语义色仅用于密级/状态。
+ * 全部系统字体栈，零外部字体依赖（契合纯内网部署）。
+ * ========================================================================= */
+:root {
+  /* 背景层级 */
+  --bg-base: #0b1220;
+  --bg-shell: #0e1726;
+  --bg-surface: #14233b;
+  --bg-surface-2: #1b2c47;
+  --bg-elevated: #20324f;
+
+  /* 主色 / 强调 */
+  --brand: #3d7eff;          /* 智蓝（唯一主色） */
+  --brand-soft: rgba(61, 126, 255, 0.14);
+  --brand-line: rgba(61, 126, 255, 0.35);
+  --seal: #d33a2c;           /* 公文红（印章/密级红标） */
+
+  /* 文本 */
+  --text-strong: #eaf1fb;
+  --text: #c7d4e8;
+  --text-muted: #8a99b3;
+  --text-faint: #5d6c86;
+
+  /* 语义色（密级 / 状态） */
+  --c-public: #2ecc71;       /* 公开 */
+  --c-internal: #3d7eff;     /* 内部 */
+  --c-restricted: #f1a33c;   /* 受限 */
+  --c-secret: #e5484d;       /* 秘密 */
+  --c-success: #2ecc71;
+  --c-warning: #f1a33c;
+  --c-danger: #e5484d;
+
+  /* 边框 / 分隔 */
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+
+  /* 字体 */
+  --font-sans: "PingFang SC", "Microsoft YaHei", "Source Han Sans SC",
+    "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC",
+    "SimSun", serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+
+  /* 间距 / 圆角 / 阴影 */
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  --gap: 16px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 通用工具类 */
+.panel {
+  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-shell) 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.text-muted { color: var(--text-muted); }
+.brand { color: var(--brand); }
+.serif { font-family: var(--font-serif); }
+.mono { font-family: var(--font-mono); }
+
+/* 密级徽标 */
+.badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--line-strong);
+}
+.badge.PUBLIC { color: var(--c-public); border-color: rgba(46,204,113,.4); }
+.badge.INTERNAL { color: var(--c-internal); border-color: rgba(61,126,255,.4); }
+.badge.RESTRICTED { color: var(--c-restricted); border-color: rgba(241,163,60,.4); }
+.badge.SECRET { color: var(--c-secret); border-color: rgba(229,72,77,.4); }

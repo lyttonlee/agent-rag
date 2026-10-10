@@ -1,0 +1,77 @@
+# ============================================================
+# 企业公文知识库 · RAG 引擎平台 — Git 忽略规则
+# ============================================================
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境（uv / venv / virtualenv）
+.venv/
+venv/
+env/
+ENV/
+
+# 类型检查 / 测试 / 打包缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+.cache/
+
+# ---------------- 环境与密钥 ----------------
+# 真实环境文件含测试凭据，必须忽略；保留样例 .env.example
+.env
+.env.*
+!.env.example
+
+# ---------------- Node / 前端 ----------------
+node_modules/
+.pnpm-store/
+dist/
+*.local
+.vite/
+*.tsbuildinfo
+
+# ---------------- 运行时数据 ----------------
+# 对象存储落地目录（LocalFS 模式的 STORAGE_ROOT）
+backend/data/
+data/
+*.log
+logs/
+
+# ---------------- 操作系统 ----------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---------------- IDE / 编辑器 ----------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------------- 工具 / 代理状态 ----------------
+# WorkBuddy 项目态数据（非源码，不入库）
+.workbuddy/
