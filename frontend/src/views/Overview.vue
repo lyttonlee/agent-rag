@@ -1,43 +1,65 @@
 <script setup lang="ts">
+import { onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { getStats, type DocStats } from '@/api/client'
 
-const kpis = [
-  { label: '文档总量', value: '30', unit: '篇', tone: 'brand' },
-  { label: '切片总量', value: '193万', unit: '片', tone: 'brand' },
-  { label: '今日检索', value: '1,284', unit: '次', tone: '' },
-  { label: '检索准确率', value: '92.4', unit: '%', tone: 'good' },
-  { label: '幻觉率', value: '1.8', unit: '%', tone: 'warn' },
-  { label: '格式合规率', value: '98.1', unit: '%', tone: 'good' },
-]
+const stats = ref<DocStats | null>(null)
+const healthOk = ref(false)
+const kpis = ref<{ label: string; value: string; unit: string; tone: string }[]>([])
 
 const trendEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
-onMounted(() => {
-  if (!trendEl.value) return
-  chart = echarts.init(trendEl.value)
-  chart.setOption({
-    grid: { left: 36, right: 16, top: 20, bottom: 24 },
-    xAxis: { type: 'category', data: ['周一', '周二', '周三', '周四', '周五', '周六', '周日'],
-      axisLine: { lineStyle: { color: '#3a4a66' } }, axisLabel: { color: '#8a99b3' } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,.06)' } },
-      axisLabel: { color: '#8a99b3' } },
-    series: [{
-      type: 'line', smooth: true, data: [820, 932, 901, 1290, 1330, 620, 710],
-      lineStyle: { color: '#3d7eff' }, itemStyle: { color: '#3d7eff' },
-      areaStyle: { color: 'rgba(61,126,255,.18)' },
-    }],
-  })
-})
-onBeforeUnmount(() => chart?.dispose())
 
-const health = [
-  { name: 'PostgreSQL + pgvector', status: '正常', tone: 'good' },
-  { name: '对象存储 (LocalFS)', status: '正常', tone: 'good' },
-  { name: 'Qwen3-32B 推理(vLLM)', status: '运行中', tone: 'good' },
-  { name: 'Embedding-4B', status: '就绪', tone: 'good' },
-  { name: 'Reranker-0.6B', status: '就绪', tone: 'good' },
-]
+onMounted(async () => {
+  try {
+    const s = await getStats()
+    stats.value = s
+    const bySec = s.by_security || {}
+    const indexed = (s.by_status || {}).INDEXED || 0
+    const doneRate = s.total_documents ? Math.round((indexed / s.total_documents) * 100) : 0
+    kpis.value = [
+      { label: '文档总量', value: String(s.total_documents), unit: '篇', tone: 'brand' },
+      { label: '切片总量', value: String(s.total_chunks), unit: '片', tone: 'brand' },
+      { label: '公开文档', value: String(bySec.PUBLIC || 0), unit: '篇', tone: 'good' },
+      { label: '内部文档', value: String(bySec.INTERNAL || 0), unit: '篇', tone: '' },
+      { label: '入库完成率', value: String(doneRate), unit: '%', tone: 'good' },
+      { label: '状态', value: healthOk.value ? '正常' : '异常', unit: '', tone: healthOk.value ? 'good' : 'warn' },
+    ]
+  } catch {
+    kpis.value = [{ label: '状态', value: '后端未连通', unit: '', tone: 'warn' }]
+  }
+
+  // 趋势图：以密级分布占位演示（真实检索量需接入日志）
+  if (trendEl.value) {
+    chart = echarts.init(trendEl.value)
+    chart.setOption({
+      grid: { left: 36, right: 16, top: 20, bottom: 24 },
+      xAxis: { type: 'category', data: ['公开', '内部', '受限', '秘密'],
+        axisLine: { lineStyle: { color: '#3a4a66' } }, axisLabel: { color: '#8a99b3' } },
+      yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,.06)' } },
+        axisLabel: { color: '#8a99b3' } },
+      series: [{
+        type: 'bar', data: [
+          stats.value?.by_security?.PUBLIC || 0,
+          stats.value?.by_security?.INTERNAL || 0,
+          stats.value?.by_security?.RESTRICTED || 0,
+          stats.value?.by_security?.SECRET || 0,
+        ],
+        itemStyle: { color: '#3d7eff', borderRadius: [4, 4, 0, 0] },
+      }],
+    })
+  }
+})
+
+async function ping() {
+  try {
+    const r = await fetch('/v1/health')
+    healthOk.value = r.ok
+  } catch {
+    healthOk.value = false
+  }
+}
+ping()
 </script>
 
 <template>
@@ -50,14 +72,26 @@ const health = [
 
   <div class="row">
     <div class="panel chart">
-      <div class="ttl">近 7 日检索量趋势</div>
+      <div class="ttl">各密级文档分布</div>
       <div ref="trendEl" class="chart-box"></div>
     </div>
     <div class="panel health">
       <div class="ttl">系统健康</div>
-      <div v-for="h in health" :key="h.name" class="h-item">
-        <span>{{ h.name }}</span>
-        <span class="dot" :class="h.tone" />{{ h.status }}
+      <div class="h-item">
+        <span>后端服务 (FastAPI)</span>
+        <span class="dot" :class="healthOk ? 'good' : 'warn'" />{{ healthOk ? '正常' : '异常' }}
+      </div>
+      <div class="h-item">
+        <span>PostgreSQL + pgvector</span><span class="dot good" />正常
+      </div>
+      <div class="h-item">
+        <span>向量化 (192.168.6.49:8002)</span><span class="dot good" />已上线
+      </div>
+      <div class="h-item">
+        <span>重排 (192.168.6.49:8001)</span><span class="dot good" />已上线
+      </div>
+      <div class="h-item">
+        <span>生成 (阿里云百炼)</span><span class="dot good" />云端
       </div>
     </div>
   </div>
@@ -79,4 +113,5 @@ const health = [
 .h-item { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); color: var(--text); }
 .dot { width: 8px; height: 8px; border-radius: 50%; }
 .dot.good { background: var(--c-success); }
+.dot.warn { background: var(--c-warning); }
 </style>

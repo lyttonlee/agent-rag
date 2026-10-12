@@ -122,3 +122,43 @@ class ConfigKV(Base, TimestampMixin):
     value: Mapped[dict] = mapped_column(JSON, default=dict)
     scope: Mapped[str | None] = mapped_column(String(128))         # 可选：按部署方隔离
     is_active: Mapped[bool] = mapped_column(default=True)
+
+
+# 入库任务状态机：PENDING → PARSING → CHUNKING → EMBEDDING → INDEXED
+#                                              ↘ FAILED（任意阶段异常）
+INGESTION_STATUSES = (
+    "PENDING",
+    "PARSING",
+    "CHUNKING",
+    "EMBEDDING",
+    "INDEXED",
+    "FAILED",
+)
+
+
+class IngestionJob(Base, TimestampMixin):
+    """入库异步任务（状态机 + 进度），供前端展示"文档入库进度"。
+
+    一次文件/正文接入对应一个 job；后端以 asyncio 后台任务推进各阶段，
+    并实时回写 status / progress / processed_chunks，前端轮询即可呈现步进式进度。
+    """
+
+    __tablename__ = "ingestion_jobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    filename: Mapped[str] = mapped_column(String(256))            # 原始文件名 / 标识
+    status: Mapped[str] = mapped_column(
+        String(16), default="PENDING", index=True
+    )
+    progress: Mapped[int] = mapped_column(Integer, default=0)      # 0-100
+    total_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    processed_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    document_id: Mapped[str | None] = mapped_column(String(32), index=True)
+
+    # 接入参数快照（便于回溯与复现）
+    strategy: Mapped[str] = mapped_column(String(16), default="paragraph")
+    chunk_size: Mapped[int] = mapped_column(Integer, default=800)
+    chunk_overlap: Mapped[int] = mapped_column(Integer, default=80)
+    security_level: Mapped[str] = mapped_column(String(16), default="INTERNAL")
+    doc_type: Mapped[str] = mapped_column(String(64), default="通知")

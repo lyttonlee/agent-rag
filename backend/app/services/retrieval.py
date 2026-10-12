@@ -86,14 +86,16 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
             # 与成功分支保持同一形状：((Chunk, rrf_score), 展示分)
             ranked = [((c, s_rrf), s_rrf) for (c, s_rrf) in top]
     else:
-        ranked = [(item, s) for item, s in top]
+        # 不做重排：以 RRF 融合分作为展示分，保持与上面分支一致的形状
+        # ((Chunk, rrf_score), display_score)
+        ranked = [((c, s), s) for c, s in top]
 
     citations = [
         Citation(
             chunk_id=c.id,
             document_id=c.document_id,
             title=c.document.title if c.document else "",
-            doc_no=None,
+            doc_no=c.document.doc_no if c.document else None,
             snippet=c.content[:200],
             score=float(s),
         )

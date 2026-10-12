@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 # ---- 通用 ----
 SecurityLevel = Literal["PUBLIC", "INTERNAL", "RESTRICTED", "SECRET"]
+# 切分策略（与 chunker.ChunkStrategy 对应）
+ChunkStrategy = Literal["paragraph", "fixed", "sentence", "section"]
 
 
 class HealthResp(BaseModel):
@@ -36,6 +39,10 @@ class DocumentIngest(BaseModel):
     source_system: str | None = None
     content: str | None = Field(None, description="内联正文；或与 content_ref 二选一")
     content_ref: str | None = Field(None, description="存储对象键：local 模式为相对路径，s3 模式为对象键；或与内联 content 文本二选一")
+    # ---- 切分策略（RAG 精髓：可选切分方式）----
+    chunk_strategy: ChunkStrategy = Field("paragraph", description="切分策略：paragraph 按段落 / fixed 定长 / sentence 按句 / section 按章节")
+    chunk_size: int = Field(800, description="单切片最大字符数", ge=64, le=4000)
+    chunk_overlap: int = Field(80, description="相邻切片重叠字符数", ge=0, le=1000)
 
 
 class IngestResp(BaseModel):
@@ -44,6 +51,72 @@ class IngestResp(BaseModel):
     status: str
     chunk_count: int = 0
     message: str = ""
+
+
+# ---- 入库任务（状态机 + 进度）----
+class IngestionJobResp(BaseModel):
+    """入库异步任务的实时状态（前端轮询展示进度）。"""
+    id: str
+    filename: str
+    status: str                                  # PENDING/PARSING/CHUNKING/EMBEDDING/INDEXED/FAILED
+    progress: int = 0                             # 0-100 百分比
+    total_chunks: int = 0
+    processed_chunks: int = 0
+    error_message: str | None = None
+    document_id: str | None = None
+    strategy: str = "paragraph"
+    chunk_size: int = 800
+    chunk_overlap: int = 80
+    security_level: str = "INTERNAL"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+# ---- 文档列表 / 详情（管理视图，真实数据）----
+class ChunkInfo(BaseModel):
+    seq: int
+    content: str
+    security_level: str
+    tokens: int = 0
+
+
+class DocumentSummary(BaseModel):
+    id: str
+    external_id: str
+    title: str
+    doc_type: str
+    issuer: str | None = None
+    doc_no: str | None = None
+    security_level: str
+    permission_tags: list[str] = Field(default_factory=list)
+    status: str
+    chunk_count: int = 0
+    created_at: datetime | None = None
+
+
+class DocumentDetail(BaseModel):
+    id: str
+    external_id: str
+    title: str
+    doc_type: str
+    issuer: str | None = None
+    doc_no: str | None = None
+    publish_date: datetime | None = None
+    security_level: str
+    permission_tags: list[str] = Field(default_factory=list)
+    owner_org: str | None = None
+    source_system: str | None = None
+    status: str
+    chunk_count: int = 0
+    created_at: datetime | None = None
+    chunks: list[ChunkInfo] = Field(default_factory=list)
+
+
+class DocStats(BaseModel):
+    total_documents: int = 0
+    total_chunks: int = 0
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_security: dict[str, int] = Field(default_factory=dict)
 
 
 # ---- 检索 ----

@@ -1,19 +1,26 @@
 """入库编排：解析 → 切片 → 向量化 → 落库。
 
-MVP 阶段为同步编排（便于跟踪）；批量导入时由异步任务队列分发。
+MVP 阶段提供两条路径：
+- ``ingest_document``：同步编排，供第三方 ``POST /documents/ingest`` 即时接入。
+- ``process_ingestion_job``：异步任务，供文件上传/批量接入，按状态机
+  (PENDING→PARSING→CHUNKING→EMBEDDING→INDEXED) 推进并实时回写进度，
+  前端轮询即可呈现"入库进度"。
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.models import Chunk as ChunkModel
 from app.db.models import Document as DocumentModel
-from app.services.chunker import build_prefix, chunk_text
+from app.db.models import IngestionJob
+from app.db.session import AsyncSessionLocal
+from app.services.chunker import build_prefix, chunk_document
 from app.services.model_provider import ModelProvider
 from app.services.parser import parse_bytes
 from app.services.storage import get_storage
@@ -26,14 +33,18 @@ async def _embed_batched(
     texts: list[str],
     batch_size: int = 8,
     max_retries: int = 2,
+    progress_cb=None,
 ) -> list[list[float]]:
     """分批调用 embedding，并对超时/瞬时错误做有限重试。
 
     大文档切片较多，整批请求易超出内网模型响应时间；分批可限制单批规模、
     分摊风险，并在偶发超时时快速重试而不丢失已成功的批次。
+    ``progress_cb(done, total)`` 用于回写入库任务进度。
     """
     out: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
+    total = len(texts)
+    done = 0
+    for i in range(0, total, batch_size):
         batch = texts[i : i + batch_size]
         last_exc: Exception | None = None
         for attempt in range(1, max_retries + 1):
@@ -47,6 +58,9 @@ async def _embed_batched(
                     await asyncio.sleep(2 * attempt)
         if last_exc is not None:
             raise last_exc
+        done += len(batch)
+        if progress_cb:
+            await progress_cb(done, total)
     return out
 
 
@@ -55,7 +69,7 @@ async def ingest_document(
     payload: dict,
     raw_bytes: bytes | None = None,
 ) -> dict:
-    """接入一篇文档并入库。
+    """接入一篇文档并同步入库（第三方即时接入路径）。
 
     Args:
         db: 异步会话
@@ -80,6 +94,7 @@ async def ingest_document(
         doc_type=payload["doc_type"],
         issuer=payload.get("issuer"),
         doc_no=payload.get("doc_no"),
+        publish_date=_parse_date(payload.get("publish_date")),
         security_level=payload.get("security_level", "INTERNAL"),
         permission_tags=payload.get("permission_tags", []),
         owner_org=payload.get("owner_org"),
@@ -97,9 +112,15 @@ async def ingest_document(
         get_storage().save(key, raw_bytes)
         doc.content_ref = key
 
-    # 3) 切片 + 前缀
+    # 3) 切片：按接入方指定的策略 / 尺寸切分（RAG 切分核心）
     prefix = build_prefix(doc.title, doc.issuer, payload.get("publish_date"))
-    pieces = chunk_text(content or "", prefix)
+    pieces = chunk_document(
+        content or "",
+        prefix,
+        strategy=payload.get("chunk_strategy", "paragraph"),
+        max_chars=payload.get("chunk_size", 800),
+        overlap=payload.get("chunk_overlap", 80),
+    )
 
     # 4) 向量化（分批调用 emb Provider + 超时重试，避免大文档单批卡死）
     emb_provider = ModelProvider(role="emb")
@@ -117,7 +138,8 @@ async def ingest_document(
                 embedding=vec,
                 security_level=doc.security_level,
                 permission_tags=doc.permission_tags,
-                # 中文 BM25 向量（zhparser）：入库时即时生成，
+                tokens=len(piece.content),
+                # 中文 BM25 向量（zhparser）：入库时即时生成；
                 # 生产环境另有触发器兜底（见迁移 0002），确保 dev/prod 一致。
                 search_vec=func.to_tsvector("chinese", piece.content),
             )
@@ -133,3 +155,131 @@ async def ingest_document(
         "status": doc.status,
         "chunk_count": doc.chunk_count,
     }
+
+
+def _parse_date(value) -> datetime | None:
+    """宽容解析 ISO 日期字符串为 datetime（接入方格式可能不一致）。"""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(value[:19], fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict) -> None:
+    """异步推进入库任务（状态机 + 进度回写）。
+
+    由 ``POST /documents/upload`` 通过 asyncio.create_task 触发，运行在独立会话中，
+    实时更新 ``IngestionJob`` 行；前端轮询 ``GET /documents/jobs/{id}`` 即可看到进度。
+
+    Args:
+        job_id: 入库任务主键
+        raw_bytes: 上传文件原始字节（None 表示纯内联正文）
+        meta: 接入元数据（title/external_id/doc_type/security_level/strategy/...）
+    """
+    async with AsyncSessionLocal() as db:
+        job = (await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))).scalar_one_or_none()
+        if not job:
+            return
+
+        try:
+            # 阶段：解析
+            job.status = "PARSING"
+            job.progress = 5
+            await db.commit()
+
+            content = meta.get("content")
+            if not content and raw_bytes:
+                parse_name = meta.get("filename") or meta.get("title") or "doc"
+                parsed = parse_bytes(parse_name, raw_bytes)
+                content = parsed.text
+            job.status = "CHUNKING"
+            job.progress = 20
+            await db.commit()
+
+            # 阶段：切片
+            prefix = build_prefix(
+                meta.get("title", ""), meta.get("issuer"), meta.get("publish_date")
+            )
+            pieces = chunk_document(
+                content or "",
+                prefix,
+                strategy=meta.get("chunk_strategy", "paragraph"),
+                max_chars=meta.get("chunk_size", 800),
+                overlap=meta.get("chunk_overlap", 80),
+            )
+            job.total_chunks = len(pieces)
+            job.status = "EMBEDDING"
+            job.progress = 40
+            await db.commit()
+
+            # 阶段：向量化（分批，逐批回写进度）
+            emb_provider = ModelProvider(role="emb")
+            texts = [p.content for p in pieces]
+
+            async def _progress(done: int, total: int):
+                job.processed_chunks = done
+                # 40%(切片完成) → 95%(向量化完成) 线性映射
+                job.progress = 40 + int(55 * done / max(total, 1))
+                await db.commit()
+
+            embeddings = await _embed_batched(
+                emb_provider, texts, batch_size=8, max_retries=2, progress_cb=_progress
+            )
+
+            # 阶段：落库文档 + 切片
+            doc = DocumentModel(
+                external_id=meta["external_id"],
+                title=meta["title"],
+                doc_type=meta.get("doc_type", "通知"),
+                issuer=meta.get("issuer"),
+                doc_no=meta.get("doc_no"),
+                publish_date=_parse_date(meta.get("publish_date")),
+                security_level=meta.get("security_level", "INTERNAL"),
+                permission_tags=meta.get("permission_tags", []),
+                owner_org=meta.get("owner_org"),
+                source_system=meta.get("source_system"),
+                status="INDEXED",
+                chunk_count=len(pieces),
+            )
+            db.add(doc)
+            await db.flush()
+
+            if raw_bytes and not meta.get("content_ref"):
+                ext = (meta.get("filename") or "bin").rsplit(".", 1)[-1].lower()
+                key = f"raw/{doc.id}.{ext}"
+                get_storage().save(key, raw_bytes)
+                doc.content_ref = key
+
+            for seq, (piece, vec) in enumerate(zip(pieces, embeddings), start=1):
+                db.add(
+                    ChunkModel(
+                        document_id=doc.id,
+                        seq=seq,
+                        content=piece.content,
+                        content_prefix=prefix,
+                        embedding=vec,
+                        security_level=doc.security_level,
+                        permission_tags=doc.permission_tags,
+                        tokens=len(piece.content),
+                        search_vec=func.to_tsvector("chinese", piece.content),
+                    )
+                )
+
+            # 收尾：任务完成
+            job.status = "INDEXED"
+            job.progress = 100
+            job.processed_chunks = len(pieces)
+            job.document_id = doc.id
+            await db.commit()
+        except Exception as exc:  # 任意阶段异常 → 标记失败，不阻塞服务
+            await db.rollback()
+            job.status = "FAILED"
+            job.error_message = f"{type(ex).__name__}: {str(ex)[:500]}"
+            job.progress = 0
+            await db.commit()

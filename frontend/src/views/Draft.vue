@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import client, { caller } from '@/api/client'
+import { generate as genApi } from '@/api/client'
 
 const docType = ref('通知')
 const topic = ref('关于开展第三季度安全生产大检查的通知')
@@ -12,21 +12,24 @@ const hits = ref<string[]>([])
 async function generate() {
   loading.value = true
   try {
-    const r = await client.post('/generate', {
-      query: topic.value, template_doc_type: docType.value, ...caller,
+    const r = await genApi(topic.value, {
+      template_doc_type: docType.value, rerank: false,
     })
-    answer.value = r.data.answer
-    citations.value = r.data.citations || []
-    hits.value = r.data.sensitive_hits || []
+    answer.value = r.answer
+    citations.value = r.citations || []
+    hits.value = r.sensitive_hits || []
   } finally { loading.value = false }
 }
 
 async function exportDocx() {
   // 直接触发文件下载（后端 /v1/export/docx 返回 FileResponse）
-  const r = await client.post('/export/docx', {
-    query: topic.value, template_doc_type: docType.value, ...caller,
-  }, { responseType: 'blob' })
-  const url = URL.createObjectURL(r.data as Blob)
+  const r = await fetch('/v1/export/docx', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: topic.value, template_doc_type: docType.value }),
+  })
+  const blob = await r.blob()
+  const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = `${topic.value.slice(0, 20)}.docx`

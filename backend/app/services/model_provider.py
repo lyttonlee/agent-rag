@@ -89,69 +89,41 @@ class ModelProvider:
 
     # ---- 重排（在线，对 top-N 逐条打分）----
     async def rerank(self, query: str, docs: list[str], top_n: int | None = None) -> list[float]:
-        """重排：优先调用 OpenAI 兼容的 /v1/rerank 原生端点（vLLM 风格），
-        失败则回退到 chat 兜底（部分仅暴露 chat 的部署方 / 历史 Mock）。
+        """重排：调用 OpenAI 兼容的 /v1/rerank 原生端点（vLLM 风格）。
 
         原生 /v1/rerank 请求体：{model, query, documents[, top_n]}
         响应体：{results:[{index, document:{text}, relevance_score}]}
           - results 按**原始输入顺序**给出，需按 index 对齐回输入顺序。
+
+        约定：rerank 端点应在 15s 内返回；超时或连接/协议错误时**抛出**，由检索
+        层捕获并降级为 RRF 排序（不阻断主链路）。用户侧已确认 rerank 部署后
+        「15s 超时则降级」的诉求。
         """
         payload = {"model": self.model_name, "query": query, "documents": docs}
         if top_n:
             payload["top_n"] = top_n
 
-        # 优先调用原生 /v1/rerank（vLLM 风格）。内网 rerank 偶发冷启动/偏慢，
-        # 放宽超时到 120s 并允许一次退避重试，避免误判为失败。
-        last_exc: Exception | None = None
-        for attempt in range(1, 3):
-            try:
-                import httpx
-
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/rerank",
-                        json=payload,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                results = data.get("results", [])
-                # 按 index 对齐回输入顺序：缺失项记 0.0
-                score_map = {
-                    int(r["index"]): float(r.get("relevance_score", 0.0)) for r in results
-                }
-                scores = [score_map.get(i, 0.0) for i in range(len(docs))]
-                return scores
-            except Exception as exc:
-                last_exc = exc
-                if attempt < 2:
-                    await asyncio.sleep(3)
-        # 原生端点连续失败：对「连接/超时」类错误直接抛出（该端点本就是 rerank，
-        # 不应再打 chat）；仅当端点确不存在时退回 chat 兜底。
-        if isinstance(last_exc, (httpx.ConnectError, httpx.ReadTimeout, asyncio.TimeoutError)):
-            raise last_exc  # 真实 rerank 端点慢/抖动：如实抛出，便于定位
+        # 单次调用，15s 超时；失败（超时/连接/协议错误）直接抛出，检索层降级 RRF。
+        RERANK_TIMEOUT = 15.0
         try:
-            scores = []
-            for d in docs:
-                resp = await self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "判断相关性，仅返回 0-1 的小数分数。",
-                        },
-                        {"role": "user", "content": f"查询：{query}\n文档：{d}"},
-                    ],
-                    temperature=0.0,
-                    max_tokens=8,
+            async with httpx.AsyncClient(timeout=RERANK_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self.base_url}/rerank",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
                 )
-                try:
-                    scores.append(float(resp.choices[0].message.content or "0"))
-                except ValueError:
-                    scores.append(0.0)
+                resp.raise_for_status()
+                data = resp.json()
+            results = data.get("results", [])
+            # 按 index 对齐回输入顺序：缺失项记 0.0
+            score_map = {
+                int(r["index"]): float(r.get("relevance_score", 0.0)) for r in results
+            }
+            scores = [score_map.get(i, 0.0) for i in range(len(docs))]
             return scores
-        except Exception:
-            raise last_exc
+        except Exception as exc:
+            # 连接/超时/协议错误：如实抛出，交给检索层降级（返回 RRF 顺序）。
+            raise exc
 
         if top_n:
             order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
