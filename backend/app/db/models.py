@@ -162,3 +162,33 @@ class IngestionJob(Base, TimestampMixin):
     chunk_overlap: Mapped[int] = mapped_column(Integer, default=80)
     security_level: Mapped[str] = mapped_column(String(16), default="INTERNAL")
     doc_type: Mapped[str] = mapped_column(String(64), default="通知")
+
+
+class AuditLog(Base, TimestampMixin):
+    """审计日志：记录"谁 / 何时 / 做了什么 / 结果如何 / 主题 / 客体"。
+
+    设计（满足《需求规格说明书》审计要求）：
+    - actor / actor_ip：操作者身份与上手 IP（信任上游网关下发的 X-Operator，缺省 anonymous）。
+    - action：语义动作（如"文档入库""检索""生成""配置变更"），method+endpoint 留痕。
+    - subject_type / subject_id：操作主体（操作者维度，便于按人追溯）。
+    - object_type / object_id：被操作客体（文档 / 任务 / 配置项等，便于按资源追溯）。
+    - result / status_code / detail：成功或失败、HTTP 状态、事件摘要。
+    - duration_ms：请求耗时，辅助性能审计。
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    actor: Mapped[str] = mapped_column(String(128), index=True, default="anonymous")  # 操作者
+    actor_ip: Mapped[str | None] = mapped_column(String(64))                          # 上手 IP
+    action: Mapped[str] = mapped_column(String(64), index=True)                       # 语义动作
+    method: Mapped[str | None] = mapped_column(String(16))                            # HTTP 方法
+    endpoint: Mapped[str | None] = mapped_column(String(256))                         # 路由
+    subject_type: Mapped[str | None] = mapped_column(String(32), index=True)          # 主题类型
+    subject_id: Mapped[str | None] = mapped_column(String(128), index=True)           # 主题 id
+    object_type: Mapped[str | None] = mapped_column(String(32), index=True)           # 客体类型
+    object_id: Mapped[str | None] = mapped_column(String(128), index=True)            # 客体 id
+    result: Mapped[str] = mapped_column(String(16), default="success")                # success/failure
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    duration_ms: Mapped[int | None] = mapped_column(Integer)

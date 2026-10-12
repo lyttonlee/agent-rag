@@ -27,6 +27,7 @@ const env = import.meta.env.MODE
         <el-menu-item index="/draft"><el-icon><EditPen /></el-icon>智能起草</el-menu-item>
         <el-menu-item index="/templates"><el-icon><Files /></el-icon>模板库</el-menu-item>
         <el-menu-item index="/config"><el-icon><Setting /></el-icon>配置中心</el-menu-item>
+        <el-menu-item index="/audit"><el-icon><Notebook /></el-icon>审计日志</el-menu-item>
         <el-menu-item index="/ops"><el-icon><Monitor /></el-icon>运维台</el-menu-item>
       </el-menu>
       <div class="sidebar-foot text-muted">v1.2.0 · 内网部署</div>

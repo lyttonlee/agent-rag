@@ -2,6 +2,10 @@
 
 第三方公文系统按我方标准元数据接入文档；运维台（前端）通过本路由浏览真实
 文档库、上传文件（带切分策略与入库进度状态机）、查看切片与统计。
+
+路由顺序约定（FastAPI 按注册顺序匹配）：
+静态路径（/stats、/jobs、/jobs/{job_id}）必须先于动态路径（/{doc_id}）注册，
+否则 /documents/jobs 会被 /{doc_id} 以 doc_id="jobs" 短路为 404。
 """
 
 from __future__ import annotations
@@ -9,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +22,7 @@ from app.core.config import Settings
 from app.db.models import Chunk, Document, IngestionJob
 from app.db.session import get_db
 from app.schemas.contracts import (
+    ChunkInfo,
     DocumentDetail,
     DocumentIngest,
     DocumentSummary,
@@ -88,17 +93,7 @@ async def upload(
     await db.refresh(job)
     # 后台推进状态机（独立会话，实时回写进度）
     asyncio.create_task(process_ingestion_job(job.id, raw, meta))
-    return IngestionJobResp(
-        id=job.id,
-        filename=job.filename,
-        status=job.status,
-        strategy=job.strategy,
-        chunk_size=job.chunk_size,
-        chunk_overlap=job.chunk_overlap,
-        security_level=job.security_level,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-    )
+    return _job_resp(job)
 
 
 @router.get("", response_model=list[DocumentSummary])
@@ -163,15 +158,42 @@ async def stats(db: AsyncSession = Depends(get_db)) -> DocStats:
     )
 
 
+@router.get("/jobs", response_model=list[IngestionJobResp])
+async def list_jobs(
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100),
+) -> list[IngestionJobResp]:
+    """最近入库任务列表（状态机进度总览）。"""
+    rows = (
+        await db.execute(
+            select(IngestionJob).order_by(IngestionJob.created_at.desc()).limit(limit)
+        )
+    ).scalars().all()
+    return [_job_resp(j) for j in rows]
+
+
+@router.get("/jobs/{job_id}", response_model=IngestionJobResp)
+async def get_job(job_id: str, db: AsyncSession = Depends(get_db)) -> IngestionJobResp:
+    """入库任务实时状态（前端轮询）。"""
+    job = (
+        await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
+    ).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return _job_resp(job)
+
+
 @router.get("/{doc_id}", response_model=DocumentDetail)
 async def get_document(doc_id: str, db: AsyncSession = Depends(get_db)) -> DocumentDetail:
-    """文档详情（含切片列表）。"""
+    """文档详情（含切片列表）。
+
+    修复记录：曾因未导入 ChunkInfo 导致 NameError（HTTP 500），
+    表现为前端"获取文档分片失败"；现已补齐导入并补充回归验证。
+    """
     doc = (
         await db.execute(select(Document).where(Document.id == doc_id))
     ).scalar_one_or_none()
     if not doc:
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=404, detail="文档不存在")
     chunk_rows = (
         await db.execute(
@@ -205,34 +227,8 @@ async def get_document(doc_id: str, db: AsyncSession = Depends(get_db)) -> Docum
     )
 
 
-@router.get("/jobs", response_model=list[IngestionJobResp])
-async def list_jobs(
-    db: AsyncSession = Depends(get_db),
-    limit: int = Query(20, ge=1, le=100),
-) -> list[IngestionJobResp]:
-    """最近入库任务列表（状态机进度总览）。"""
-    rows = (
-        await db.execute(
-            select(IngestionJob).order_by(IngestionJob.created_at.desc()).limit(limit)
-        )
-    ).scalars().all()
-    return [_job_resp(j) for j in rows]
-
-
-@router.get("/jobs/{job_id}", response_model=IngestionJobResp)
-async def get_job(job_id: str, db: AsyncSession = Depends(get_db)) -> IngestionJobResp:
-    """入库任务实时状态（前端轮询）。"""
-    job = (
-        await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))
-    ).scalar_one_or_none()
-    if not job:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return _job_resp(job)
-
-
 def _job_resp(j: IngestionJob) -> IngestionJobResp:
+    """入库任务 ORM → 响应 DTO（含进度字段，供前端状态机展示）。"""
     return IngestionJobResp(
         id=j.id,
         filename=j.filename,

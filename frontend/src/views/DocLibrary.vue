@@ -137,8 +137,11 @@ const detailLoading = ref(false)
 async function openDetail(id: string) {
   drawer.value = true
   detailLoading.value = true
+  detail.value = null
   try {
     detail.value = await getDocument(id)
+  } catch (e: any) {
+    ElMessage.error('获取文档分片失败：' + (e?.response?.data?.detail || e.message))
   } finally {
     detailLoading.value = false
   }
@@ -202,7 +205,11 @@ async function quickIngest() {
       </el-upload>
       <el-form :model="form" label-width="92px" style="margin-top: 14px">
         <el-form-item label="标题"><el-input v-model="form.title" placeholder="默认取文件名" /></el-form-item>
-        <el-form-item label="文种"><el-input v-model="form.doc_type" /></el-form-item>
+        <el-form-item label="文种">
+          <el-select v-model="form.doc_type" style="width: 160px">
+            <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="发文机关"><el-input v-model="form.issuer" /></el-form-item>
         <el-form-item label="文号"><el-input v-model="form.doc_no" /></el-form-item>
         <el-form-item label="密级">

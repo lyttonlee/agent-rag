@@ -10,6 +10,7 @@ MVP 阶段提供两条路径：
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 
 from sqlalchemy import func, select
@@ -26,6 +27,10 @@ from app.services.parser import parse_bytes
 from app.services.storage import get_storage
 
 _settings = get_settings()
+logger = logging.getLogger(__name__)
+
+# 非终态：这些状态在进程重启后不应"永远停留"，需回收为 FAILED。
+_NON_TERMINAL = {"PENDING", "PARSING", "CHUNKING", "EMBEDDING"}
 
 
 async def _embed_batched(
@@ -177,6 +182,11 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
     由 ``POST /documents/upload`` 通过 asyncio.create_task 触发，运行在独立会话中，
     实时更新 ``IngestionJob`` 行；前端轮询 ``GET /documents/jobs/{id}`` 即可看到进度。
 
+    关键修复：
+    - 解析（``parse_bytes`` 为 CPU 密集型同步调用）放到线程池执行，避免阻塞事件循环，
+      否则大文档解析期间轮询请求无法被服务，前端表现为"卡在解析阶段(5%)"。
+    - 每个阶段补充结构化日志，便于线上定位卡点。
+
     Args:
         job_id: 入库任务主键
         raw_bytes: 上传文件原始字节（None 表示纯内联正文）
@@ -186,23 +196,30 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
         job = (await db.execute(select(IngestionJob).where(IngestionJob.id == job_id))).scalar_one_or_none()
         if not job:
             return
+        # 防御：若任务已被标记为终态（如启动回收），不再重复处理
+        if job.status in ("INDEXED", "FAILED"):
+            logger.warning("入库任务 %s 已是终态(%s)，跳过", job_id, job.status)
+            return
 
         try:
-            # 阶段：解析
+            logger.info("入库任务 %s 开始：filename=%s strategy=%s", job_id, job.filename, meta.get("chunk_strategy"))
+
+            # 阶段：解析（线程池，避免阻塞事件循环）
             job.status = "PARSING"
             job.progress = 5
             await db.commit()
-
             content = meta.get("content")
             if not content and raw_bytes:
                 parse_name = meta.get("filename") or meta.get("title") or "doc"
-                parsed = parse_bytes(parse_name, raw_bytes)
+                logger.info("入库任务 %s 解析中：%s (%d bytes)", job_id, parse_name, len(raw_bytes))
+                parsed = await asyncio.to_thread(parse_bytes, parse_name, raw_bytes)
                 content = parsed.text
+                logger.info("入库任务 %s 解析完成：%d 字符，扫描件=%s", job_id, len(content or ""), parsed.is_scanned)
+
+            # 阶段：切片
             job.status = "CHUNKING"
             job.progress = 20
             await db.commit()
-
-            # 阶段：切片
             prefix = build_prefix(
                 meta.get("title", ""), meta.get("issuer"), meta.get("publish_date")
             )
@@ -214,11 +231,12 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 overlap=meta.get("chunk_overlap", 80),
             )
             job.total_chunks = len(pieces)
+            logger.info("入库任务 %s 切片完成：%d 片", job_id, len(pieces))
+
+            # 阶段：向量化（分批，逐批回写进度）
             job.status = "EMBEDDING"
             job.progress = 40
             await db.commit()
-
-            # 阶段：向量化（分批，逐批回写进度）
             emb_provider = ModelProvider(role="emb")
             texts = [p.content for p in pieces]
 
@@ -231,6 +249,7 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
             embeddings = await _embed_batched(
                 emb_provider, texts, batch_size=8, max_retries=2, progress_cb=_progress
             )
+            logger.info("入库任务 %s 向量化完成：%d 片", job_id, len(embeddings))
 
             # 阶段：落库文档 + 切片
             doc = DocumentModel(
@@ -277,9 +296,31 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
             job.processed_chunks = len(pieces)
             job.document_id = doc.id
             await db.commit()
+            logger.info("入库任务 %s 完成：document_id=%s 切片=%d", job_id, doc.id, len(pieces))
         except Exception as exc:  # 任意阶段异常 → 标记失败，不阻塞服务
             await db.rollback()
             job.status = "FAILED"
             job.error_message = f"{type(ex).__name__}: {str(ex)[:500]}"
             job.progress = 0
             await db.commit()
+            logger.exception("入库任务 %s 失败：%s", job_id, exc)
+
+
+async def reconcile_stuck_jobs() -> int:
+    """启动回收：将残留的非终态入库任务标记为 FAILED。
+
+    场景：进程在入库途中重启/崩溃，任务停留在 PENDING/PARSING/CHUNKING/EMBEDDING，
+    若不回收会"永久 5%"。本函数在 lifespan 启动时调用，返回被回收的任务数。
+    """
+    async with AsyncSessionLocal() as db:
+        stuck = (
+            await db.execute(select(IngestionJob).where(IngestionJob.status.in_(_NON_TERMINAL)))
+        ).scalars().all()
+        for j in stuck:
+            j.status = "FAILED"
+            j.progress = 0
+            j.error_message = "进程重启回收：原任务未正常完成"
+        if stuck:
+            await db.commit()
+            logger.warning("启动回收 %d 个残留入库任务为 FAILED", len(stuck))
+        return len(stuck)

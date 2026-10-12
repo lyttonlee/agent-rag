@@ -169,3 +169,268 @@ export async function generate(
   })
   return r.data
 }
+
+// ============================ 流式生成（SSE） ============================
+
+export interface CitationPayload {
+  chunk_id: string
+  document_id: string
+  title: string
+  doc_no: string | null
+  snippet: string
+  score: number
+}
+
+export interface StreamHandlers {
+  /** 检索元数据（引用列表）到达 */
+  onMeta?: (model: string, citations: CitationPayload[], truncated: boolean) => void
+  /** 正文 token 逐片到达 */
+  onToken?: (text: string) => void
+  /** 思考链片段到达（推理模型） */
+  onReasoning?: (text: string) => void
+  /** 流式完成（含脱敏后完整答案与敏感词命中） */
+  onDone?: (answer: string, sensitiveHits: string[], model: string) => void
+  /** 出错（后端推送 error 事件或网络异常） */
+  onError?: (message: string) => void
+}
+
+export interface StreamGenerateOpts {
+  query: string
+  template_doc_type?: string
+  caller_scope?: string[]
+  max_clearance?: SecurityLevel
+  rerank?: boolean
+  top_n?: number
+}
+
+/**
+ * 流式生成：fetch 消费 POST /v1/generate/stream（text/event-stream）。
+ *
+ * 之所以用原生 fetch 而非 axios：axios 不支持流式读取响应体，
+ * 必须逐段解析 SSE（data: {...}\n\n）才能实现"实时出字"体验。
+ * 返回 AbortController，调用方可随时中止（用户点「停止」）。
+ */
+export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandlers): AbortController {
+  const controller = new AbortController()
+
+  const run = async () => {
+    let resp: Response
+    try {
+      resp = await fetch('/v1/generate/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: opts.query,
+          template_doc_type: opts.template_doc_type,
+          caller_scope: opts.caller_scope ?? [],
+          max_clearance: opts.max_clearance ?? 'INTERNAL',
+          rerank: opts.rerank ?? false,
+          top_n: opts.top_n ?? 8,
+        }),
+        signal: controller.signal,
+      })
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      handlers.onError?.(`网络错误：${e?.message || e}`)
+      return
+    }
+    if (!resp.ok || !resp.body) {
+      handlers.onError?.(`服务端错误 HTTP ${resp.status}`)
+      return
+    }
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        // SSE 事件以空行分隔；逐事件解析，做到"到达即渲染"
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const raw = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          const line = raw.trim()
+          if (!line.startsWith('data:')) continue
+          let evt: any
+          try {
+            evt = JSON.parse(line.slice(5).trim())
+          } catch {
+            continue
+          }
+          switch (evt.type) {
+            case 'meta':
+              handlers.onMeta?.(evt.model ?? '', evt.citations ?? [], !!evt.truncated_by_security)
+              break
+            case 'token':
+              handlers.onToken?.(evt.text ?? '')
+              break
+            case 'reasoning':
+              handlers.onReasoning?.(evt.text ?? '')
+              break
+            case 'done':
+              handlers.onDone?.(evt.answer ?? '', evt.sensitive_hits ?? [], evt.model ?? '')
+              break
+            case 'error':
+              handlers.onError?.(evt.message ?? '生成失败')
+              break
+          }
+        }
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      handlers.onError?.(`流式读取中断：${e?.message || e}`)
+    }
+  }
+  void run()
+  return controller
+}
+
+// ============================ 配置中心 ============================
+
+export interface ConfigItem {
+  category: string
+  key: string
+  value: Record<string, unknown>
+  scope: string | null
+  is_active: boolean
+}
+
+export async function getConfigItems(category: string): Promise<ConfigItem[]> {
+  const r = await client.get<ConfigItem[]>('/config/items', { params: { category } })
+  return r.data
+}
+
+export async function saveConfigItem(item: ConfigItem): Promise<ConfigItem> {
+  const r = await client.put<ConfigItem>('/config/items', item)
+  return r.data
+}
+
+export async function deleteConfigItem(category: string, key: string): Promise<void> {
+  await client.delete('/config/items', { params: { category, key } })
+}
+
+// ============================ 模板库 ============================
+
+export interface TemplateSection {
+  key: string
+  label: string
+  placeholder: string
+  required: boolean
+}
+
+export interface TemplateLayout {
+  red_head: boolean
+  font: string
+  paper: string
+  subtitle: string
+  tone: string
+  sections: TemplateSection[]
+}
+
+export interface TemplateItem {
+  key: string
+  value: {
+    name: string
+    layout: TemplateLayout
+    content_ref?: string | null
+  }
+}
+
+export async function listTemplates(): Promise<TemplateItem[]> {
+  const r = await client.get<TemplateItem[]>('/templates')
+  return r.data
+}
+
+export async function uploadTemplate(
+  file: File,
+  meta: { doc_type?: string; name?: string },
+): Promise<TemplateItem> {
+  const form = new FormData()
+  form.append('file', file)
+  if (meta.doc_type) form.append('doc_type', meta.doc_type)
+  if (meta.name) form.append('name', meta.name)
+  const r = await client.post<TemplateItem>('/templates/upload', form)
+  return r.data
+}
+
+export async function saveTemplate(
+  docType: string,
+  value: { name: string; layout: TemplateLayout },
+): Promise<TemplateItem> {
+  const r = await client.post<TemplateItem>('/templates', {
+    category: 'template',
+    key: docType,
+    value,
+  })
+  return r.data
+}
+
+export async function deleteTemplate(docType: string): Promise<void> {
+  await client.delete(`/templates/${encodeURIComponent(docType)}`)
+}
+
+export async function seedTemplates(): Promise<{ added: number; message: string }> {
+  const r = await client.post('/templates/seed')
+  return r.data
+}
+
+export async function downloadTemplate(docType: string): Promise<void> {
+  const r = await client.get(`/templates/${encodeURIComponent(docType)}/file`, {
+    responseType: 'blob',
+  })
+  const url = URL.createObjectURL(r.data as Blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${docType}_template`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// ============================ 审计日志 ============================
+
+export interface AuditLog {
+  id: string
+  actor: string
+  actor_ip: string | null
+  action: string
+  method: string | null
+  endpoint: string | null
+  subject_type: string | null
+  subject_id: string | null
+  object_type: string | null
+  object_id: string | null
+  result: string
+  status_code: number | null
+  detail: string
+  duration_ms: number | null
+  created_at: string | null
+}
+
+export interface AuditStats {
+  total: number
+  recent_24h: number
+  by_action: Record<string, number>
+  by_result: Record<string, number>
+}
+
+export interface AuditQuery {
+  actor?: string
+  action?: string
+  object_type?: string
+  result?: string
+  page?: number
+  size?: number
+}
+
+export async function listAuditLogs(q: AuditQuery = {}): Promise<AuditLog[]> {
+  const r = await client.get<AuditLog[]>('/audit/logs', { params: q })
+  return r.data
+}
+
+export async function getAuditStats(): Promise<AuditStats> {
+  const r = await client.get<AuditStats>('/audit/stats')
+  return r.data
+}

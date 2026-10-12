@@ -66,8 +66,9 @@ class ModelProvider:
         self.base_url = base_url
         self.api_key = api_key or "EMPTY"
         # 超时保护：内网模型偶发无响应时快速失败，避免整批入库挂死。
-        # gen 留 120s 余量；emb/rerank 输入短，分批调用后单批 180s 足够。
-        _timeout = 120.0 if role == "gen" else 180.0
+        # gen 使用流式输出，单篇公文起草体量大（含思考链），留 300s 余量；
+        # emb/rerank 输入短，分批调用后单批 180s 足够。
+        _timeout = 300.0 if role == "gen" else 180.0
         self.client = AsyncOpenAI(base_url=base_url, api_key=self.api_key, timeout=_timeout)
 
     # ---- 向量化（批量）----
@@ -86,6 +87,36 @@ class ModelProvider:
             max_tokens=max_tokens,
         )
         return resp.choices[0].message.content or ""
+
+    # ---- 流式生成（SSE 逐 token 输出，避免大草稿"假死/超时"）----
+    async def generate_stream(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 1500,
+    ):
+        """流式生成，异步产出 ``("content", text)`` 或 ``("reasoning", text)`` 片段。
+
+        Qwen3 系列在 delta 中同时携带 ``reasoning_content``（思考链）与 ``content``
+        （正式回答）；分别产出，便于前端区分"思考过程"与"正文"。
+        """
+        stream = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                yield ("reasoning", rc)
+            content = getattr(delta, "content", None)
+            if content:
+                yield ("content", content)
 
     # ---- 重排（在线，对 top-N 逐条打分）----
     async def rerank(self, query: str, docs: list[str], top_n: int | None = None) -> list[float]:

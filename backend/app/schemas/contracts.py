@@ -156,6 +156,9 @@ class GenerateRequest(BaseModel):
     sensitive_words: list[str] | None = Field(
         None, description="请求级敏感词覆盖；缺省用配置中心词库"
     )
+    rerank: bool = Field(
+        False, description="生成链路是否启用重排；起草场景默认关闭（重排端点慢时避免久等，检索问答默认开启）"
+    )
     stream: bool = False
 
 
@@ -174,3 +177,23 @@ class ConfigItem(BaseModel):
     value: dict[str, Any] = Field(default_factory=dict)
     scope: str | None = None
     is_active: bool = True
+
+
+# ---- 审计日志 ----
+class AuditLogResp(BaseModel):
+    """审计日志条目：谁 / 何时 / 做了什么 / 结果 / 主题 / 客体。"""
+    id: str
+    actor: str                                  # 操作者（谁）
+    actor_ip: str | None = None                  # 上手 IP
+    action: str                                  # 语义动作（做了什么）
+    method: str | None = None
+    endpoint: str | None = None
+    subject_type: str | None = None              # 主题类型（操作者维度）
+    subject_id: str | None = None                # 主题 id
+    object_type: str | None = None               # 客体类型（资源维度）
+    object_id: str | None = None                 # 客体 id
+    result: str = "success"                      # success / failure
+    status_code: int | None = None
+    detail: str = ""
+    duration_ms: int | None = None
+    created_at: datetime | None = None
