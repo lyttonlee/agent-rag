@@ -45,12 +45,34 @@ def parse_docx_bytes(data: bytes) -> ParsedDoc:
     return ParsedDoc(text="\n".join(paras), pages=1, is_scanned=False, scanned_pages=0)
 
 
+def _sniff_format(data: bytes) -> str:
+    """按文件头（magic bytes）嗅探真实格式，兼容「无扩展名」文件。"""
+    head = data[:8]
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    # DOCX / OOXML 本质是 ZIP 包（PK\x03\x04）
+    if head.startswith(b"PK\x03\x04"):
+        return "docx"
+    return ""
+
+
 def parse_bytes(filename: str, data: bytes) -> ParsedDoc:
-    """按扩展名分发解析。"""
+    """按扩展名（优先）或内容嗅探分发解析。
+
+    说明：公文系统导出的文件常不带扩展名，故在无扩展名时回退到
+    文件头嗅探，保证 PDF / DOCX 仍可被正确解析。
+    """
     lower = filename.lower()
+    fmt = ""
     if lower.endswith(".pdf"):
+        fmt = "pdf"
+    elif lower.endswith((".docx", ".doc")):
+        fmt = "docx"
+    else:
+        fmt = _sniff_format(data)  # 无扩展名或未知后缀时嗅探
+    if fmt == "pdf":
         return parse_pdf_bytes(data)
-    if lower.endswith((".docx", ".doc")):
+    if fmt == "docx":
         return parse_docx_bytes(data)
     # 其它格式（wps/ofd 等）二期或经格式适配器预处理
     raise ValueError(f"暂不支持的解析格式：{filename}")

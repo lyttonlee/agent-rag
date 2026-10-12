@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -19,6 +21,8 @@ from app.core.security import build_visibility_filter
 from app.db.models import Chunk
 from app.schemas.contracts import Citation, RetrieveRequest, RetrieveResp
 from app.services.model_provider import ModelProvider
+
+logger = logging.getLogger(__name__)
 
 _settings = get_settings()
 RRF_K = 60
@@ -68,12 +72,19 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
     fused = sorted(rrf.values(), key=lambda x: x[1], reverse=True)
     top = fused[: _settings.retrieve_final_top_n]
 
-    # ---- 重排（在线）----
-    # 兼容 RetrieveRequest（含 rerank）与 GenerateRequest（无 rerank，默认开启）
+    # ---- 重排（在线，best-effort）----
+    # 兼容 RetrieveRequest（含 rerank）与 GenerateRequest（无 rerank，默认开启）。
+    # rerank 是「增强排序」而非检索必需环节：当其端点慢/抖动/不可用时，
+    # 优雅回退到 RRF 融合分排序，保证检索主链路不中断（生产级健壮性）。
     if getattr(req, "rerank", True) and top:
-        reranker = ModelProvider(role="rerank")
-        scores = await reranker.rerank(req.query, [c.content for c, _ in top])
-        ranked = sorted(zip(top, scores), key=lambda x: x[1], reverse=True)
+        try:
+            reranker = ModelProvider(role="rerank")
+            scores = await reranker.rerank(req.query, [c.content for c, _ in top])
+            ranked = sorted(zip(top, scores), key=lambda x: x[1], reverse=True)
+        except Exception as exc:  # 重排服务不可用：回退 RRF 顺序，不阻断检索
+            logger.warning("rerank 调用失败，回退 RRF 顺序：%s", exc)
+            # 与成功分支保持同一形状：((Chunk, rrf_score), 展示分)
+            ranked = [((c, s_rrf), s_rrf) for (c, s_rrf) in top]
     else:
         ranked = [(item, s) for item, s in top]
 
