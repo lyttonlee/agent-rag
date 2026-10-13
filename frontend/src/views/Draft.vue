@@ -11,6 +11,7 @@ import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import ReasoningPanel from '@/components/ReasoningPanel.vue'
+import MarkdownText from '@/components/MarkdownText.vue'
 import {
   caller,
   getConversation,
@@ -270,7 +271,9 @@ async function exportDocx() {
 
       <div class="paper panel">
         <div class="red">{{ docType }}</div>
-        <p class="body">{{ answer || '在上方输入主题并点击「起草」，系统将基于知识库检索材料生成带引用的公文草稿，正文实时流式输出。在同一会话中继续输入修改意见即可多轮完善。' }}<span v-if="loading" class="cursor" /></p>
+        <!-- 文稿正文：Markdown 渲染（纸面浅色主题，见下方 .paper :deep 适配） -->
+        <MarkdownText :text="answer || '在上方输入主题并点击「起草」，系统将基于知识库检索材料生成带引用的公文草稿，正文实时流式输出。在同一会话中继续输入修改意见即可多轮完善。'" />
+        <span v-if="loading" class="cursor" />
         <div v-if="citations.length" class="refs">
           <div class="ttl">参考资料（{{ citations.length }}）</div>
           <div v-for="(c, i) in citations" :key="c.chunk_id">[{{ i + 1 }}] 《{{ c.title }}》</div>
@@ -310,6 +313,20 @@ async function exportDocx() {
 .paper { padding: 28px; max-width: 820px; margin: 0 auto; background: #f7f4ec; color: #1c1c1c; }
 .red { color: #c0392b; font-family: var(--font-serif); font-size: 22px; text-align: center; font-weight: 700; margin-bottom: 16px; }
 .body { line-height: 1.9; white-space: pre-wrap; min-height: 200px; }
+/* 纸面（浅色 #f7f4ec）上的 Markdown 适配：覆盖 MarkdownText 的深色主题令牌 */
+.paper :deep(.md-body) { line-height: 1.9; min-height: 200px; }
+.paper :deep(.md-body h1),
+.paper :deep(.md-body h2),
+.paper :deep(.md-body h3),
+.paper :deep(.md-body h4) { color: #1c1c1c; font-family: var(--font-serif); }
+.paper :deep(.md-body blockquote) { color: #555; background: rgba(0, 0, 0, 0.04); border-left-color: #c0392b; }
+.paper :deep(.md-body th),
+.paper :deep(.md-body td) { border-color: #d8d2c4; }
+.paper :deep(.md-body tr:nth-child(even) td) { background: rgba(0, 0, 0, 0.03); }
+.paper :deep(.md-body a) { color: #1a5276; }
+.paper :deep(.md-body strong) { color: #1c1c1c; }
+.paper :deep(.md-body code) { background: rgba(0, 0, 0, 0.07); }
+.paper :deep(.md-body pre) { background: rgba(0, 0, 0, 0.05); }
 .refs { margin-top: 20px; border-top: 1px solid #d8d2c4; padding-top: 10px; font-size: 13px; color: #444; }
 .refs .ttl { font-weight: 600; margin-bottom: 6px; }
 .warn-chip { margin-top: 12px; color: #c0392b; font-size: 13px; }

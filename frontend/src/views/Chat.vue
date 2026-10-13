@@ -15,6 +15,7 @@ import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import ReasoningPanel from '@/components/ReasoningPanel.vue'
+import MarkdownText from '@/components/MarkdownText.vue'
 import {
   caller,
   getConversation,
@@ -363,7 +364,8 @@ onBeforeUnmount(() => {
             <!-- 思考过程（默认折叠，可展开查看；随消息持久化不丢失） -->
             <ReasoningPanel v-if="m.reasoning" :text="m.reasoning" />
             <div class="bubble panel">
-              {{ m.content }}
+              <!-- 答案正文：Markdown 渲染（模型输出多为 md 格式） -->
+              <MarkdownText :text="m.content" />
               <!-- 本轮意图徽标（每轮独立留痕，不被后续轮次覆盖） -->
               <span v-if="m.intent" class="intent-badge" :title="`本轮意图：${intentLabelOf(m.intent)}`">
                 {{ intentLabelOf(m.intent) }}
@@ -400,7 +402,8 @@ onBeforeUnmount(() => {
               :streaming="!answer"
             />
             <div class="bubble panel">
-              {{ answer }}<span v-if="answer" class="cursor" />
+              <!-- 答案正文：Markdown 渲染；流式中同样逐段渲染 -->
+              <MarkdownText :text="answer" /><span v-if="answer" class="cursor" />
               <span v-if="!answer && !reasoning" class="thinking">正在思考…</span>
             </div>
             <div v-if="citations.length" class="msg-refs">
