@@ -48,7 +48,7 @@ doRetrieve()
 </script>
 
 <template>
-  <div class="panel pad">
+  <div class="panel pad page-fill">
     <div class="head">
       <div class="ttl serif">智能检索问答</div>
       <span class="badge INTERNAL">强制引用溯源 · 服务端密级下推</span>

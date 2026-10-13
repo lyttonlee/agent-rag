@@ -233,7 +233,7 @@ function currentDesc() {
 </script>
 
 <template>
-  <div class="panel pad">
+  <div class="panel pad page-fill">
     <div class="ttl serif">配置中心</div>
     <p class="text-muted desc">我方制定标准，第三方适配。以下为明确的可配置项，填写结构化字段即可，无需了解 JSON。</p>
 

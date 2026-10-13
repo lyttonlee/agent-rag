@@ -118,12 +118,21 @@ body {
 }
 
 /* 通用工具类 */
+/* 面板背景统一为单一纯色：早期版本用 surface→shell 渐变，多个面板/卡片
+ * 同屏叠加时呈现"拼花"观感且各页面深浅不一；按用户反馈统一为纯色，
+ * 层级关系仅由 --bg-surface（面板）与 --bg-surface-2（面板内嵌套卡片）
+ * 两档区分，全站一致。 */
 .panel {
-  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-shell) 100%);
+  background: var(--bg-surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
 }
+/* 页面根容器：铺满内容区，消除"漂浮面板 + 大片空白背景"的怪异观感
+ * （配合 App.vue 的 .content flex column 使用） */
+.page-fill { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* 单面板页面：面板自身滚动，高度刚好铺满内容区 */
+.page-fill.panel { overflow: auto; }
 .text-muted { color: var(--text-muted); }
 .brand { color: var(--brand); }
 .serif { font-family: var(--font-serif); }

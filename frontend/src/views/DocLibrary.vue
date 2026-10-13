@@ -372,8 +372,9 @@ async function quickIngest() {
 </script>
 
 <template>
-  <div class="wrap">
-    <div class="panel pad">
+  <div class="wrap page-fill">
+    <!-- 单面板铺满内容区并内部滚动；空间卡片网格在少量卡片时保持顶部对齐 -->
+    <div class="panel pad lib-panel">
       <!-- 头部：标题 + 面包屑 + 操作 -->
       <div class="head">
         <div class="ttl serif">文档库</div>
@@ -607,6 +608,10 @@ async function quickIngest() {
 
 <style scoped>
 .pad { padding: 16px; }
+/* 页面根：flex column（由 .page-fill 提供），主面板弹性铺满并内部滚动，
+ * 消除早期"面板短、下方大片裸背景"的怪异观感 */
+.wrap { gap: 0; }
+.lib-panel { flex: 1; min-height: 0; overflow: auto; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 .ttl { font-size: 18px; color: var(--text-strong); }
 .count { font-size: 13px; }

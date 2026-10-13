@@ -78,5 +78,6 @@ const env = import.meta.env.MODE
   background: var(--bg-surface-2); color: var(--text-muted);
 }
 .scope { font-size: 12px; }
-.content { flex: 1; overflow: auto; padding: 20px; }
+/* 内容区：flex column 使页面根容器可通过 .page-fill 铺满视口 */
+.content { flex: 1; overflow: auto; padding: 20px; display: flex; flex-direction: column; }
 </style>

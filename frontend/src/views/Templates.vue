@@ -141,7 +141,7 @@ async function download(row: TemplateItem) {
 </script>
 
 <template>
-  <div class="panel pad">
+  <div class="panel pad page-fill">
     <div class="head">
       <div class="ttl serif">文种模板库</div>
       <span class="text-muted">上传模板文件自动解析版式，或直接编辑标准模板</span>

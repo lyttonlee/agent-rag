@@ -68,7 +68,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="panel pad">
+  <div class="panel pad page-fill">
     <div class="head">
       <div class="ttl serif">审计日志</div>
       <span class="text-muted">谁 · 何时 · 做了什么 · 结果如何 · 主题 · 客体，全量留痕可追溯</span>
