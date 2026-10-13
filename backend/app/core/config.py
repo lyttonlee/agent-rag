@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     storage_s3_secret_key: str = "admin123"
     storage_s3_region: str = "us-east-1"
     storage_s3_secure: bool = False
+    # 寻址风格：内网 IP+端口端点必须 path（endpoint/bucket/key）；
+    # 仅当 SeaweedFS 前置域名且配了泛 DNS 时才考虑 virtual。
+    storage_s3_addressing_style: Literal["path", "virtual"] = "path"
 
     # ---- Redis（可选）----
     redis_url: str = "redis://127.0.0.1:6379/0"

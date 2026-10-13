@@ -20,6 +20,10 @@
 > - **默认 `local` 模式**——本地文件系统，零镜像、零协议风险，适合本项目 20 万文档 / ~44GB 规模；
 > - **可选 `s3` 模式**——指向 **SeaweedFS**（Apache 2.0，镜像可得）或 Ceph RGW / 国产私有化对象存储（均兼容 S3 API）。
 > 业务代码通过 `STORAGE_PROVIDER=local|s3` 切换，**零改动**。详见《详细设计文档 V1.2》与 `backend/app/services/storage.py`。
+>
+> **s3 模式部署联调**：镜像拉起后按《SeaweedFS部署与联调指南》（docs/SeaweedFS部署与联调指南.md）执行——
+> `docker compose --profile seaweedfs up -d` 起服务，后端 `.env` 切 `STORAGE_PROVIDER=s3`，
+> bucket 由后端自动创建，`GET /health` 可查存储连通性。单测：`uv run pytest tests/test_storage_s3.py`（moto mock，11 例）。
 
 > 说明：zhparser 需编译，故 PostgreSQL 采用**自定义构建镜像**而非直接拉官方镜像。
 > 若 zhparser 构建受阻，可降级为「只向量 + 简单中文分词（jieba 客户端侧）」，检索质量略降但不阻塞 MVP。

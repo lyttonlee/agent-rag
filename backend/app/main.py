@@ -30,14 +30,14 @@ from app.api.routes import (
     spaces,
     templates,
 )
+from app.api.routes.spaces import ensure_default_space
+from app.api.routes.templates import ensure_seed_templates
 from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import AsyncSessionLocal, engine
 from app.services.audit import actor_from_request, record_audit
 from app.services.auth import ensure_admin_user, get_caller
 from app.services.ingestion import reconcile_stuck_jobs
-from app.api.routes.spaces import ensure_default_space
-from app.api.routes.templates import ensure_seed_templates
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level)
@@ -90,6 +90,35 @@ async def lifespan(app: FastAPI):
         logger.info("管理员账号就绪：%s（角色 %s）", admin.username, admin.role)
     except Exception as exc:
         logger.warning("种子管理员初始化失败：%s", exc)
+    # 对象存储自检：local 探根目录可写；s3 探 SeaweedFS 连通性与 bucket（自动创建）
+    try:
+        from app.services.storage import storage_info
+
+        info = storage_info()
+        if info["ok"]:
+            logger.info(
+                "对象存储就绪：%s 模式 %s",
+                info["provider"], info["detail"],
+            )
+        else:
+            logger.warning(
+                "对象存储不可用（%s 模式 %s）：s3 模式请确认 SeaweedFS 已部署、"
+                "端点/凭证/桶配置正确（见 docs/SeaweedFS部署与联调指南.md）",
+                info["provider"], info["detail"],
+            )
+    except Exception as exc:
+        logger.warning("对象存储自检失败：%s", exc)
+    # 配置中心种子：默认检索参数写入 ConfigKV（幂等，不覆盖用户已改值），
+    # 使「配置中心 → 检索参数」开箱即见、可调（用户 2026-10-13 需求）
+    try:
+        from app.services.runtime_config import ensure_default_configs
+
+        async with AsyncSessionLocal() as db:
+            added = await ensure_default_configs(db)
+        if added:
+            logger.info("配置中心种子：新增 %d 项默认检索配置", added)
+    except Exception as exc:
+        logger.warning("配置中心种子失败：%s", exc)
     yield
     await engine.dispose()
 
@@ -160,8 +189,16 @@ app.include_router(audit.router, prefix=API_PREFIX, dependencies=[Depends(get_ca
 
 @app.get("/health", tags=["health"])
 async def health():
+    """健康检查（开放）：进程状态 + 对象存储后端与连通性（联调排障用）。"""
+    from app.services.storage import storage_info
+
+    try:
+        storage = storage_info()
+    except Exception as exc:  # pragma: no cover - 存储配置错误不应压垮探活
+        storage = {"provider": "unknown", "ok": False, "detail": {"error": str(exc)}}
     return {
         "status": "ok",
         "version": settings.app_version,
         "environment": settings.environment,
+        "storage": storage,
     }

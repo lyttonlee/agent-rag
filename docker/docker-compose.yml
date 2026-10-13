@@ -25,15 +25,24 @@ services:
 
   # ---- 对象存储（抽象层，默认 local 无需独立组件）----
   # 默认 local 模式：原文直接写后端挂载卷（见下方 storage-data），无需独立服务、无镜像依赖。
-  # 若采用 s3 模式，可用 SeaweedFS 替代 MinIO（Apache 2.0，镜像可得），详见 docs/docker_pull_list.md。
-  # seaweedfs:
-  #   image: chrislusf/seaweedfs:latest
-  #   container_name: rag-seaweedfs
-  #   command: server -dir=/data -s3 -s3.port=8333
-  #   ports:
-  #     - "8333:8333"
-  #   volumes:
-  #     - seaweed-data:/data
+  # s3 模式（可选）：SeaweedFS（Apache 2.0，S3 兼容）。启用方式：
+  #   docker compose --profile seaweedfs up -d
+  # 随后把后端 .env 切到 STORAGE_PROVIDER=s3（见 docs/SeaweedFS部署与联调指南.md）。
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: rag-seaweedfs
+    restart: unless-stopped
+    # 单机一体化：master + volume + filer + S3(8333)；目录 /data 为卷
+    command: server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "8333:8333"   # S3 API（后端 STORAGE_S3_ENDPOINT 指向此）
+      - "9333:9333"   # master（weed shell 管理用）
+      - "8888:8888"   # filer HTTP
+    volumes:
+      - seaweed-data:/data
+      # S3 凭证配置：access/secret 与后端 .env 的 STORAGE_S3_ACCESS_KEY/SECRET 一致
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    profiles: ["seaweedfs"]
 
   # ---- Redis（检索缓存 / 异步任务队列，可选）----
   redis:
@@ -68,4 +77,4 @@ volumes:
   pg-data:
   redis-data:
   storage-data:        # local 模式：后端容器挂载此卷作为 STORAGE_ROOT
-  # seaweed-data:      # s3 模式（SeaweedFS）使用
+  seaweed-data:        # s3 模式（SeaweedFS）使用：docker compose --profile seaweedfs up -d

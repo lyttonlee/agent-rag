@@ -21,6 +21,7 @@ from app.core.security import build_visibility_filter
 from app.db.models import Chunk
 from app.schemas.contracts import Citation, RetrieveRequest, RetrieveResp
 from app.services.model_provider import ModelProvider
+from app.services.runtime_config import load_retrieval_config
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ RRF_K = 60
 
 
 async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveResp:
+    # 检索参数从配置中心读取（top_k / 召回宽度 / 重排开关），缺项回退代码默认；
+    # 运维在「配置中心 → 检索参数」调整后即时生效，无需重启（用户 2026-10-13 需求）。
+    cfg = await load_retrieval_config(db)
+
     emb = ModelProvider(role="emb")
     query_vec = (await emb.embed([req.query]))[0]
 
@@ -57,7 +62,7 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         .options(joinedload(Chunk.document))
         .where(vis_filter)
         .order_by(Chunk.embedding.cosine_distance(query_vec))
-        .limit(_settings.retrieve_vector_top_n)
+        .limit(cfg.vector_top_n)
     )
     vec_q = _apply(vec_q)
     # .all() 保留 (Chunk, dist) 元组：既供 RRF 融合取 Chunk，
@@ -73,7 +78,7 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         .where(vis_filter)
         .where(Chunk.search_vec.op("@@")(kw_ts))
         .order_by(func.ts_rank_cd(Chunk.search_vec, kw_ts).desc())
-        .limit(_settings.retrieve_keyword_top_n)
+        .limit(cfg.keyword_top_n)
     )
     kw_q = _apply(kw_q)
     kw_rows = (await db.execute(kw_q)).scalars().all()
@@ -88,17 +93,18 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         rrf[c.id] = (c, rrf[c.id][1] + 1.0 / (RRF_K + rank))
 
     fused = sorted(rrf.values(), key=lambda x: x[1], reverse=True)
-    top = fused[: _settings.retrieve_final_top_n]
+    top = fused[: cfg.final_top_n]
 
     # ---- 重排（在线，best-effort）----
     # 兼容 RetrieveRequest（含 rerank）与 GenerateRequest（无 rerank，默认开启）。
     # rerank 是「增强排序」而非检索必需环节：当其端点慢/抖动/不可用时，
     # 优雅回退到 RRF 融合分排序，保证检索主链路不中断（生产级健壮性）。
-    if getattr(req, "rerank", True) and top:
+    # 全局开关来自配置中心（cfg.rerank_enabled），请求级 rerank=False 同样可关。
+    if getattr(req, "rerank", True) and cfg.rerank_enabled and top:
         try:
             reranker = ModelProvider(role="rerank")
             scores = await reranker.rerank(req.query, [c.content for c, _ in top])
-            ranked = sorted(zip(top, scores), key=lambda x: x[1], reverse=True)
+            ranked = sorted(zip(top, scores, strict=True), key=lambda x: x[1], reverse=True)
         except Exception as exc:  # 重排服务不可用：回退 RRF 顺序，不阻断检索
             logger.warning("rerank 调用失败，回退 RRF 顺序：%s", exc)
             # 与成功分支保持同一形状：((Chunk, rrf_score), 展示分)

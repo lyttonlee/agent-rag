@@ -39,6 +39,7 @@ from app.services.audit import record_audit
 from app.services.generation_prompt import build_generation_messages
 from app.services.model_provider import ModelProvider
 from app.services.retrieval import hybrid_retrieve
+from app.services.runtime_config import load_prompt_templates, load_retrieval_config
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +86,15 @@ async def generate_answer(db: AsyncSession, req: GenerateRequest) -> dict:
     """
     retrieve_resp = await hybrid_retrieve(db, req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
-    no_materials = is_no_useful_info(retrieve_resp)
+    # 检索参数（向量距离阈值）与提示词模板均来自配置中心，缺项回退默认
+    cfg = await load_retrieval_config(db)
+    templates = await load_prompt_templates(db)
+    no_materials = is_no_useful_info(retrieve_resp, cfg.vec_distance_threshold)
 
     gen = ModelProvider(role="gen")
-    messages = build_generation_messages(req, citations, no_materials=no_materials)
+    messages = build_generation_messages(
+        req, citations, no_materials=no_materials, templates=templates
+    )
     raw = await gen.generate(messages)
     if no_materials:
         raw += TASK_DISCLAIMER
@@ -202,10 +208,15 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
         citations: list[Citation] = retrieve_resp.citations
         citations_holder[:] = citations
         # 无有用信息（双信号判定）：任务不失败，切换自身能力起草 + 甄别声明
-        no_materials = is_no_useful_info(retrieve_resp)
+        # 阈值与提示词模板均来自配置中心（缺项回退默认）
+        cfg = await load_retrieval_config(db)
+        templates = await load_prompt_templates(db)
+        no_materials = is_no_useful_info(retrieve_resp, cfg.vec_distance_threshold)
         disclaimer = no_materials  # 无材料兜底：答案需追加甄别声明
         gen = ModelProvider(role="gen")
-        messages = build_generation_messages(req, citations, no_materials=no_materials)
+        messages = build_generation_messages(
+            req, citations, no_materials=no_materials, templates=templates
+        )
 
         # 2) 先回传检索元数据，前端可立即渲染"参考材料"与意图标签
         yield _sse({

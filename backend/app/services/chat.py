@@ -72,6 +72,11 @@ from app.services.audit import record_audit
 from app.services.generation_prompt import build_chat_messages
 from app.services.model_provider import ModelProvider
 from app.services.retrieval import hybrid_retrieve
+from app.services.runtime_config import (
+    RetrievalConfig,
+    load_prompt_templates,
+    load_retrieval_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +110,9 @@ class _ChatCtx:
     model_name: str = ""
     no_result: bool = False       # 未检索到有用信息（直接拒答 / 任务型兜底）
     disclaimer: bool = False      # 任务型无材料兜底 → 答案需追加甄别声明
+    # 配置中心运行时配置（检索后按需加载；供提示词模板与阈值消费）
+    retrieval_cfg: RetrievalConfig | None = None
+    prompt_templates: dict | None = None
 
     @property
     def reasoning_text(self) -> str:
@@ -212,8 +220,11 @@ async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
     retrieve_resp = await hybrid_retrieve(ctx.db, ctx.req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
     ctx.citations[:] = citations
-    # "无有用信息"双信号判定（向量距离 + 关键词命中，见 policies.is_no_useful_info）
-    ctx.no_result = is_no_useful_info(retrieve_resp)
+    # "无有用信息"双信号判定（向量距离 + 关键词命中，见 policies.is_no_useful_info）；
+    # 阈值来自配置中心 retrieval.vec_distance_threshold（缺项回退代码默认）
+    ctx.retrieval_cfg = await load_retrieval_config(ctx.db)
+    ctx.prompt_templates = await load_prompt_templates(ctx.db)
+    ctx.no_result = is_no_useful_info(retrieve_resp, ctx.retrieval_cfg.vec_distance_threshold)
 
     gen = ModelProvider(role="gen")
     ctx.model_name = gen.model_name
@@ -226,7 +237,8 @@ async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
             # 不得声称引用知识库，末尾追加甄别声明（统一收尾处处理）。
             ctx.disclaimer = True
             messages = build_chat_messages(
-                ctx.req.query, ctx.history, citations, no_materials=True
+                ctx.req.query, ctx.history, citations, no_materials=True,
+                templates=ctx.prompt_templates,
             )
             async for evt in _stream_model(ctx, messages, gen):
                 yield evt
@@ -238,7 +250,9 @@ async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
             yield _sse({"type": "token", "text": chunk})
         return
 
-    messages = build_chat_messages(ctx.req.query, ctx.history, citations)
+    messages = build_chat_messages(
+        ctx.req.query, ctx.history, citations, templates=ctx.prompt_templates
+    )
     async for evt in _stream_model(ctx, messages, gen):
         yield evt
 

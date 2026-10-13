@@ -21,6 +21,8 @@ from collections.abc import AsyncGenerator
 #   主题相关查询 ≈0.28；无关查询 ≈0.64~0.70；边缘查询 ≈0.59。
 # 取 0.60：宁可将边缘查询放行给模型（提示词纪律兜底"依据不足"），
 # 也不误杀可能有用的材料——直答拒答是硬行为，必须保守。
+# 该默认值已被配置中心项 retrieval.vec_distance_threshold 覆写可能
+# （运维在「配置中心 → 检索参数」调整，见 services/runtime_config.py）。
 _VEC_DISTANCE_THRESHOLD = 0.60
 
 # 任务型意图（draft / complex_task）在无检索材料时，由模型自身能力完成，
@@ -88,7 +90,7 @@ def pick_chitchat_reply(query: str) -> str:
     return _CHITCHAT_FALLBACK
 
 
-def is_no_useful_info(retrieve_resp) -> bool:
+def is_no_useful_info(retrieve_resp, vec_distance_threshold: float | None = None) -> bool:
     """判定一次检索是否"没有检索到有用/事实信息"（用户 2026-10-13 硬性要求）。
 
     双信号同时异常才判定为无有用信息（保守策略，防误杀）：
@@ -101,12 +103,18 @@ def is_no_useful_info(retrieve_resp) -> bool:
     （"依据不足，建议核实"），避免把可能有用的材料一刀切拒答。
 
     该判定不依赖 rerank（距离与分词信号在 rerank 降级时依然有效）。
+
+    Args:
+        retrieve_resp: 检索响应（citations / top_vector_distance / keyword_hits）。
+        vec_distance_threshold: 距离阈值；None 用代码默认（_VEC_DISTANCE_THRESHOLD）。
+            调用方应传入配置中心值（retrieval.vec_distance_threshold）。
     """
     if not retrieve_resp.citations:
         return True
+    threshold = _VEC_DISTANCE_THRESHOLD if vec_distance_threshold is None else vec_distance_threshold
     distance = getattr(retrieve_resp, "top_vector_distance", None)
     keyword_hits = getattr(retrieve_resp, "keyword_hits", 0) or 0
-    if distance is not None and keyword_hits == 0 and distance > _VEC_DISTANCE_THRESHOLD:
+    if distance is not None and keyword_hits == 0 and distance > threshold:
         return True
     return False
 

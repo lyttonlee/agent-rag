@@ -35,7 +35,71 @@ const TABS = [
     name: 'Agent 设置',
     desc: '智能体（Agent）运行参数：总开关、LLM 意图分类兜底、复杂任务步骤上限。关闭总开关后，问答与起草完全走原直答链路。',
   },
+  {
+    cat: 'retrieval',
+    name: '检索参数',
+    desc: '检索链路运行参数：返回条数 top_k、双路召回宽度、重排开关、相关度阈值（向量距离 / rerank 分数，低于阈值视为无效检索）。保存即时生效，无需重启。',
+  },
+  {
+    cat: 'prompt',
+    name: '提示词模板',
+    desc: '生成链路使用的系统提示词（公文起草 / 智能问答 / 无材料兜底）。修改后下次生成即生效；「恢复默认」删除配置项，回退系统内置文案。',
+  },
 ] as const
+
+/** 检索参数默认值（与后端 app/services/runtime_config.py RetrievalConfig 保持一致） */
+const RETRIEVAL_DEFAULTS = {
+  final_top_n: 8,
+  vector_top_n: 50,
+  keyword_top_n: 50,
+  rerank_enabled: true,
+  vec_distance_threshold: 0.6,
+  rerank_min_score: 0.35,
+  // ---- 查询改写（《检索优化方案 V1.0》P1 规划项，功能上线前调整不生效）----
+  rewrite_enabled: false,
+  rewrite_max_rounds: 2,
+  rewrite_timeout_ms: 8000,
+}
+const retrievalForm = reactive({ ...RETRIEVAL_DEFAULTS })
+
+/**
+ * 提示词模板默认值（与后端 app/services/generation_prompt.py 的 DEFAULT_* 常量一致；
+ * 后端为唯一事实源，如调整文案请同步此处——保存后以配置中心值为准）。
+ */
+const PROMPT_DEFAULTS: Record<string, string> = {
+  draft_system:
+    '你是企业公文辅助写作引擎。请基于【检索材料】回答，并遵守：\n' +
+    '1. 所有事实性陈述必须标注引用，格式 [n] 对应材料序号；\n' +
+    '2. 检索材料未覆盖的内容，必须明确说明\'依据不足，建议核实\'，不得编造；\n' +
+    '3. 用语符合公文规范，结构清晰。\n',
+  no_materials_system:
+    '你是企业公文辅助写作引擎。本次未检索到知识库参考材料，请基于你的' +
+    '通用公文写作能力完成起草，并遵守：\n' +
+    '1. 不得声称引用了知识库文档、内部规定或具体文号（没有材料可引）；\n' +
+    '2. 涉及具体数据、时限、责任人等处使用占位符或说明\'需按实际情况填写\'；\n' +
+    '3. 用语符合公文规范，结构清晰。\n',
+  chat_system:
+    '你是企业公文知识库的智能问答助手。请基于【检索材料】与【对话历史】回答，并遵守：\n' +
+    '1. 所有事实性陈述必须标注引用，格式 [n] 对应本轮检索材料序号；\n' +
+    '2. 检索材料未覆盖的内容，必须明确说明\'依据不足，建议核实\'，不得编造；\n' +
+    '3. 结合对话历史理解用户指代（如\'它\'\'该文件\'\'上述要求\'），保持上下文连贯；\n' +
+    '4. 用语简洁专业，结构清晰；与公文起草无关时不要套用公文格式。\n',
+  chat_no_materials_system:
+    '你是企业公文知识库的智能问答助手。本次未检索到知识库参考材料，' +
+    '但用户的请求属于完成任务型（如起草、创作、整理），请基于你的' +
+    '通用能力直接完成，并遵守：\n' +
+    '1. 不得声称引用了知识库文档、内部规定或具体文号（没有材料可引）；\n' +
+    '2. 涉及具体数据、时限、责任人等处使用占位符或说明\'需按实际情况填写\'；\n' +
+    '3. 结合对话历史理解用户指代，保持上下文连贯；\n' +
+    '4. 用语简洁专业，结构清晰。\n',
+}
+const PROMPT_LABELS: Record<string, string> = {
+  draft_system: '公文起草（有材料）',
+  no_materials_system: '公文起草（无材料兜底）',
+  chat_system: '智能问答（有材料）',
+  chat_no_materials_system: '智能问答（无材料兜底）',
+}
+const promptForm = reactive<Record<string, string>>({ ...PROMPT_DEFAULTS })
 
 /** Agent 配置项（与后端 app/services/agent/config.py 的键一一对应） */
 const AGENT_DEFAULTS = {
@@ -85,6 +149,8 @@ async function load() {
   try {
     rows.value = await getConfigItems(active.value)
     if (active.value === 'agent') fillAgentForm()
+    if (active.value === 'retrieval') fillRetrievalForm()
+    if (active.value === 'prompt') fillPromptForm()
   } catch {
     rows.value = []
   } finally {
@@ -137,9 +203,101 @@ async function resetAgent() {
   }
 }
 
+// ---- 检索参数 ----
+
+/** 行 → 检索参数表单（缺项用默认值；is_active=false 视为未配置） */
+function fillRetrievalForm() {
+  Object.assign(retrievalForm, RETRIEVAL_DEFAULTS)
+  for (const row of rows.value) {
+    if (!row.is_active) continue
+    const v = (row.value as Record<string, any>)?.value
+    if (row.key in retrievalForm && v !== undefined && v !== null) {
+      ;(retrievalForm as Record<string, any>)[row.key] = v
+    }
+  }
+}
+
+/** 保存检索参数（逐项写入，保存即生效） */
+async function saveRetrieval() {
+  try {
+    for (const key of Object.keys(RETRIEVAL_DEFAULTS) as (keyof typeof RETRIEVAL_DEFAULTS)[]) {
+      await saveConfigItem({
+        category: 'retrieval',
+        key,
+        value: { value: retrievalForm[key] },
+        scope: null,
+        is_active: true,
+      })
+    }
+    ElMessage.success('检索参数已保存，即时生效')
+    load()
+  } catch (e: any) {
+    ElMessage.error('保存失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
+/** 恢复代码默认值（删除配置项，后端回落默认） */
+async function resetRetrieval() {
+  try {
+    for (const key of Object.keys(RETRIEVAL_DEFAULTS)) {
+      await deleteConfigItem('retrieval', key).catch(() => undefined)
+    }
+    ElMessage.success('已恢复默认参数')
+    load()
+  } catch (e: any) {
+    ElMessage.error('重置失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
+// ---- 提示词模板 ----
+
+/** 行 → 提示词表单（缺项用系统默认文案） */
+function fillPromptForm() {
+  Object.assign(promptForm, PROMPT_DEFAULTS)
+  for (const row of rows.value) {
+    if (!row.is_active) continue
+    const v = (row.value as Record<string, any>)?.value
+    if (row.key in promptForm && typeof v === 'string') {
+      promptForm[row.key] = v
+    }
+  }
+}
+
+/** 保存提示词模板（逐项写入，保存即生效） */
+async function savePrompt() {
+  try {
+    for (const key of Object.keys(PROMPT_DEFAULTS)) {
+      await saveConfigItem({
+        category: 'prompt',
+        key,
+        value: { value: promptForm[key] },
+        scope: null,
+        is_active: true,
+      })
+    }
+    ElMessage.success('提示词已保存，下次生成即生效')
+    load()
+  } catch (e: any) {
+    ElMessage.error('保存失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
+/** 恢复系统默认（删除配置项，后端回落内置文案） */
+async function resetPrompt() {
+  try {
+    for (const key of Object.keys(PROMPT_DEFAULTS)) {
+      await deleteConfigItem('prompt', key).catch(() => undefined)
+    }
+    ElMessage.success('已恢复系统默认文案')
+    load()
+  } catch (e: any) {
+    ElMessage.error('重置失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
 function openAdd() {
-  // Agent 设置为开关表单（非条目表），不走新增对话框
-  if (active.value === 'agent') return
+  // Agent / 检索参数 / 提示词为开关表单（非条目表），不走新增对话框
+  if (['agent', 'retrieval', 'prompt'].includes(active.value)) return
   Object.assign(form, emptyForms())
   editing.value = false
   dialog.value = true
@@ -280,7 +438,86 @@ function currentDesc() {
       </div>
     </div>
 
-    <div v-if="active !== 'agent'" class="bar">
+    <!-- 检索参数：数值/开关表单（非条目表），保存即生效 -->
+    <div v-if="active === 'retrieval'" class="agent-settings panel" v-loading="loading">
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">最终返回条数 top_k</div>
+          <div class="agent-sub">检索结果最终返回多少条进入提示词（原默认 8）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.final_top_n" :min="1" :max="100" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">向量路召回宽度</div>
+          <div class="agent-sub">pgvector 向量召回候选数（原默认 50）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.vector_top_n" :min="1" :max="500" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">关键词路召回宽度</div>
+          <div class="agent-sub">zhparser 分词 + BM25 关键词召回候选数（原默认 50）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.keyword_top_n" :min="1" :max="500" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">重排总开关</div>
+          <div class="agent-sub">Reranker 重排（提升引用质量）；关闭后按 RRF 融合分排序，请求级 rerank=false 同样可关</div>
+        </div>
+        <el-switch v-model="retrievalForm.rerank_enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">向量距离阈值（相关度）</div>
+          <div class="agent-sub">top1 余弦距离超过该值且关键词零命中 → 判定「无有用信息」（拒答/兜底）。标定参考：主题相关 ≈0.28，无关 ≈0.64~0.70；调大更易放行、调小更严格</div>
+        </div>
+        <el-input-number v-model="retrievalForm.vec_distance_threshold" :min="0" :max="2" :step="0.05" :precision="2" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">Rerank 分数阈值（有效检索线）</div>
+          <div class="agent-sub">rerank top1 低于该分数视为无效检索——查询改写的触发线之一（《检索优化方案 V1.0》P1 上线后参与判定，待评测台标定）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.rerank_min_score" :min="0" :max="1" :step="0.05" :precision="2" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">查询改写（P1 规划）</div>
+          <div class="agent-sub">检索不到时改写 query 重检（同义扩展 / HyDE / 子问题拆解）。功能尚未上线，提前配置备用；上线后在此启用</div>
+        </div>
+        <el-switch v-model="retrievalForm.rewrite_enabled" active-text="开" inactive-text="关" disabled />
+      </div>
+      <div class="agent-actions">
+        <el-button type="primary" size="small" @click="saveRetrieval">保存参数</el-button>
+        <el-button size="small" @click="resetRetrieval">恢复默认</el-button>
+        <span class="text-muted">修改即时生效，无需重启</span>
+      </div>
+    </div>
+
+    <!-- 提示词模板：多行文本表单，保存即生效 -->
+    <div v-if="active === 'prompt'" class="agent-settings panel" v-loading="loading">
+      <div class="agent-row" style="display:block" v-for="(label, key) in PROMPT_LABELS" :key="key">
+        <div class="agent-info" style="margin-bottom:6px">
+          <div class="agent-name">{{ label }}</div>
+          <div class="agent-sub">键名 <span class="mono">{{ key }}</span>；当前为系统默认时保存即覆盖</div>
+        </div>
+        <el-input
+          v-model="promptForm[key]"
+          type="textarea"
+          :rows="6"
+          :placeholder="PROMPT_DEFAULTS[key]"
+        />
+      </div>
+      <div class="agent-actions">
+        <el-button type="primary" size="small" @click="savePrompt">保存模板</el-button>
+        <el-button size="small" @click="resetPrompt">恢复默认</el-button>
+        <span class="text-muted">保存后下次生成即生效</span>
+      </div>
+    </div>
+
+    <div v-if="!['agent', 'retrieval', 'prompt'].includes(active)" class="bar">
       <el-button type="primary" size="small" @click="openAdd">
         + 新增{{ active === 'sensitive_word' ? '敏感词' : active === 'format_adapter' ? '适配器' : active === 'model_profile' ? 'Profile' : '词条' }}
       </el-button>
