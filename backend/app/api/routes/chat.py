@@ -16,14 +16,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.schemas.contracts import ChatRequest
 from app.services.audit import actor_from_request
+from app.services.auth import Caller, get_caller
 from app.services.chat import stream_chat
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-@router.post("/stream")
+@router.post("/stream", dependencies=[Depends(get_caller)])
 async def chat_stream(
-    req: ChatRequest, request: Request, db: AsyncSession = Depends(get_db)
+    req: ChatRequest, request: Request, caller: Caller = Depends(get_caller),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """智能问答流式接口（SSE）。
 
@@ -32,7 +34,17 @@ async def chat_stream(
     intent/plan/step_*（老客户端忽略新事件即可兼容）。
     前端用 fetch + ReadableStream 消费，实时渲染；点「停止」时后端
     自动保存已生成部分为助手消息。
+
+    认证（2026-10-13）：双模认证（用户 JWT / 第三方 X-API-Key）；
+    请求声明的 max_clearance 会被调用方额度压低（权限管控入口），
+    第三方客户端还需具备 chat 能力域。
     """
+    if not caller.allows_scope("chat"):
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=403, detail="该客户端无 chat 能力域权限")
+    # 权限管控：请求密级不得超过调用方额度（密级过滤下推的入口）
+    req.max_clearance = caller.cap_clearance(req.max_clearance)
     return StreamingResponse(
         stream_chat(db, req, actor=actor_from_request(request)),
         media_type="text/event-stream",

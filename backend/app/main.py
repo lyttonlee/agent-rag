@@ -14,11 +14,12 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import (
     audit,
+    auth,
     chat,
     config,
     conversations,
@@ -33,6 +34,7 @@ from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import AsyncSessionLocal, engine
 from app.services.audit import actor_from_request, record_audit
+from app.services.auth import ensure_admin_user, get_caller
 from app.services.ingestion import reconcile_stuck_jobs
 from app.api.routes.spaces import ensure_default_space
 from app.api.routes.templates import ensure_seed_templates
@@ -41,8 +43,9 @@ settings = get_settings()
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger("gov_doc_rag")
 
-# 不审计这些路径（健康检查 / 文档 / OpenAPI / 审计自身，避免噪声与递归）
-_SKIP_AUDIT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi", "/v1/audit")
+# 不审计这些路径（健康检查 / 文档 / OpenAPI / 审计自身 / 登录态探测，避免噪声与递归）
+# 注意：登录（/v1/auth/login）与客户端注册保留审计——安全相关操作必须留痕
+_SKIP_AUDIT_PREFIXES = ("/health", "/docs", "/redoc", "/openapi", "/v1/audit", "/v1/auth/me")
 
 
 def _client_ip(request: Request) -> str | None:
@@ -80,6 +83,13 @@ async def lifespan(app: FastAPI):
         logger.info("默认文档空间就绪")
     except Exception as exc:
         logger.warning("默认空间初始化失败：%s", exc)
+    # 种子管理员：dev 开箱即登录（admin/admin123，生产用环境变量覆盖）
+    try:
+        async with AsyncSessionLocal() as db:
+            admin = await ensure_admin_user(db)
+        logger.info("管理员账号就绪：%s（角色 %s）", admin.username, admin.role)
+    except Exception as exc:
+        logger.warning("种子管理员初始化失败：%s", exc)
     yield
     await engine.dispose()
 
@@ -132,16 +142,20 @@ app.add_middleware(
 )
 
 API_PREFIX = settings.api_prefix
-app.include_router(documents.router, prefix=API_PREFIX)
-app.include_router(retrieve.router, prefix=API_PREFIX)
-app.include_router(generate.router, prefix=API_PREFIX)
-app.include_router(spaces.router, prefix=API_PREFIX)
-app.include_router(chat.router, prefix=API_PREFIX)
-app.include_router(conversations.router, prefix=API_PREFIX)
-app.include_router(templates.router, prefix=API_PREFIX)
-app.include_router(config.router, prefix=API_PREFIX)
-app.include_router(export.router, prefix=API_PREFIX)
-app.include_router(audit.router, prefix=API_PREFIX)
+# 业务路由统一双模认证（用户 JWT / 第三方 X-API-Key，见 services/auth.get_caller）。
+# auth 路由自身不挂全局依赖：login/register 为开放端点，me/客户端管理自行校验。
+# 健康检查 / OpenAPI 文档保持开放（探活与联调用）。
+app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(documents.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(retrieve.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(generate.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(spaces.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(chat.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(conversations.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(templates.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(config.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(export.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
+app.include_router(audit.router, prefix=API_PREFIX, dependencies=[Depends(get_caller)])
 
 
 @app.get("/health", tags=["health"])

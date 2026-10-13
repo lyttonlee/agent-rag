@@ -1,11 +1,30 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { useRoute } from 'vue-router'
-import { caller } from '@/api/client'
+import { computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { caller, currentUser, fetchMe, getToken, logout, setToken } from '@/api/client'
 
 const route = useRoute()
+const router = useRouter()
 const title = computed(() => (route.meta.title as string) || '企业公文知识库')
 const env = import.meta.env.MODE
+
+// 当前登录用户（共享 ref，驱动顶栏展示与管理员菜单可见性）
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+
+onMounted(async () => {
+  // 无令牌（登录页）不拉用户；令牌无效时清态即可，跳转由路由守卫/拦截器负责
+  if (!getToken()) return
+  try {
+    await fetchMe()
+  } catch {
+    setToken(null)
+  }
+})
+
+function onLogout() {
+  logout()
+  router.replace('/login')
+}
 </script>
 
 <template>
@@ -27,6 +46,7 @@ const env = import.meta.env.MODE
         <el-menu-item index="/chat"><el-icon><ChatDotRound /></el-icon>智能问答</el-menu-item>
         <el-menu-item index="/draft"><el-icon><EditPen /></el-icon>智能起草</el-menu-item>
         <el-menu-item index="/templates"><el-icon><Files /></el-icon>模板库</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/auth"><el-icon><Key /></el-icon>认证管理</el-menu-item>
         <el-menu-item index="/config"><el-icon><Setting /></el-icon>配置中心</el-menu-item>
         <el-menu-item index="/audit"><el-icon><Notebook /></el-icon>审计日志</el-menu-item>
         <el-menu-item index="/ops"><el-icon><Monitor /></el-icon>运维台</el-menu-item>
@@ -42,6 +62,11 @@ const env = import.meta.env.MODE
         <span class="badge INTERNAL">密级：内部</span>
         <span class="env-chip">{{ env }}</span>
         <span class="scope mono text-muted">{{ caller.caller_scope.join(',') || 'no-scope' }}</span>
+        <!-- 当前用户 + 退出 -->
+        <span v-if="currentUser" class="user-chip mono" :title="`${currentUser.username}（${currentUser.role}）`">
+          {{ currentUser.display_name || currentUser.username }}
+        </span>
+        <el-button size="small" round @click="onLogout">退出</el-button>
       </header>
       <main class="content">
         <router-view />
@@ -78,6 +103,12 @@ const env = import.meta.env.MODE
   background: var(--bg-surface-2); color: var(--text-muted);
 }
 .scope { font-size: 12px; }
+.user-chip {
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  background: var(--bg-surface-2); color: var(--text);
+  border: 1px solid var(--line-strong); max-width: 160px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* 内容区：flex column 使页面根容器可通过 .page-fill 铺满视口 */
 .content { flex: 1; overflow: auto; padding: 20px; display: flex; flex-direction: column; }
 </style>

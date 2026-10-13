@@ -317,3 +317,72 @@ class AuditLogResp(BaseModel):
     detail: str = ""
     duration_ms: int | None = None
     created_at: datetime | None = None
+
+
+# =========================================================================
+# 认证（用户 2026-10-13 需求）
+# =========================================================================
+
+class LoginReq(BaseModel):
+    """用户登录（运维台/控制台）。"""
+
+    username: str
+    password: str
+
+
+class UserResp(BaseModel):
+    """用户信息（不含口令哈希等敏感字段）。"""
+
+    id: str
+    username: str
+    display_name: str = ""
+    role: str
+    enabled: bool = True
+    last_login_at: datetime | None = None
+
+
+class LoginResp(BaseModel):
+    """登录成功响应：JWT + 用户信息。"""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(..., description="有效期（秒）")
+    user: UserResp
+
+
+class ClientRegisterReq(BaseModel):
+    """第三方客户端注册（"注册调用"的注册环节）。
+
+    提交后返回 client_id 与 api_key——**api_key 仅此一次明文返回**，
+    请妥善保存；后续调用只需携带 X-API-Key 头。
+    """
+
+    name: str = Field(..., description="客户端名称（建议：接入系统名，便于审计）")
+    scopes: list[str] = Field(
+        default_factory=lambda: ["chat", "retrieve"],
+        description='允许的能力域：chat/retrieve/documents/spaces/conversations/templates/config/audit/ops，或 ["*"] 全开',
+    )
+    max_clearance: SecurityLevel = Field(
+        "INTERNAL", description="可检索最高密级：PUBLIC/INTERNAL/RESTRICTED/SECRET"
+    )
+
+
+class ClientResp(BaseModel):
+    """第三方客户端信息（api_key 永不明文返回，仅展示前缀）。"""
+
+    client_id: str
+    name: str
+    key_prefix: str = Field("", description="API Key 前缀（如 sk-ab12…），仅供核对")
+    scopes: list[str] = Field(default_factory=list)
+    max_clearance: str = "INTERNAL"
+    enabled: bool = True
+    expires_at: datetime | None = None
+    created_by: str = ""
+    last_used_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class ClientRegisterResp(ClientResp):
+    """注册响应：唯一一次返回 api_key 明文。"""
+
+    api_key: str = Field(..., description="API Key 明文，仅此次返回，请立即保存")

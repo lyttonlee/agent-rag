@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { ref } from 'vue'
 
 // 统一 API 客户端：/v1 前缀（与后端 API_PREFIX 对齐），由 vite 代理转发到 8000。
 const client = axios.create({
@@ -15,6 +16,107 @@ export interface CallerContext {
 export const caller: CallerContext = {
   caller_scope: ['scope:dept:office'],
   max_clearance: 'INTERNAL',
+}
+
+// ============================ 认证（2026-10-13） ============================
+// 登录态管理：JWT 存 localStorage；请求拦截器统一附加 Authorization 头；
+// 响应拦截器捕获 401（未登录/令牌过期）→ 清令牌并跳转登录页。
+
+const TOKEN_KEY = 'gov_doc_token'
+
+export interface AuthUser {
+  id: string
+  username: string
+  display_name: string
+  role: 'admin' | 'operator' | 'viewer'
+  enabled: boolean
+  last_login_at: string | null
+}
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setToken(token: string | null): void {
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
+}
+
+// 请求拦截：附加 JWT
+client.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+// 响应拦截：401 → 清令牌跳登录（避免在拦截器里直接用 router 单例，懒取防初始化顺序问题）
+client.interceptors.response.use(
+  (resp) => resp,
+  (error) => {
+    if (error.response?.status === 401) {
+      setToken(null)
+      const path = window.location.pathname
+      if (path !== '/login') {
+        window.location.assign(`/login?redirect=${encodeURIComponent(path)}`)
+      }
+    }
+    return Promise.reject(error)
+  },
+)
+
+/** 当前登录用户（跨组件共享：登录页写入，App 壳/菜单读取） */
+export const currentUser = ref<AuthUser | null>(null)
+
+export async function login(username: string, password: string): Promise<{ access_token: string; user: AuthUser }> {
+  const { data } = await client.post('/auth/login', { username, password })
+  setToken(data.access_token)
+  currentUser.value = data.user
+  return data
+}
+
+export function logout(): void {
+  setToken(null)
+  currentUser.value = null
+  window.location.assign('/login')
+}
+
+export async function fetchMe(): Promise<AuthUser> {
+  const { data } = await client.get('/auth/me')
+  currentUser.value = data
+  return data
+}
+
+// ---- 第三方客户端管理 ----
+export interface ApiClientItem {
+  client_id: string
+  name: string
+  key_prefix: string
+  scopes: string[]
+  max_clearance: SecurityLevel
+  enabled: boolean
+  expires_at: string | null
+  created_by: string
+  last_used_at: string | null
+  created_at: string | null
+}
+
+export async function listApiClients(): Promise<ApiClientItem[]> {
+  const { data } = await client.get('/auth/clients')
+  return data
+}
+
+export async function registerApiClient(payload: {
+  name: string
+  scopes: string[]
+  max_clearance: SecurityLevel
+}): Promise<ApiClientItem & { api_key: string }> {
+  const { data } = await client.post('/auth/clients/register', payload)
+  return data
+}
+
+export async function setClientEnabled(clientId: string, enabled: boolean): Promise<ApiClientItem> {
+  const { data } = await client.post(`/auth/clients/${clientId}/${enabled ? 'enable' : 'disable'}`)
+  return data
 }
 
 export default client
@@ -403,7 +505,7 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
     try {
       resp = await fetch('/v1/generate/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
         body: JSON.stringify({
           query: opts.query,
           template_doc_type: opts.template_doc_type,
@@ -541,7 +643,7 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
     try {
       resp = await fetch('/v1/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}) },
         body: JSON.stringify({
           query: opts.query,
           conversation_id: opts.conversation_id,

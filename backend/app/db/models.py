@@ -297,3 +297,56 @@ class ConversationMessage(Base, TimestampMixin):
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+# =========================================================================
+# 认证模型（用户 2026-10-13 需求：添加用户认证 + 第三方注册调用认证）
+# =========================================================================
+
+class User(Base, TimestampMixin):
+    """运维台用户（前端控制台登录账号）。
+
+    口令存储 pbkdf2-sha256 哈希（迭代次数+盐+摘要，见 auth.py），
+    绝不保存明文；role 控制管理操作权限（admin/operator/viewer）。
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    display_name: Mapped[str] = mapped_column(String(64), default="")
+    # admin=可管理第三方客户端；operator=日常运维；viewer=只读
+    role: Mapped[str] = mapped_column(String(16), default="operator", index=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApiClient(Base, TimestampMixin):
+    """第三方调用客户端（机器对机器认证）。
+
+    注册流程（"第三方注册调用"）：第三方 POST /v1/auth/clients/register
+    提交名称与所需能力，服务端返回 client_id 与 api_key（**仅此一次明文**，
+    后续只存 sha256 哈希）。第三方调用时携带 X-API-Key 头认证。
+
+    额度约束（与密级体系联动）：
+    - scopes：允许调用的能力域（chat/retrieve/documents/... 或 ["*"]）；
+    - max_clearance：该客户端可检索的最高密级，请求体的 max_clearance
+      超过此值时被服务端压低（权限过滤下推的入口管控）。
+    """
+
+    __tablename__ = "api_clients"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    # 对外标识（注册时返回，可安全展示）；api_key 只存哈希
+    client_id: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    api_key_hash: Mapped[str] = mapped_column(String(64), index=True)
+    # 展示用前缀（如 sk-ab12…），便于运维台核对"哪个 key 在用"
+    key_prefix: Mapped[str] = mapped_column(String(16), default="")
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)   # ["*"] 或具体能力域
+    max_clearance: Mapped[str] = mapped_column(String(16), default="INTERNAL")
+    enabled: Mapped[bool] = mapped_column(default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="self-register")
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

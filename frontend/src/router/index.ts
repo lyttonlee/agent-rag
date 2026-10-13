@@ -1,6 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { getToken } from '@/api/client'
 
 const routes = [
+  { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
   { path: '/', redirect: '/overview' },
   { path: '/overview', name: 'overview', component: () => import('@/views/Overview.vue'), meta: { title: '概览' } },
   { path: '/docs', name: 'docs', component: () => import('@/views/DocLibrary.vue'), meta: { title: '文档库' } },
@@ -8,12 +10,24 @@ const routes = [
   { path: '/chat', name: 'chat', component: () => import('@/views/Chat.vue'), meta: { title: '智能问答' } },
   { path: '/draft', name: 'draft', component: () => import('@/views/Draft.vue'), meta: { title: '智能起草' } },
   { path: '/templates', name: 'templates', component: () => import('@/views/Templates.vue'), meta: { title: '模板库' } },
+  { path: '/auth', name: 'auth', component: () => import('@/views/AuthManager.vue'), meta: { title: '认证管理' } },
   { path: '/config', name: 'config', component: () => import('@/views/Config.vue'), meta: { title: '配置中心' } },
   { path: '/audit', name: 'audit', component: () => import('@/views/AuditLog.vue'), meta: { title: '审计日志' } },
   { path: '/ops', name: 'ops', component: () => import('@/views/Ops.vue'), meta: { title: '运维台' } },
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes,
 })
+
+// 全局前置守卫：未登录访问业务页 → 跳登录页（带上原路径，登录后回跳）
+router.beforeEach((to) => {
+  if (to.meta.public) return true
+  if (!getToken()) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  return true
+})
+
+export default router

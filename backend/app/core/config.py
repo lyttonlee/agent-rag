@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     retrieve_vector_top_n: int = 50
     retrieve_final_top_n: int = 8
 
+    # ---- 认证（用户 2026-10-13 需求：用户认证 + 第三方注册调用认证）----
+    # JWT 签名密钥：生产必须通过环境变量覆盖（默认值仅用于开发）
+    jwt_secret: str = "dev-only-insecure-secret-change-me"
+    # 访问令牌有效期（小时）
+    jwt_expire_hours: int = 12
+    # 启动时种子的管理员账号（dev 开箱即用；生产应改密或禁用）
+    admin_username: str = "admin"
+    admin_password: str = "admin123"
+
     @property
     def database_url(self) -> str:
         """异步 SQLAlchemy 连接串。"""
