@@ -76,16 +76,135 @@ export interface IngestionJob {
   updated_at: string | null
 }
 
+// ============================ 文档空间 ============================
+
+export interface DocSpace {
+  id: string
+  name: string
+  code: string
+  description: string | null
+  is_default: boolean
+  doc_count: number
+  chunk_count: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+export async function listSpaces(): Promise<DocSpace[]> {
+  const r = await client.get<DocSpace[]>('/spaces')
+  return r.data
+}
+
+export async function createSpace(payload: {
+  name: string
+  code: string
+  description?: string
+}): Promise<DocSpace> {
+  const r = await client.post<DocSpace>('/spaces', payload)
+  return r.data
+}
+
+export async function updateSpace(
+  id: string,
+  payload: { name?: string; description?: string },
+): Promise<DocSpace> {
+  const r = await client.put<DocSpace>(`/spaces/${id}`, payload)
+  return r.data
+}
+
+export async function deleteSpace(id: string): Promise<void> {
+  await client.delete(`/spaces/${id}`)
+}
+
+// ============================ 会话（问答/起草共用） ============================
+
+export type ConvType = 'chat' | 'draft'
+
+export interface Conversation {
+  id: string
+  title: string
+  conv_type: ConvType
+  space_ids: string[]
+  message_count: number
+  last_message_at: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ConversationMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  citations: CitationPayload[]
+  sensitive_hits: string[]
+  model: string | null
+  created_at: string | null
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: ConversationMessage[]
+}
+
+export async function listConversations(convType?: ConvType): Promise<Conversation[]> {
+  const r = await client.get<Conversation[]>('/conversations', {
+    params: convType ? { conv_type: convType } : {},
+  })
+  return r.data
+}
+
+export async function createConversation(payload: {
+  conv_type: ConvType
+  title?: string
+  space_ids?: string[]
+}): Promise<Conversation> {
+  const r = await client.post<Conversation>('/conversations', payload)
+  return r.data
+}
+
+export async function getConversation(id: string): Promise<ConversationDetail> {
+  const r = await client.get<ConversationDetail>(`/conversations/${id}`)
+  return r.data
+}
+
+export async function updateConversation(
+  id: string,
+  payload: { title?: string; space_ids?: string[] },
+): Promise<Conversation> {
+  const r = await client.put<Conversation>(`/conversations/${id}`, payload)
+  return r.data
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  await client.delete(`/conversations/${id}`)
+}
+
+export async function appendMessage(
+  id: string,
+  payload: {
+    role: 'user' | 'assistant'
+    content: string
+    citations?: CitationPayload[]
+    sensitive_hits?: string[]
+    model?: string
+  },
+): Promise<ConversationMessage> {
+  const r = await client.post<ConversationMessage>(`/conversations/${id}/messages`, payload)
+  return r.data
+}
+
 // ============================ API 封装 ============================
 
-export async function getStats(): Promise<DocStats> {
-  const r = await client.get<DocStats>('/documents/stats')
+export async function getStats(spaceId?: string): Promise<DocStats> {
+  const r = await client.get<DocStats>('/documents/stats', {
+    params: spaceId ? { space_id: spaceId } : {},
+  })
   return r.data
 }
 
 export interface ListQuery {
   doc_type?: string
   security_level?: string
+  space_id?: string
   status?: string
   q?: string
   page?: number
@@ -110,6 +229,7 @@ export interface UploadMeta {
   publish_date?: string
   security_level?: SecurityLevel
   permission_tags?: string
+  space_id?: string
   chunk_strategy?: ChunkStrategy
   chunk_size?: number
   chunk_overlap?: number
@@ -137,11 +257,18 @@ export async function listJobs(limit = 20): Promise<IngestionJob[]> {
 
 export async function retrieve(
   query: string,
-  opts: { top_n?: number; caller_scope?: string[]; max_clearance?: SecurityLevel; rerank?: boolean },
+  opts: {
+    top_n?: number
+    space_ids?: string[]
+    caller_scope?: string[]
+    max_clearance?: SecurityLevel
+    rerank?: boolean
+  },
 ) {
   const r = await client.post('/retrieve', {
     query,
     top_n: opts.top_n ?? 8,
+    space_ids: opts.space_ids ?? null,
     caller_scope: opts.caller_scope ?? [],
     max_clearance: opts.max_clearance ?? 'INTERNAL',
     rerank: opts.rerank ?? true,
@@ -153,6 +280,8 @@ export async function generate(
   query: string,
   opts: {
     template_doc_type?: string
+    conversation_id?: string
+    space_ids?: string[]
     caller_scope?: string[]
     max_clearance?: SecurityLevel
     rerank?: boolean
@@ -162,6 +291,8 @@ export async function generate(
   const r = await client.post('/generate', {
     query,
     template_doc_type: opts.template_doc_type,
+    conversation_id: opts.conversation_id,
+    space_ids: opts.space_ids ?? null,
     caller_scope: opts.caller_scope ?? [],
     max_clearance: opts.max_clearance ?? 'INTERNAL',
     rerank: opts.rerank ?? false,
@@ -182,8 +313,8 @@ export interface CitationPayload {
 }
 
 export interface StreamHandlers {
-  /** 检索元数据（引用列表）到达 */
-  onMeta?: (model: string, citations: CitationPayload[], truncated: boolean) => void
+  /** 检索元数据（引用列表）到达；conversationId 为起草会话 ID（首轮后端创建并回传） */
+  onMeta?: (model: string, citations: CitationPayload[], truncated: boolean, conversationId?: string) => void
   /** 正文 token 逐片到达 */
   onToken?: (text: string) => void
   /** 思考链片段到达（推理模型） */
@@ -197,6 +328,8 @@ export interface StreamHandlers {
 export interface StreamGenerateOpts {
   query: string
   template_doc_type?: string
+  conversation_id?: string
+  space_ids?: string[]
   caller_scope?: string[]
   max_clearance?: SecurityLevel
   rerank?: boolean
@@ -222,6 +355,8 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
         body: JSON.stringify({
           query: opts.query,
           template_doc_type: opts.template_doc_type,
+          conversation_id: opts.conversation_id,
+          space_ids: opts.space_ids ?? null,
           caller_scope: opts.caller_scope ?? [],
           max_clearance: opts.max_clearance ?? 'INTERNAL',
           rerank: opts.rerank ?? false,
@@ -262,7 +397,12 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
           }
           switch (evt.type) {
             case 'meta':
-              handlers.onMeta?.(evt.model ?? '', evt.citations ?? [], !!evt.truncated_by_security)
+              handlers.onMeta?.(
+                evt.model ?? '',
+                evt.citations ?? [],
+                !!evt.truncated_by_security,
+                evt.conversation_id ?? undefined,
+              )
               break
             case 'token':
               handlers.onToken?.(evt.text ?? '')
@@ -275,6 +415,125 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
               break
             case 'error':
               handlers.onError?.(evt.message ?? '生成失败')
+              break
+          }
+        }
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      handlers.onError?.(`流式读取中断：${e?.message || e}`)
+    }
+  }
+  void run()
+  return controller
+}
+
+// ============================ 智能问答（SSE，多轮会话） ============================
+
+export interface StreamChatOpts {
+  query: string
+  conversation_id?: string
+  space_ids?: string[]
+  doc_types?: string[]
+  caller_scope?: string[]
+  max_clearance?: SecurityLevel
+  rerank?: boolean
+  top_n?: number
+}
+
+export interface ChatHandlers {
+  /** 会话与检索元数据到达（conversation_id 供前端后续轮次复用） */
+  onMeta?: (conversationId: string, model: string, citations: CitationPayload[], truncated: boolean) => void
+  onToken?: (text: string) => void
+  onReasoning?: (text: string) => void
+  /** 流式完成（含脱敏后完整答案、敏感词命中、会话 ID） */
+  onDone?: (answer: string, sensitiveHits: string[], model: string, conversationId: string) => void
+  onError?: (message: string) => void
+}
+
+/**
+ * 智能问答流式：fetch 消费 POST /v1/chat/stream（text/event-stream）。
+ *
+ * 与 streamGenerate 的差异：meta/done 事件携带 conversation_id——
+ * 首轮问答后端自动创建会话并回传 ID，前端据此把同一会话的后续轮次
+ * 挂在同一 conversation_id 上，实现多轮追问与历史记录。
+ */
+export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortController {
+  const controller = new AbortController()
+
+  const run = async () => {
+    let resp: Response
+    try {
+      resp = await fetch('/v1/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: opts.query,
+          conversation_id: opts.conversation_id,
+          space_ids: opts.space_ids ?? null,
+          doc_types: opts.doc_types ?? null,
+          caller_scope: opts.caller_scope ?? [],
+          max_clearance: opts.max_clearance ?? 'INTERNAL',
+          rerank: opts.rerank ?? true,
+          top_n: opts.top_n ?? 8,
+        }),
+        signal: controller.signal,
+      })
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return
+      handlers.onError?.(`网络错误：${e?.message || e}`)
+      return
+    }
+    if (!resp.ok || !resp.body) {
+      handlers.onError?.(`服务端错误 HTTP ${resp.status}`)
+      return
+    }
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const raw = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          const line = raw.trim()
+          if (!line.startsWith('data:')) continue
+          let evt: any
+          try {
+            evt = JSON.parse(line.slice(5).trim())
+          } catch {
+            continue
+          }
+          switch (evt.type) {
+            case 'meta':
+              handlers.onMeta?.(
+                evt.conversation_id ?? '',
+                evt.model ?? '',
+                evt.citations ?? [],
+                !!evt.truncated_by_security,
+              )
+              break
+            case 'token':
+              handlers.onToken?.(evt.text ?? '')
+              break
+            case 'reasoning':
+              handlers.onReasoning?.(evt.text ?? '')
+              break
+            case 'done':
+              handlers.onDone?.(
+                evt.answer ?? '',
+                evt.sensitive_hits ?? [],
+                evt.model ?? '',
+                evt.conversation_id ?? '',
+              )
+              break
+            case 'error':
+              handlers.onError?.(evt.message ?? '问答失败')
               break
           }
         }

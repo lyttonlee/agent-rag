@@ -1,8 +1,9 @@
-"""数据模型：文档、切片、模板、配置 KV。
+"""数据模型：文档、切片、模板、配置 KV、文档空间、会话。
 
 设计要点：
 - 切片（chunk）**冗余存储 security_level 与 permission_tags**，
   以便检索阶段在切片粒度直接下推过滤（避免每次 JOIN 文档表）。
+- 切片同样**冗余 space_id**（文档空间），支撑"按空间检索"的切片粒度下推。
 - embedding 列使用 pgvector 的 Vector(embedding_dim) 类型。
 - search_vec 为 tsvector 列（由 zhparser 中文分词生成），支撑 BM25 关键词召回。
 """
@@ -36,6 +37,27 @@ def _uuid() -> str:
     return uuid.uuid4().hex
 
 
+class DocumentSpace(Base, TimestampMixin):
+    """文档空间：知识库的逻辑分区（如"综合政务"/"安全生产"/"人事档案"）。
+
+    文档上传/接入时归属到某一空间；检索/问答可按 space_ids（支持多个）
+    限定知识范围。第三方系统通过同一套 /v1/spaces 接口创建空间并
+    将文档接入指定空间，实现多租户式的知识隔离。
+    """
+
+    __tablename__ = "document_spaces"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    # 空间编码：第三方系统对接用的稳定标识（唯一，建议英文/数字）
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(String(512))
+    # 默认空间：存量文档与未显式指定空间的接入文档归属；不可删除
+    is_default: Mapped[bool] = mapped_column(default=False, index=True)
+
+    documents: Mapped[list["Document"]] = relationship(back_populates="space")
+
+
 class Document(Base, TimestampMixin):
     """公文文档主表（第三方接入，携带我方标准元数据）。"""
 
@@ -56,8 +78,13 @@ class Document(Base, TimestampMixin):
     content_ref: Mapped[str | None] = mapped_column(String(512))   # 存储对象键（local 相对路径 / s3 对象键）
     status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 所属文档空间（删除空间时置空，文档不随空间删除而丢失）
+    space_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_spaces.id", ondelete="SET NULL"), index=True
+    )
 
     chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
+    space: Mapped["DocumentSpace | None"] = relationship(back_populates="documents")
 
 
 class Chunk(Base, TimestampMixin):
@@ -77,6 +104,8 @@ class Chunk(Base, TimestampMixin):
     # 冗余密级 / 权限，支撑检索下推过滤
     security_level: Mapped[str] = mapped_column(String(16), index=True, default="INTERNAL")
     permission_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    # 冗余文档空间：按空间检索时在切片粒度直接 WHERE 下推（免 JOIN documents）
+    space_id: Mapped[str | None] = mapped_column(String(32), index=True)
     search_vec: Mapped[object] = mapped_column(TSVECTOR)            # 中文 BM25 向量
     tokens: Mapped[int] = mapped_column(Integer, default=0)         # 字数，用于计费/统计
 
@@ -192,3 +221,49 @@ class AuditLog(Base, TimestampMixin):
     status_code: Mapped[int | None] = mapped_column(Integer)
     detail: Mapped[str] = mapped_column(Text, default="")
     duration_ms: Mapped[int | None] = mapped_column(Integer)
+
+
+class Conversation(Base, TimestampMixin):
+    """会话：智能问答 / 公文起草的多轮对话容器。
+
+    一次会话包含多条消息（user/assistant 交替），支持：
+    - 智能问答（conv_type=chat）：基于知识文档回答问题，可多轮追问；
+    - 公文起草（conv_type=draft）：按文种模板生成草稿，可多轮修改。
+    会话可绑定知识空间（space_ids），限定检索范围。
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    title: Mapped[str] = mapped_column(String(256), default="新会话")
+    conv_type: Mapped[str] = mapped_column(String(16), default="chat", index=True)  # chat/draft
+    # 会话绑定的知识空间（多选）；空列表 = 不限空间（受密级/权限约束）
+    space_ids: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    messages: Mapped[list["ConversationMessage"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+
+
+class ConversationMessage(Base, TimestampMixin):
+    """会话消息：一问一答为一条 user + 一条 assistant。
+
+    assistant 消息携带 citations（引用溯源）与 sensitive_hits（敏感词命中），
+    历史回看时仍可核对依据；停止生成时保存的部分答案同样留痕。
+    """
+
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), index=True)      # user / assistant
+    content: Mapped[str] = mapped_column(Text)
+    citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    sensitive_hits: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    model: Mapped[str | None] = mapped_column(String(64))
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="messages")

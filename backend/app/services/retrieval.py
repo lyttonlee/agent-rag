@@ -38,6 +38,19 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         permission_tags_col=Chunk.permission_tags,
     )
 
+    # ---- 文档空间过滤（可选）：切片粒度 space_id 下推，免 JOIN documents ----
+    # space_ids 为空/缺省 = 不限空间（仍受密级/权限约束）；
+    # 传入多个空间 ID 时取并集（知识范围合并检索）。
+    space_ids = getattr(req, "space_ids", None)
+    space_filter = Chunk.space_id.in_(space_ids) if space_ids else None
+
+    def _apply(q):
+        """给召回查询统一叠加 可见性 + 空间 过滤。"""
+        q = q.where(vis_filter)
+        if space_filter is not None:
+            q = q.where(space_filter)
+        return q
+
     # ---- 向量召回 ----
     vec_q = (
         select(Chunk, Chunk.embedding.cosine_distance(query_vec).label("dist"))
@@ -46,6 +59,7 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         .order_by(Chunk.embedding.cosine_distance(query_vec))
         .limit(_settings.retrieve_vector_top_n)
     )
+    vec_q = _apply(vec_q)
     vec_rows = (await db.execute(vec_q)).scalars().all()
 
     # ---- 关键词召回（zhparser 中文分词 + ts_rank）----
@@ -58,6 +72,7 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         .order_by(func.ts_rank_cd(Chunk.search_vec, kw_ts).desc())
         .limit(_settings.retrieve_keyword_top_n)
     )
+    kw_q = _apply(kw_q)
     kw_rows = (await db.execute(kw_q)).scalars().all()
 
     # ---- RRF 融合 ----

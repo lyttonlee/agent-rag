@@ -17,12 +17,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import audit, config, documents, export, generate, retrieve, templates
+from app.api.routes import (
+    audit,
+    chat,
+    config,
+    conversations,
+    documents,
+    export,
+    generate,
+    retrieve,
+    spaces,
+    templates,
+)
 from app.core.config import get_settings
 from app.db.base import Base
-from app.db.session import engine
+from app.db.session import AsyncSessionLocal, engine
 from app.services.audit import record_audit
 from app.services.ingestion import reconcile_stuck_jobs
+from app.api.routes.spaces import ensure_default_space
 from app.api.routes.templates import ensure_seed_templates
 
 settings = get_settings()
@@ -48,7 +60,7 @@ def _actor(request: Request) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：建表（dev）→ 回收残留任务 → 种子模板库。"""
+    """应用生命周期：建表（dev）→ 回收残留任务 → 种子模板库 → 确保默认空间。"""
     # 开发环境自动建表（生产由 Alembic 迁移管理）
     if settings.environment in ("dev", "test"):
         async with engine.begin() as conn:
@@ -66,6 +78,13 @@ async def lifespan(app: FastAPI):
             logger.info("模板库种子初始化：新增 %d 个标准模板", added)
     except Exception as exc:
         logger.warning("模板库种子初始化失败：%s", exc)
+    # 默认空间：保证任何文档都有明确空间归属（按空间检索才有意义）
+    try:
+        async with AsyncSessionLocal() as db:
+            await ensure_default_space(db)
+        logger.info("默认文档空间就绪")
+    except Exception as exc:
+        logger.warning("默认空间初始化失败：%s", exc)
     yield
     await engine.dispose()
 
@@ -121,6 +140,9 @@ API_PREFIX = settings.api_prefix
 app.include_router(documents.router, prefix=API_PREFIX)
 app.include_router(retrieve.router, prefix=API_PREFIX)
 app.include_router(generate.router, prefix=API_PREFIX)
+app.include_router(spaces.router, prefix=API_PREFIX)
+app.include_router(chat.router, prefix=API_PREFIX)
+app.include_router(conversations.router, prefix=API_PREFIX)
 app.include_router(templates.router, prefix=API_PREFIX)
 app.include_router(config.router, prefix=API_PREFIX)
 app.include_router(export.router, prefix=API_PREFIX)

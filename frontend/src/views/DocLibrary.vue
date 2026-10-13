@@ -1,13 +1,18 @@
 <script setup lang="ts">
-import { onBeforeUnmount, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import client from '@/api/client'
 import {
   caller,
+  createSpace,
+  deleteSpace,
   getDocument,
-  listDocuments,
-  uploadDocument,
   getJob,
+  listDocuments,
+  listSpaces,
+  updateSpace,
+  uploadDocument,
+  type DocSpace,
   type DocSummary,
   type DocDetail,
   type IngestionJob,
@@ -18,6 +23,25 @@ import {
 const rows = ref<DocSummary[]>([])
 const loading = ref(false)
 const total = ref(0)
+
+// ---- 文档空间 ----
+const spaces = ref<DocSpace[]>([])
+const currentSpace = ref('') // '' = 全部空间
+
+async function loadSpaces() {
+  try {
+    spaces.value = await listSpaces()
+  } catch {
+    ElMessage.error('加载文档空间失败')
+  }
+}
+onMounted(loadSpaces)
+
+/** 空间 ID → 名称（表格展示用） */
+function spaceName(id: string | null): string {
+  if (!id) return '—'
+  return spaces.value.find((s) => s.id === id)?.name || id.slice(0, 8)
+}
 
 // ---- 过滤 ----
 const filters = reactive({
@@ -33,6 +57,7 @@ async function load() {
       q: filters.q || undefined,
       doc_type: filters.doc_type || undefined,
       security_level: filters.security_level || undefined,
+      space_id: currentSpace.value || undefined,
       size: 100,
     })
     rows.value = data
@@ -47,6 +72,12 @@ load()
 const dialog = ref(false)
 const uploading = ref(false)
 const fileRef = ref<File | null>(null)
+
+/** 打开上传对话框：默认把文档放到当前正在浏览的空间 */
+function openUpload() {
+  form.space_id = currentSpace.value
+  dialog.value = true
+}
 const strategyDesc: Record<ChunkStrategy, string> = {
   paragraph: '按段落边界切分（默认，最稳妥，尽量不切断语义）',
   fixed: '定长滑动窗口（无视边界，召回最均匀）',
@@ -60,10 +91,88 @@ const form = reactive({
   doc_no: '',
   security_level: 'PUBLIC' as SecurityLevel,
   permission_tags: '',
+  space_id: '',
   chunk_strategy: 'paragraph' as ChunkStrategy,
   chunk_size: 800,
   chunk_overlap: 80,
 })
+
+// ---- 空间管理对话框 ----
+const spaceDialog = ref(false)
+const spaceSaving = ref(false)
+const spaceForm = reactive({ name: '', code: '', description: '' })
+const editingSpace = ref<DocSpace | null>(null)
+
+function openCreateSpace() {
+  editingSpace.value = null
+  spaceForm.name = ''
+  spaceForm.code = ''
+  spaceForm.description = ''
+}
+
+async function submitSpace() {
+  if (!spaceForm.name.trim()) {
+    ElMessage.warning('请输入空间名称')
+    return
+  }
+  spaceSaving.value = true
+  try {
+    if (editingSpace.value) {
+      await updateSpace(editingSpace.value.id, {
+        name: spaceForm.name.trim(),
+        description: spaceForm.description.trim() || undefined,
+      })
+      ElMessage.success('空间已更新')
+    } else {
+      if (!spaceForm.code.trim()) {
+        ElMessage.warning('请输入空间编码（唯一标识，建议英文）')
+        spaceSaving.value = false
+        return
+      }
+      await createSpace({
+        name: spaceForm.name.trim(),
+        code: spaceForm.code.trim(),
+        description: spaceForm.description.trim() || undefined,
+      })
+      ElMessage.success('空间已创建')
+    }
+    await loadSpaces()
+    spaceDialog.value = false
+    load()
+  } catch (e: any) {
+    ElMessage.error('保存失败：' + (e?.response?.data?.detail || e.message))
+  } finally {
+    spaceSaving.value = false
+  }
+}
+
+function editSpace(s: DocSpace) {
+  editingSpace.value = s
+  spaceForm.name = s.name
+  spaceForm.code = s.code
+  spaceForm.description = s.description || ''
+}
+
+async function removeSpace(s: DocSpace) {
+  try {
+    await ElMessageBox.confirm(
+      `删除空间「${s.name}」？空间内的文档需要先处理（迁移或删除）。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteSpace(s.id)
+    ElMessage.success('已删除')
+    if (currentSpace.value === s.id) currentSpace.value = ''
+    await loadSpaces()
+    load()
+  } catch (e: any) {
+    ElMessage.error('删除失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
 
 function onFileChange(file: any) {
   fileRef.value = file.raw as File
@@ -113,6 +222,7 @@ async function submit() {
       doc_no: form.doc_no,
       security_level: form.security_level,
       permission_tags: form.permission_tags,
+      space_id: form.space_id || undefined,
       chunk_strategy: form.chunk_strategy,
       chunk_size: form.chunk_size,
       chunk_overlap: form.chunk_overlap,
@@ -160,7 +270,22 @@ async function quickIngest() {
         <div class="ttl serif">文档库</div>
         <span class="count text-muted">共 {{ total }} 篇 · 真实数据</span>
         <div class="spacer" />
-        <el-button type="primary" @click="dialog = true">接入文档</el-button>
+        <el-select
+          :model-value="currentSpace"
+          placeholder="全部空间"
+          style="width: 200px"
+          @change="(v: string) => { currentSpace = v; load() }"
+        >
+          <el-option label="全部空间" value="" />
+          <el-option
+            v-for="s in spaces"
+            :key="s.id"
+            :label="`${s.name}（${s.doc_count} 篇）`"
+            :value="s.id"
+          />
+        </el-select>
+        <el-button @click="spaceDialog = true; openCreateSpace()">管理空间</el-button>
+        <el-button type="primary" @click="openUpload()">接入文档</el-button>
       </div>
 
       <div class="filters">
@@ -177,6 +302,9 @@ async function quickIngest() {
 
       <el-table :data="rows" v-loading="loading" style="width: 100%" empty-text="暂无文档（请先接入）">
         <el-table-column prop="title" label="标题" min-width="240" show-overflow-tooltip />
+        <el-table-column label="所属空间" width="130">
+          <template #default="{ row }">{{ spaceName(row.space_id) }}</template>
+        </el-table-column>
         <el-table-column prop="doc_type" label="文种" width="90" />
         <el-table-column label="密级" width="100">
           <template #default="{ row }"><span class="badge" :class="row.security_level">{{ row.security_level }}</span></template>
@@ -205,6 +333,17 @@ async function quickIngest() {
       </el-upload>
       <el-form :model="form" label-width="92px" style="margin-top: 14px">
         <el-form-item label="标题"><el-input v-model="form.title" placeholder="默认取文件名" /></el-form-item>
+        <el-form-item label="文档空间">
+          <el-select v-model="form.space_id" placeholder="默认空间" style="width: 200px">
+            <el-option
+              v-for="s in spaces"
+              :key="s.id"
+              :label="s.name + (s.is_default ? '（默认）' : '')"
+              :value="s.id"
+            />
+          </el-select>
+          <span class="hint">文档将归属到所选空间，检索可按空间过滤</span>
+        </el-form-item>
         <el-form-item label="文种">
           <el-select v-model="form.doc_type" style="width: 160px">
             <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
@@ -238,6 +377,56 @@ async function quickIngest() {
         <el-button @click="dialog = false">取消</el-button>
         <el-button type="primary" :loading="uploading" @click="submit">提交入库</el-button>
       </template>
+    </el-dialog>
+
+    <!-- 文档空间管理对话框 -->
+    <el-dialog v-model="spaceDialog" title="文档空间管理" width="640px">
+      <div class="space-list">
+        <div v-for="s in spaces" :key="s.id" class="space-row">
+          <div class="space-info">
+            <div class="space-name">
+              {{ s.name }}
+              <el-tag v-if="s.is_default" size="small" type="info" effect="dark">默认</el-tag>
+            </div>
+            <div class="space-sub text-muted">
+              编码 {{ s.code }} · {{ s.doc_count }} 篇文档 / {{ s.chunk_count }} 切片
+              <span v-if="s.description"> · {{ s.description }}</span>
+            </div>
+          </div>
+          <div class="space-ops">
+            <el-button link type="primary" size="small" @click="editSpace(s)">重命名</el-button>
+            <el-button
+              v-if="!s.is_default"
+              link
+              type="danger"
+              size="small"
+              @click="removeSpace(s)"
+            >删除</el-button>
+          </div>
+        </div>
+        <div v-if="!spaces.length" class="text-muted" style="padding: 12px 0">暂无空间</div>
+      </div>
+      <el-divider />
+      <div class="space-form">
+        <div class="form-ttl">{{ editingSpace ? '重命名空间' : '新建空间' }}</div>
+        <el-form label-width="72px" style="margin-top: 10px">
+          <el-form-item label="名称">
+            <el-input v-model="spaceForm.name" placeholder="如：安全生产专项" />
+          </el-form-item>
+          <el-form-item label="编码" v-if="!editingSpace">
+            <el-input v-model="spaceForm.code" placeholder="唯一标识，建议英文，如 safety-2026" />
+          </el-form-item>
+          <el-form-item label="描述">
+            <el-input v-model="spaceForm.description" placeholder="选填" />
+          </el-form-item>
+        </el-form>
+        <div class="form-ops">
+          <el-button v-if="editingSpace" @click="openCreateSpace()">取消编辑</el-button>
+          <el-button type="primary" :loading="spaceSaving" @click="submitSpace">
+            {{ editingSpace ? '保存' : '创建空间' }}
+          </el-button>
+        </div>
+      </div>
     </el-dialog>
 
     <!-- 入库进度（状态机）对话框 -->
@@ -290,6 +479,16 @@ async function quickIngest() {
 .st.ok { color: var(--c-success); }
 .up-tip { color: var(--text-muted); padding: 18px 0; }
 .hint { color: var(--text-faint); font-size: 12px; margin-left: 10px; }
+.space-list { max-height: 280px; overflow: auto; }
+.space-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}
+.space-name { color: var(--text-strong); font-size: 14px; display: flex; align-items: center; gap: 6px; }
+.space-sub { font-size: 12px; margin-top: 4px; }
+.space-form .form-ttl { color: var(--text-strong); font-size: 14px; font-weight: 600; }
+.space-form .form-ops { display: flex; justify-content: flex-end; gap: 8px; }
 .job-file { color: var(--text-strong); }
 .job-meta { display: flex; gap: 18px; margin-top: 10px; font-size: 13px; }
 .job-err { color: var(--c-danger); font-size: 12px; margin-top: 8px; word-break: break-all; }

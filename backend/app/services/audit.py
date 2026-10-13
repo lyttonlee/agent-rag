@@ -32,6 +32,12 @@ _PATH_RULES: list[tuple[re.Pattern[str], str, str | None]] = [
     (re.compile(r"^/v1/generate/stream$"), "流式智能生成", None),
     (re.compile(r"^/v1/generate$"), "智能生成", None),
     (re.compile(r"^/v1/retrieve$"), "智能检索", None),
+    (re.compile(r"^/v1/spaces/[^/]+$"), "空间维护", "document_space"),
+    (re.compile(r"^/v1/spaces$"), "空间维护", "document_space"),
+    (re.compile(r"^/v1/chat/stream$"), "智能问答", None),
+    (re.compile(r"^/v1/conversations/[^/]+/messages$"), "会话消息", "conversation"),
+    (re.compile(r"^/v1/conversations/[^/]+$"), "会话维护", "conversation"),
+    (re.compile(r"^/v1/conversations$"), "会话维护", "conversation"),
     (re.compile(r"^/v1/templates/seed$"), "模板种子初始化", "template"),
     (re.compile(r"^/v1/templates/[^/]+$"), "模板删除", "template"),
     (re.compile(r"^/v1/templates$"), "模板维护", "template"),
@@ -59,8 +65,11 @@ def _classify(path: str, method: str) -> tuple[str, str | None]:
 
 
 def _extract_object_id(path: str) -> str | None:
-    """从路径抽取资源主键（如 /v1/documents/{id}）。"""
-    m = re.search(r"^/v1/(?:documents|documents/jobs|templates)/([A-Za-z0-9_]+)$", path)
+    """从路径抽取资源主键（如 /v1/documents/{id}、/v1/spaces/{id}）。"""
+    m = re.search(
+        r"^/v1/(?:documents|documents/jobs|templates|spaces|conversations)/([A-Za-z0-9_]+)$",
+        path,
+    )
     if m:
         return m.group(1)
     return None

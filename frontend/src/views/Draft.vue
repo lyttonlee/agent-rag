@@ -1,7 +1,22 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue'
+/**
+ * 智能起草页：按文种模板生成公文草稿（SSE 流式 + 会话历史）。
+ *
+ * 多轮修改机制：首次起草自动创建 draft 会话（conversation_id 由后端
+ * meta 事件回传）；后续在同一会话中输入修改意见（如"语气更严厉一些"），
+ * 后端将该轮 user 消息落库，历史在左侧会话栏可回看。
+ */
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { caller, streamGenerate, type CitationPayload } from '@/api/client'
+import ConversationSidebar from '@/components/ConversationSidebar.vue'
+import {
+  caller,
+  getConversation,
+  streamGenerate,
+  type ConversationDetail,
+  type ConversationMessage,
+  type CitationPayload,
+} from '@/api/client'
 
 const docType = ref('通知')
 const topic = ref('关于开展第三季度安全生产大检查的通知')
@@ -17,6 +32,14 @@ let timer: number | null = null
 let controller: AbortController | null = null
 let startedAt = 0
 
+// ---- 会话（多轮修改）----
+const sidebar = ref<InstanceType<typeof ConversationSidebar> | null>(null)
+const activeId = ref<string | null>(null)
+const activeTitle = ref('新会话')
+const history = ref<ConversationMessage[]>([])
+const historyLoading = ref(false)
+const hasHistory = computed(() => history.value.length > 0)
+
 function startTimer() {
   startedAt = Date.now()
   elapsed.value = 0
@@ -24,6 +47,42 @@ function startTimer() {
 }
 function stopTimer() {
   if (timer) { clearInterval(timer); timer = null }
+}
+
+async function openConversation(id: string) {
+  if (loading.value) controller?.abort()
+  activeId.value = id
+  historyLoading.value = true
+  try {
+    const detail: ConversationDetail = await getConversation(id)
+    activeTitle.value = detail.title
+    history.value = detail.messages
+  } catch (e: any) {
+    ElMessage.error('加载会话失败：' + (e?.response?.data?.detail || e.message))
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+function newConversation() {
+  if (loading.value) controller?.abort()
+  activeId.value = null
+  activeTitle.value = '新会话'
+  history.value = []
+  answer.value = ''
+}
+
+/** 拉取会话最新消息（done / stop 后刷新历史） */
+async function refreshHistory() {
+  if (!activeId.value) return
+  try {
+    const detail = await getConversation(activeId.value)
+    activeTitle.value = detail.title
+    history.value = detail.messages
+  } catch {
+    // 刷新失败不打扰用户（主内容已在页面渲染）
+  }
+  sidebar.value?.load()
 }
 
 /** 流式生成：SSE 实时出字（meta → token* → done），思考链折叠展示。 */
@@ -44,14 +103,19 @@ async function generate() {
     {
       query: topic.value,
       template_doc_type: docType.value,
+      conversation_id: activeId.value ?? undefined,
       caller_scope: caller.caller_scope,
       max_clearance: caller.max_clearance,
       rerank: false,
     },
     {
-      onMeta: (model, cits) => {
+      onMeta: (model, cits, _truncated, conversationId) => {
         modelName.value = model
         citations.value = cits
+        // 首轮：后端自动创建起草会话并回传 ID，后续修改轮次复用
+        if (conversationId && conversationId !== activeId.value) {
+          activeId.value = conversationId
+        }
       },
       onReasoning: (text) => {
         reasoning.value += text
@@ -69,12 +133,15 @@ async function generate() {
         hits.value = sensitiveHits
         loading.value = false
         stopTimer()
+        // 落库完成：刷新会话历史（meta 事件已回传 conversation_id 到 activeId）
+        refreshHistory()
         if (sensitiveHits.length) {
           ElMessage.warning(`敏感词命中 ${sensitiveHits.length} 处，已脱敏`)
         }
       },
       onError: (message) => {
         ElMessage.error('生成失败：' + message)
+        refreshHistory()
         loading.value = false
         stopTimer()
       },
@@ -87,7 +154,13 @@ function stop() {
   controller = null
   loading.value = false
   stopTimer()
-  ElMessage.info('已停止生成')
+  // 后端已保存部分答案，刷新历史显示
+  refreshHistory()
+  ElMessage.info('已停止生成，已生成部分已保留在会话中')
+}
+
+function onDeleted(id: string) {
+  if (activeId.value === id) newConversation()
 }
 
 onBeforeUnmount(() => {
@@ -118,45 +191,71 @@ async function exportDocx() {
 </script>
 
 <template>
-  <div class="panel pad">
-    <div class="head">
-      <div class="ttl serif">智能起草</div>
-      <span class="badge INTERNAL">按文种模板 · 引用溯源 · 流式输出</span>
-    </div>
-    <div class="bar">
-      <el-select v-model="docType" style="width: 140px">
-        <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
-      </el-select>
-      <el-input v-model="topic" placeholder="起草主题" style="flex: 1" @keyup.enter="generate" />
-      <el-button type="primary" :loading="loading" @click="generate">{{ loading ? '生成中…' : '起草' }}</el-button>
-      <el-button v-if="loading" @click="stop">停止</el-button>
-      <el-button :disabled="!answer" @click="exportDocx">导出 docx</el-button>
-    </div>
+  <div class="draft-wrap">
+    <!-- 左：会话历史（多轮修改） -->
+    <ConversationSidebar
+      ref="sidebar"
+      :conv-type="'draft'"
+      :active-id="activeId"
+      @select="openConversation"
+      @new="newConversation"
+      @deleted="onDeleted"
+    />
 
-    <!-- 流式状态条：模型 / 耗时 / 思考链折叠 -->
-    <div v-if="loading || reasoning" class="stream-bar">
-      <span v-if="loading" class="live"><i class="dot" />流式生成中</span>
-      <span v-if="loading" class="mono text-muted">{{ elapsed.toFixed(1) }}s</span>
-      <span v-if="modelName" class="text-muted">模型 {{ modelName }}</span>
-      <el-link v-if="reasoning" type="primary" @click="showReasoning = !showReasoning">
-        {{ showReasoning ? '收起思考过程' : `查看思考过程（${reasoning.length} 字）` }}
-      </el-link>
-    </div>
-    <div v-if="showReasoning && reasoning" class="reasoning">{{ reasoning }}<span v-if="loading" class="cursor" /></div>
-
-    <div class="paper panel">
-      <div class="red">{{ docType }}</div>
-      <p class="body">{{ answer || '在上方输入主题并点击「起草」，系统将基于知识库检索材料生成带引用的公文草稿，正文实时流式输出。' }}<span v-if="loading" class="cursor" /></p>
-      <div v-if="citations.length" class="refs">
-        <div class="ttl">参考资料（{{ citations.length }}）</div>
-        <div v-for="(c, i) in citations" :key="c.chunk_id">[{{ i + 1 }}] 《{{ c.title }}》</div>
+    <!-- 右：起草区 -->
+    <div class="panel pad draft-main">
+      <div class="head">
+        <div class="ttl serif">智能起草</div>
+        <span class="badge INTERNAL">按文种模板 · 引用溯源 · 流式输出</span>
+        <div class="spacer" />
+        <span class="text-muted" style="font-size: 12px">当前会话：{{ activeTitle }}</span>
       </div>
-      <div v-if="hits.length" class="warn-chip">敏感词命中：{{ hits.join('、') }}（已脱敏）</div>
+      <div class="bar">
+        <el-select v-model="docType" style="width: 140px">
+          <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
+        </el-select>
+        <el-input v-model="topic" placeholder="起草主题 / 修改意见（如：语气更严厉）" style="flex: 1" @keyup.enter="generate" />
+        <el-button type="primary" :loading="loading" @click="generate">{{ loading ? '生成中…' : '起草' }}</el-button>
+        <el-button v-if="loading" @click="stop">停止</el-button>
+        <el-button :disabled="!answer" @click="exportDocx">导出 docx</el-button>
+      </div>
+
+      <!-- 流式状态条：模型 / 耗时 / 思考链折叠 -->
+      <div v-if="loading || reasoning" class="stream-bar">
+        <span v-if="loading" class="live"><i class="dot" />流式生成中</span>
+        <span v-if="loading" class="mono text-muted">{{ elapsed.toFixed(1) }}s</span>
+        <span v-if="modelName" class="text-muted">模型 {{ modelName }}</span>
+        <el-link v-if="reasoning" type="primary" @click="showReasoning = !showReasoning">
+          {{ showReasoning ? '收起思考过程' : `查看思考过程（${reasoning.length} 字）` }}
+        </el-link>
+      </div>
+      <div v-if="showReasoning && reasoning" class="reasoning">{{ reasoning }}<span v-if="loading" class="cursor" /></div>
+
+      <div class="paper panel">
+        <div class="red">{{ docType }}</div>
+        <p class="body">{{ answer || '在上方输入主题并点击「起草」，系统将基于知识库检索材料生成带引用的公文草稿，正文实时流式输出。在同一会话中继续输入修改意见即可多轮完善。' }}<span v-if="loading" class="cursor" /></p>
+        <div v-if="citations.length" class="refs">
+          <div class="ttl">参考资料（{{ citations.length }}）</div>
+          <div v-for="(c, i) in citations" :key="c.chunk_id">[{{ i + 1 }}] 《{{ c.title }}》</div>
+        </div>
+        <div v-if="hits.length" class="warn-chip">敏感词命中：{{ hits.join('、') }}（已脱敏）</div>
+      </div>
+
+      <!-- 历史轮次（当前会话的往轮问答，只读时间线） -->
+      <div v-if="hasHistory" class="draft-history" v-loading="historyLoading">
+        <div class="hist-ttl text-muted">本轮会话历史（{{ history.length }} 条）</div>
+        <div v-for="m in history" :key="m.id" class="hist-item">
+          <span class="hist-role" :class="m.role">{{ m.role === 'user' ? '要求' : '草稿' }}</span>
+          <div class="hist-content">{{ m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content }}</div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.draft-wrap { display: flex; gap: var(--gap); height: 100%; }
+.draft-main { flex: 1; overflow: auto; min-width: 0; }
 .pad { padding: 16px; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 .ttl { font-size: 18px; color: var(--text-strong); }
@@ -178,4 +277,13 @@ async function exportDocx() {
 .refs { margin-top: 20px; border-top: 1px solid #d8d2c4; padding-top: 10px; font-size: 13px; color: #444; }
 .refs .ttl { font-weight: 600; margin-bottom: 6px; }
 .warn-chip { margin-top: 12px; color: #c0392b; font-size: 13px; }
+.draft-history { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.hist-ttl { font-size: 12px; margin-bottom: 8px; }
+.hist-item { display: flex; gap: 10px; padding: 6px 0; font-size: 13px; align-items: baseline; }
+.hist-role {
+  flex-shrink: 0; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--line-strong); color: var(--text-muted);
+}
+.hist-role.user { color: var(--brand); border-color: var(--brand-line); }
+.hist-content { color: var(--text-muted); line-height: 1.6; }
 </style>

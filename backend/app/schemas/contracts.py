@@ -37,6 +37,7 @@ class DocumentIngest(BaseModel):
     permission_tags: list[str] = Field(default_factory=list, description="scope:type:value")
     owner_org: str | None = None
     source_system: str | None = None
+    space_id: str | None = Field(None, description="所属文档空间 ID；缺省归入默认空间")
     content: str | None = Field(None, description="内联正文；或与 content_ref 二选一")
     content_ref: str | None = Field(None, description="存储对象键：local 模式为相对路径，s3 模式为对象键；或与内联 content 文本二选一")
     # ---- 切分策略（RAG 精髓：可选切分方式）----
@@ -89,6 +90,7 @@ class DocumentSummary(BaseModel):
     doc_no: str | None = None
     security_level: str
     permission_tags: list[str] = Field(default_factory=list)
+    space_id: str | None = None
     status: str
     chunk_count: int = 0
     created_at: datetime | None = None
@@ -104,6 +106,7 @@ class DocumentDetail(BaseModel):
     publish_date: datetime | None = None
     security_level: str
     permission_tags: list[str] = Field(default_factory=list)
+    space_id: str | None = None
     owner_org: str | None = None
     source_system: str | None = None
     status: str
@@ -119,10 +122,41 @@ class DocStats(BaseModel):
     by_security: dict[str, int] = Field(default_factory=dict)
 
 
+# ---- 文档空间 ----
+class SpaceCreate(BaseModel):
+    """创建文档空间（运维台与第三方系统共用）。"""
+
+    name: str = Field(..., min_length=1, max_length=128)
+    code: str = Field(..., min_length=1, max_length=64, description="空间编码（唯一，第三方对接稳定标识）")
+    description: str | None = Field(None, max_length=512)
+
+
+class SpaceUpdate(BaseModel):
+    """更新文档空间（名称/描述；code 与默认标记不可改）。"""
+
+    name: str | None = Field(None, min_length=1, max_length=128)
+    description: str | None = Field(None, max_length=512)
+
+
+class SpaceResp(BaseModel):
+    """文档空间响应（含实时文档数统计）。"""
+
+    id: str
+    name: str
+    code: str
+    description: str | None = None
+    is_default: bool = False
+    doc_count: int = 0
+    chunk_count: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 # ---- 检索 ----
 class RetrieveRequest(BaseModel):
     query: str
     doc_types: list[str] | None = None
+    space_ids: list[str] | None = Field(None, description="限定检索的文档空间（多选）；缺省不限空间")
     top_n: int | None = 8
     # 调用方上下文（上游网关下发，我方强制执行过滤）
     caller_scope: list[str] = Field(default_factory=list)
@@ -150,9 +184,11 @@ class RetrieveResp(BaseModel):
 class GenerateRequest(BaseModel):
     query: str
     doc_types: list[str] | None = None
+    space_ids: list[str] | None = Field(None, description="限定检索的文档空间（多选）；缺省不限空间")
     caller_scope: list[str] = Field(default_factory=list)
     max_clearance: SecurityLevel = "INTERNAL"
     template_doc_type: str | None = None  # 按文种模板起草
+    conversation_id: str | None = Field(None, description="所属会话（公文起草多轮修改）；缺省自动创建")
     sensitive_words: list[str] | None = Field(
         None, description="请求级敏感词覆盖；缺省用配置中心词库"
     )
@@ -177,6 +213,68 @@ class ConfigItem(BaseModel):
     value: dict[str, Any] = Field(default_factory=dict)
     scope: str | None = None
     is_active: bool = True
+
+
+# ---- 会话（智能问答 / 公文起草共用）----
+class ConversationCreate(BaseModel):
+    conv_type: str = Field("chat", description="会话类型：chat 智能问答 / draft 公文起草")
+    title: str | None = Field(None, max_length=256)
+    space_ids: list[str] = Field(default_factory=list, description="绑定的知识空间（多选）")
+
+
+class ConversationUpdate(BaseModel):
+    title: str | None = Field(None, min_length=1, max_length=256)
+    space_ids: list[str] | None = None
+
+
+class MessageAppend(BaseModel):
+    """手动追加消息（如用户停止生成后保存部分答案）。"""
+
+    role: str = Field("assistant", description="user / assistant")
+    content: str
+    citations: list[dict] = Field(default_factory=list)
+    sensitive_hits: list[str] = Field(default_factory=list)
+    model: str | None = None
+
+
+class MessageResp(BaseModel):
+    id: str
+    role: str
+    content: str
+    citations: list[dict] = Field(default_factory=list)
+    sensitive_hits: list[str] = Field(default_factory=list)
+    model: str | None = None
+    created_at: datetime | None = None
+
+
+class ConversationResp(BaseModel):
+    id: str
+    title: str
+    conv_type: str
+    space_ids: list[str] = Field(default_factory=list)
+    message_count: int = 0
+    last_message_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ConversationDetail(ConversationResp):
+    messages: list[MessageResp] = Field(default_factory=list)
+
+
+# ---- 智能问答 ----
+class ChatRequest(BaseModel):
+    """智能问答请求（多轮：conversation_id 为空时自动创建会话）。"""
+
+    conversation_id: str | None = None
+    query: str
+    space_ids: list[str] | None = Field(None, description="本次问答限定的知识空间；缺省沿用会话绑定空间")
+    doc_types: list[str] | None = None
+    caller_scope: list[str] = Field(default_factory=list)
+    max_clearance: SecurityLevel = "INTERNAL"
+    top_n: int | None = 8
+    rerank: bool = Field(True, description="问答链路默认启用重排（提升引用质量）")
+    sensitive_words: list[str] | None = None
 
 
 # ---- 审计日志 ----

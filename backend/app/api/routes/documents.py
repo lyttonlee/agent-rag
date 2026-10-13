@@ -53,6 +53,7 @@ async def upload(
     publish_date: str = Form(""),
     security_level: str = Form("INTERNAL"),
     permission_tags: str = Form(""),
+    space_id: str = Form("", description="目标文档空间 ID；缺省归入默认空间"),
     chunk_strategy: str = Form("paragraph"),
     chunk_size: int = Form(800),
     chunk_overlap: int = Form(80),
@@ -62,6 +63,7 @@ async def upload(
     """文件上传接入（PDF/DOCX），异步入库并返回任务（含状态机进度）。
 
     支持选择切分策略（paragraph/fixed/sentence/section）与切片尺寸，
+    支持指定目标文档空间（space_id，缺省默认空间）；
     前端轮询 /documents/jobs/{id} 即可查看 PARSING→CHUNKING→EMBEDDING→INDEXED 进度。
     """
     raw = await file.read()
@@ -75,6 +77,7 @@ async def upload(
         "publish_date": publish_date or None,
         "security_level": security_level,
         "permission_tags": [t.strip() for t in permission_tags.split(",") if t.strip()],
+        "space_id": space_id or None,
         "chunk_strategy": chunk_strategy,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
@@ -101,6 +104,7 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
     doc_type: str | None = Query(None, description="按文种过滤"),
     security_level: str | None = Query(None, description="按密级过滤"),
+    space_id: str | None = Query(None, description="按文档空间过滤"),
     status: str | None = Query(None, description="按状态过滤"),
     q: str | None = Query(None, description="标题/文号模糊检索"),
     page: int = Query(1, ge=1),
@@ -112,6 +116,8 @@ async def list_documents(
         stmt = stmt.where(Document.doc_type == doc_type)
     if security_level:
         stmt = stmt.where(Document.security_level == security_level)
+    if space_id:
+        stmt = stmt.where(Document.space_id == space_id)
     if status:
         stmt = stmt.where(Document.status == status)
     if q:
@@ -129,6 +135,7 @@ async def list_documents(
             doc_no=d.doc_no,
             security_level=d.security_level,
             permission_tags=d.permission_tags or [],
+            space_id=d.space_id,
             status=d.status,
             chunk_count=d.chunk_count,
             created_at=d.created_at,
@@ -138,18 +145,27 @@ async def list_documents(
 
 
 @router.get("/stats", response_model=DocStats)
-async def stats(db: AsyncSession = Depends(get_db)) -> DocStats:
+async def stats(
+    db: AsyncSession = Depends(get_db),
+    space_id: str | None = Query(None, description="按文档空间统计（可选）"),
+) -> DocStats:
     """文档库统计（管理视图）：总数、切片数、按状态/密级分布。"""
-    total_docs = (await db.execute(select(func.count()).select_from(Document))).scalar() or 0
-    total_chunks = (await db.execute(select(func.count()).select_from(Chunk))).scalar() or 0
-    by_status_rows = (
-        await db.execute(select(Document.status, func.count()).group_by(Document.status))
-    ).all()
-    by_security_rows = (
-        await db.execute(
-            select(Document.security_level, func.count()).group_by(Document.security_level)
-        )
-    ).all()
+    doc_stmt = select(func.count()).select_from(Document)
+    chunk_stmt = select(func.count()).select_from(Chunk)
+    if space_id:
+        doc_stmt = doc_stmt.where(Document.space_id == space_id)
+        chunk_stmt = chunk_stmt.where(Chunk.space_id == space_id)
+    total_docs = (await db.execute(doc_stmt)).scalar() or 0
+    total_chunks = (await db.execute(chunk_stmt)).scalar() or 0
+    status_stmt = select(Document.status, func.count()).group_by(Document.status)
+    security_stmt = select(Document.security_level, func.count()).group_by(
+        Document.security_level
+    )
+    if space_id:
+        status_stmt = status_stmt.where(Document.space_id == space_id)
+        security_stmt = security_stmt.where(Document.space_id == space_id)
+    by_status_rows = (await db.execute(status_stmt)).all()
+    by_security_rows = (await db.execute(security_stmt)).all()
     return DocStats(
         total_documents=total_docs,
         total_chunks=total_chunks,
@@ -210,6 +226,7 @@ async def get_document(doc_id: str, db: AsyncSession = Depends(get_db)) -> Docum
         publish_date=doc.publish_date,
         security_level=doc.security_level,
         permission_tags=doc.permission_tags or [],
+        space_id=doc.space_id,
         owner_org=doc.owner_org,
         source_system=doc.source_system,
         status=doc.status,

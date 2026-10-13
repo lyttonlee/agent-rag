@@ -93,6 +93,10 @@ async def ingest_document(
         content = parsed.text
 
     # 2) 写文档主表（content_ref 优先取外部托管键；后续若有 raw_bytes 则本地落盘覆盖）
+    # space_id 收敛：缺省归默认空间，无效 ID 直接 404（避免写进幽灵空间导致按空间检索丢数据）
+    from app.api.routes.spaces import resolve_space_id
+
+    space_id = await resolve_space_id(db, payload.get("space_id"))
     doc = DocumentModel(
         external_id=payload["external_id"],
         title=payload["title"],
@@ -105,6 +109,7 @@ async def ingest_document(
         owner_org=payload.get("owner_org"),
         source_system=payload.get("source_system"),
         content_ref=payload.get("content_ref"),
+        space_id=space_id,
         status="PARSING",
     )
     db.add(doc)
@@ -143,6 +148,7 @@ async def ingest_document(
                 embedding=vec,
                 security_level=doc.security_level,
                 permission_tags=doc.permission_tags,
+                space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
                 tokens=len(piece.content),
                 # 中文 BM25 向量（zhparser）：入库时即时生成；
                 # 生产环境另有触发器兜底（见迁移 0002），确保 dev/prod 一致。
@@ -252,6 +258,10 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
             logger.info("入库任务 %s 向量化完成：%d 片", job_id, len(embeddings))
 
             # 阶段：落库文档 + 切片
+            # space_id 收敛：缺省归默认空间，无效 ID 记录为失败（任务可重试）
+            from app.api.routes.spaces import resolve_space_id
+
+            space_id = await resolve_space_id(db, meta.get("space_id"))
             doc = DocumentModel(
                 external_id=meta["external_id"],
                 title=meta["title"],
@@ -265,6 +275,7 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 source_system=meta.get("source_system"),
                 status="INDEXED",
                 chunk_count=len(pieces),
+                space_id=space_id,
             )
             db.add(doc)
             await db.flush()
@@ -285,6 +296,7 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                         embedding=vec,
                         security_level=doc.security_level,
                         permission_tags=doc.permission_tags,
+                        space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
                         tokens=len(piece.content),
                         search_vec=func.to_tsvector("chinese", piece.content),
                     )

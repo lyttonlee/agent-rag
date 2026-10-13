@@ -24,6 +24,7 @@ const env = import.meta.env.MODE
         <el-menu-item index="/overview"><el-icon><DataLine /></el-icon>概览</el-menu-item>
         <el-menu-item index="/docs"><el-icon><Document /></el-icon>文档库</el-menu-item>
         <el-menu-item index="/retrieve"><el-icon><Search /></el-icon>智能检索问答</el-menu-item>
+        <el-menu-item index="/chat"><el-icon><ChatDotRound /></el-icon>智能问答</el-menu-item>
         <el-menu-item index="/draft"><el-icon><EditPen /></el-icon>智能起草</el-menu-item>
         <el-menu-item index="/templates"><el-icon><Files /></el-icon>模板库</el-menu-item>
         <el-menu-item index="/config"><el-icon><Setting /></el-icon>配置中心</el-menu-item>
