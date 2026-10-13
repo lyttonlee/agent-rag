@@ -43,6 +43,11 @@ class DocumentSpace(Base, TimestampMixin):
     文档上传/接入时归属到某一空间；检索/问答可按 space_ids（支持多个）
     限定知识范围。第三方系统通过同一套 /v1/spaces 接口创建空间并
     将文档接入指定空间，实现多租户式的知识隔离。
+
+    层级结构（用户 2026-10-13 反馈：空间管理应类似文件夹的层级关系）：
+    - parent_id 自引用外键，支撑"父空间/子空间"树（根空间 parent_id=NULL）；
+    - 删除父空间时子空间挂起到根级（ON DELETE SET NULL），不级联丢数据；
+    - 空间内仍有文档或仍有子空间时拒绝删除（409），避免误删知识。
     """
 
     __tablename__ = "document_spaces"
@@ -54,6 +59,20 @@ class DocumentSpace(Base, TimestampMixin):
     description: Mapped[str | None] = mapped_column(String(512))
     # 默认空间：存量文档与未显式指定空间的接入文档归属；不可删除
     is_default: Mapped[bool] = mapped_column(default=False, index=True)
+    # 父空间（层级结构）：NULL = 根级空间
+    parent_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("document_spaces.id", ondelete="SET NULL"),
+        index=True,
+    )
+
+    # 父子关系（parent 侧 remote_side 指向自身主键，自引用）
+    parent: Mapped["DocumentSpace | None"] = relationship(
+        back_populates="children", remote_side=[id]
+    )
+    children: Mapped[list["DocumentSpace"]] = relationship(
+        back_populates="parent", passive_deletes=True
+    )
 
     documents: Mapped[list["Document"]] = relationship(back_populates="space")
 
@@ -252,6 +271,13 @@ class ConversationMessage(Base, TimestampMixin):
 
     assistant 消息携带 citations（引用溯源）与 sensitive_hits（敏感词命中），
     历史回看时仍可核对依据；停止生成时保存的部分答案同样留痕。
+
+    Agent 留痕（用户 2026-10-13 反馈：意图识别不应被后续轮次覆盖、思考
+    过程应在回答后可展开查看）：
+    - intent：本条 assistant 消息的意图标识（direct_qa/draft/...），
+      每轮独立留痕，历史消息各自可查看"这一轮 Agent 判定的意图"；
+    - reasoning：模型思考链全文（流式 reasoning 事件累积），回答结束后
+      不丢失，前端以"默认折叠、可展开"面板展示。
     """
 
     __tablename__ = "conversation_messages"
@@ -265,5 +291,9 @@ class ConversationMessage(Base, TimestampMixin):
     citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
     sensitive_hits: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
     model: Mapped[str | None] = mapped_column(String(64))
+    # Agent 意图标识（assistant 消息；老数据为 NULL）
+    intent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 模型思考链全文（assistant 消息；无推理过程时为 NULL）
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

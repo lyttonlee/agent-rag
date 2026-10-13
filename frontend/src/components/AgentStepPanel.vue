@@ -161,8 +161,9 @@ const notice = computed<{ type: 'info' | 'warning'; text: string } | null>(() =>
   display: flex; align-items: flex-start; gap: 8px; margin-top: 10px;
   padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.6;
 }
-.notice.info { background: var(--brand-soft); color: var(--text-muted); }
+/* info 提示用 --text（原 --text-muted 在 brand-soft 底上对比度不足） */
+.notice.info { background: var(--brand-soft); color: var(--text); }
 .notice.info svg { color: var(--brand); flex-shrink: 0; margin-top: 2px; }
-.notice.warning { background: rgba(241, 163, 60, 0.12); color: var(--c-warning); }
-.notice.warning svg { color: var(--c-warning); flex-shrink: 0; margin-top: 2px; }
+.notice.warning { background: rgba(241, 163, 60, 0.12); color: #f5b04c; }
+.notice.warning svg { color: #f5b04c; flex-shrink: 0; margin-top: 2px; }
 </style>

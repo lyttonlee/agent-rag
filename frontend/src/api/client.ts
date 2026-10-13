@@ -84,10 +84,26 @@ export interface DocSpace {
   code: string
   description: string | null
   is_default: boolean
+  /** 父空间 ID（层级结构）；null = 根级空间 */
+  parent_id: string | null
   doc_count: number
   chunk_count: number
   created_at: string | null
   updated_at: string | null
+}
+
+/** 意图中文标签（与后端 agent.intents 注册表一致） */
+export const INTENT_LABELS: Record<string, string> = {
+  direct_qa: '确切回答',
+  complex_task: '复杂任务',
+  draft: '公文起草',
+  chitchat: '闲聊',
+  out_of_scope: '超出范围',
+}
+
+export function intentLabelOf(intent: string | null | undefined): string {
+  if (!intent) return ''
+  return INTENT_LABELS[intent] || intent
 }
 
 export async function listSpaces(): Promise<DocSpace[]> {
@@ -99,6 +115,7 @@ export async function createSpace(payload: {
   name: string
   code: string
   description?: string
+  parent_id?: string | null
 }): Promise<DocSpace> {
   const r = await client.post<DocSpace>('/spaces', payload)
   return r.data
@@ -106,7 +123,7 @@ export async function createSpace(payload: {
 
 export async function updateSpace(
   id: string,
-  payload: { name?: string; description?: string },
+  payload: { name?: string; description?: string; parent_id?: string | null },
 ): Promise<DocSpace> {
   const r = await client.put<DocSpace>(`/spaces/${id}`, payload)
   return r.data
@@ -138,6 +155,10 @@ export interface ConversationMessage {
   citations: CitationPayload[]
   sensitive_hits: string[]
   model: string | null
+  /** Agent 意图标识（assistant 消息；每轮独立留痕，不被后续轮次覆盖） */
+  intent: string | null
+  /** 模型思考链全文（回答结束后不丢失，可折叠展开查看） */
+  reasoning: string | null
   created_at: string | null
 }
 

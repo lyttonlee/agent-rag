@@ -48,6 +48,8 @@ def _msg_resp(m: ConversationMessage) -> MessageResp:
         citations=m.citations or [],
         sensitive_hits=m.sensitive_hits or [],
         model=m.model,
+        intent=m.intent,
+        reasoning=m.reasoning,
         created_at=m.created_at,
     )
 
@@ -165,5 +167,7 @@ async def append_message(
         citations=payload.citations,
         sensitive_hits=payload.sensitive_hits,
         model=payload.model,
+        intent=payload.intent,
+        reasoning=payload.reasoning,
     )
     return _msg_resp(msg)

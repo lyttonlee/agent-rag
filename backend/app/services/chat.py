@@ -16,9 +16,14 @@
 - direct_qa：单轮检索 + 直答；**无材料时委婉拒答（固定话术，不编造）**；
 - complex_task：Planner 拆步 → Executor 分步执行（过程可见）→ Aggregator
   汇总；无材料时改用模型自身能力完成，并追加甄别声明；
-- draft：问答场景下的起草诉求按直答策略处理（检索素材 + 生成）；
+- draft：问答场景下的起草/创作诉求按直答策略处理（有素材则检索+生成）；
+  **任务型意图无材料时不拒答**——按意图规格 allows_self_capability 分流：
+  确切回答型拒答，任务型用自身能力完成并追加甄别声明；
 - chitchat：不走检索，固定话术即时寒暄；
 - out_of_scope：明确拒答 + 说明能力边界。
+
+思考链留痕：reasoning 事件内容累积并随助手消息落库，回答结束后前端
+以"默认折叠、可展开"面板展示，不再随正文出现而消失。
 
 事件序列（SSE，向后兼容——老前端忽略不认识的 type 即可）：
   meta（conversation_id / intent / citations / no_result）
@@ -53,6 +58,7 @@ from app.services.agent import (
     StepArtifact,
     build_final_messages,
     execute_plan,
+    get_spec,
     has_materials,
     intent_label,
     is_no_useful_info,
@@ -93,11 +99,17 @@ class _ChatCtx:
     actor: str
     agent_on: bool = True                 # Agent 是否开启（meta 事件如实回报）
     parts: list[str] = field(default_factory=list)      # 已生成正文片段
+    reasoning_parts: list[str] = field(default_factory=list)  # 思考链片段（回答后可展开查看）
     citations: list[Citation] = field(default_factory=list)  # 最终引用（汇总合并后）
     saved: bool = False                                  # 助手消息落库幂等标志
     model_name: str = ""
     no_result: bool = False       # 未检索到有用信息（直接拒答 / 任务型兜底）
     disclaimer: bool = False      # 任务型无材料兜底 → 答案需追加甄别声明
+
+    @property
+    def reasoning_text(self) -> str:
+        """思考链全文（落库 / 前端折叠面板展示用）。"""
+        return "".join(self.reasoning_parts)
 
 
 async def _ensure_conversation(db: AsyncSession, req: ChatRequest) -> Conversation:
@@ -173,17 +185,30 @@ def _meta_event(ctx: _ChatCtx, model: str, citations: list[Citation], *, no_resu
 
 
 async def _stream_model(ctx: _ChatCtx, messages: list[dict], gen: ModelProvider) -> AsyncGenerator[str, None]:
-    """流式生成（思考链 + 正文），正文片段累积到 ctx.parts。"""
+    """流式生成（思考链 + 正文），正文片段累积到 ctx.parts、思考链累积到 ctx.reasoning_parts。
+
+    思考链同样随助手消息落库（ctx.reasoning_text）：回答结束后前端以
+    "默认折叠、可展开"面板展示，不再一出现正文就消失。
+    """
     async for kind, text in gen.generate_stream(messages):
         if kind == "content":
             ctx.parts.append(text)
             yield _sse({"type": "token", "text": text})
         else:
+            ctx.reasoning_parts.append(text)
             yield _sse({"type": "reasoning", "text": text})
 
 
 async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
-    """direct_qa / draft（问答场景）：检索 + 直答；无有用信息 → 委婉拒答不编造。"""
+    """direct_qa / draft（问答场景）：检索 + 直答。
+
+    无有用信息时按意图规格分流（用户 2026-10-13 硬性要求，V1.1 方案）：
+    - 确切回答型（allows_self_capability=False，如 direct_qa）→ 固定话术
+      委婉说明没有相关内容，不调用模型，从机制上杜绝编造；
+    - 任务型（allows_self_capability=True，如 draft 公文起草/创作）→ 不拒答，
+      改用模型自身能力完成任务（提示词切换 no_materials 模式），答案末尾
+      追加甄别声明（disclaimer=True）。
+    """
     retrieve_resp = await hybrid_retrieve(ctx.db, ctx.req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
     ctx.citations[:] = citations
@@ -195,7 +220,18 @@ async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
     yield _sse(_meta_event(ctx, gen.model_name, citations, no_result=ctx.no_result))
 
     if ctx.no_result:
-        # 硬性要求（用户 2026-10-13）：确切回答型意图 + 无有用检索结果 →
+        spec = get_spec(ctx.intent.intent)
+        if spec is not None and spec.allows_self_capability:
+            # 任务型意图（起草/创作/完成任务）：知识库无材料也用自身能力完成，
+            # 不得声称引用知识库，末尾追加甄别声明（统一收尾处处理）。
+            ctx.disclaimer = True
+            messages = build_chat_messages(
+                ctx.req.query, ctx.history, citations, no_materials=True
+            )
+            async for evt in _stream_model(ctx, messages, gen):
+                yield evt
+            return
+        # 确切回答型：硬性要求（用户 2026-10-13）——无有用检索结果 →
         # 固定话术委婉说明没有相关内容，不调用模型，从机制上杜绝编造。
         async for chunk in stream_text(NO_RESULT_ANSWER):
             ctx.parts.append(chunk)
@@ -354,7 +390,11 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
     strategy = _CHAT_STRATEGIES.get(intent_result.intent, _run_direct_answer)
 
     async def _save_assistant(answer: str, hits: list[str], model: str):
-        """落库助手消息（幂等由 ctx.saved 保证；答案为空则不落库）。"""
+        """落库助手消息（幂等由 ctx.saved 保证；答案为空则不落库）。
+
+        intent / reasoning 随消息留痕：每轮意图独立保存（不被后续轮次
+        覆盖），思考链全文可折叠展开查看。
+        """
         if ctx.saved or not answer.strip():
             return
         await conv_service.append_message(
@@ -375,6 +415,8 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
             ],
             sensitive_hits=hits,
             model=model,
+            intent=ctx.intent.intent,
+            reasoning=ctx.reasoning_text or None,
         )
         ctx.saved = True
 

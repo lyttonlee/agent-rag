@@ -124,28 +124,38 @@ class DocStats(BaseModel):
 
 # ---- 文档空间 ----
 class SpaceCreate(BaseModel):
-    """创建文档空间（运维台与第三方系统共用）。"""
+    """创建文档空间（运维台与第三方系统共用）。
+
+    parent_id：父空间 ID（层级结构，类似文件夹）；缺省/None = 根级空间。
+    """
 
     name: str = Field(..., min_length=1, max_length=128)
     code: str = Field(..., min_length=1, max_length=64, description="空间编码（唯一，第三方对接稳定标识）")
     description: str | None = Field(None, max_length=512)
+    parent_id: str | None = Field(None, description="父空间 ID；缺省为根级空间")
 
 
 class SpaceUpdate(BaseModel):
-    """更新文档空间（名称/描述；code 与默认标记不可改）。"""
+    """更新文档空间（名称/描述/父空间；code 与默认标记不可改）。
+
+    parent_id 支持把空间移动到其他父级下；服务端会阻止把空间移动到
+    自己的子孙节点下（防环）。
+    """
 
     name: str | None = Field(None, min_length=1, max_length=128)
     description: str | None = Field(None, max_length=512)
+    parent_id: str | None = Field(None, description="父空间 ID；null 表示移到根级")
 
 
 class SpaceResp(BaseModel):
-    """文档空间响应（含实时文档数统计）。"""
+    """文档空间响应（含实时文档数统计与层级信息）。"""
 
     id: str
     name: str
     code: str
     description: str | None = None
     is_default: bool = False
+    parent_id: str | None = None
     doc_count: int = 0
     chunk_count: int = 0
     created_at: datetime | None = None
@@ -240,6 +250,8 @@ class MessageAppend(BaseModel):
     citations: list[dict] = Field(default_factory=list)
     sensitive_hits: list[str] = Field(default_factory=list)
     model: str | None = None
+    intent: str | None = Field(None, description="Agent 意图标识（assistant 消息留痕）")
+    reasoning: str | None = Field(None, description="模型思考链全文（可折叠展开查看）")
 
 
 class MessageResp(BaseModel):
@@ -249,6 +261,8 @@ class MessageResp(BaseModel):
     citations: list[dict] = Field(default_factory=list)
     sensitive_hits: list[str] = Field(default_factory=list)
     model: str | None = None
+    intent: str | None = None
+    reasoning: str | None = None
     created_at: datetime | None = None
 
 

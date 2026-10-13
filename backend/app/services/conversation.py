@@ -41,8 +41,14 @@ async def append_message(
     citations: list[dict] | None = None,
     sensitive_hits: list[str] | None = None,
     model: str | None = None,
+    intent: str | None = None,
+    reasoning: str | None = None,
 ) -> ConversationMessage:
     """追加一条消息并维护会话的消息数与最后活跃时间。
+
+    intent / reasoning（assistant 消息）：Agent 意图标识与模型思考链
+    全文随消息留痕——每轮独立保存，历史回看时既能核对"这一轮判定
+    的意图"，也能展开查看当时的思考过程（回答结束后不丢失）。
 
     标题自动衍生：会话仍是默认标题且首条消息为 user 时，
     取内容前 30 字作为标题（前端可再重命名）。
@@ -54,6 +60,8 @@ async def append_message(
         citations=citations or [],
         sensitive_hits=sensitive_hits or [],
         model=model,
+        intent=intent,
+        reasoning=reasoning,
     )
     db.add(msg)
 

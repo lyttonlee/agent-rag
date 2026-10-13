@@ -14,9 +14,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
+import ReasoningPanel from '@/components/ReasoningPanel.vue'
 import {
   caller,
   getConversation,
+  intentLabelOf,
   listSpaces,
   streamChat,
   updateConversation,
@@ -31,6 +33,23 @@ import {
 const spaces = ref<DocSpace[]>([])
 const selectedSpaces = ref<string[]>([])
 
+/** 空间完整路径标签（"父 / 子"）：层级结构下避免同名空间混淆 */
+const spacePath = computed(() => {
+  const byId = new Map(spaces.value.map((s) => [s.id, s]))
+  const label = (id: string): string => {
+    const parts: string[] = []
+    let cursor = byId.get(id)
+    let guard = 0
+    while (cursor && guard < 32) {
+      parts.unshift(cursor.name)
+      cursor = cursor.parent_id ? byId.get(cursor.parent_id) : undefined
+      guard += 1
+    }
+    return parts.join(' / ')
+  }
+  return label
+})
+
 // ---- 会话状态 ----
 const sidebar = ref<InstanceType<typeof ConversationSidebar> | null>(null)
 const activeId = ref<string | null>(null)
@@ -43,7 +62,6 @@ const input = ref('')
 const sentQuery = ref('')
 const loading = ref(false)
 const reasoning = ref('')
-const showReasoning = ref(false)
 const answer = ref('')
 const citations = ref<CitationPayload[]>([])
 const hits = ref<string[]>([])
@@ -169,7 +187,6 @@ function send(text?: string) {
   reasoning.value = ''
   citations.value = []
   hits.value = []
-  showReasoning.value = false
   resetAgentTurn()
   input.value = ''
   scrollBottom()
@@ -223,12 +240,11 @@ function send(text?: string) {
       },
       onReasoning: (t) => {
         reasoning.value += t
-        showReasoning.value = true
+        // 思考面板的自动展开/收起由组件内部按 streaming 状态自行处理
         scrollBottom()
       },
       onToken: (t) => {
         answer.value += t
-        showReasoning.value = false
         scrollBottom()
       },
       onDone: (finalAnswer, sensitiveHits, model, conversationId, extra) => {
@@ -312,7 +328,7 @@ onBeforeUnmount(() => {
           <el-option
             v-for="s in spaces"
             :key="s.id"
-            :label="`${s.name}（${s.doc_count} 篇）`"
+            :label="`${spacePath(s.id)}（${s.doc_count} 篇）`"
             :value="s.id"
           />
         </el-select>
@@ -344,7 +360,15 @@ onBeforeUnmount(() => {
             <div class="bubble">{{ m.content }}</div>
           </div>
           <div v-else class="msg assistant">
-            <div class="bubble panel">{{ m.content }}</div>
+            <!-- 思考过程（默认折叠，可展开查看；随消息持久化不丢失） -->
+            <ReasoningPanel v-if="m.reasoning" :text="m.reasoning" />
+            <div class="bubble panel">
+              {{ m.content }}
+              <!-- 本轮意图徽标（每轮独立留痕，不被后续轮次覆盖） -->
+              <span v-if="m.intent" class="intent-badge" :title="`本轮意图：${intentLabelOf(m.intent)}`">
+                {{ intentLabelOf(m.intent) }}
+              </span>
+            </div>
             <div v-if="m.citations?.length" class="msg-refs">
               <span class="ref-label">引用 {{ m.citations.length }} 条</span>
               <el-tag
@@ -369,12 +393,15 @@ onBeforeUnmount(() => {
             <div class="bubble">{{ sentQuery }}</div>
           </div>
           <div class="msg assistant">
-            <div v-if="showReasoning && reasoning" class="reasoning">
-              {{ reasoning }}<span class="cursor" />
-            </div>
+            <!-- 思考过程：推理中自动展开，正文开始后自动收起，回答结束后保留可展开 -->
+            <ReasoningPanel
+              v-if="reasoning"
+              :text="reasoning"
+              :streaming="!answer"
+            />
             <div class="bubble panel">
               {{ answer }}<span v-if="answer" class="cursor" />
-              <span v-if="!answer" class="thinking">正在思考…</span>
+              <span v-if="!answer && !reasoning" class="thinking">正在思考…</span>
             </div>
             <div v-if="citations.length" class="msg-refs">
               <span class="ref-label">引用 {{ citations.length }} 条</span>
@@ -442,7 +469,8 @@ onBeforeUnmount(() => {
 .msg.user { justify-content: flex-end; }
 .msg.user .bubble {
   max-width: 72%; padding: 10px 14px; border-radius: 12px 12px 2px 12px;
-  background: var(--brand); color: #fff; font-size: 14px; line-height: 1.7;
+  /* 深一档的品牌蓝：白字对比度 4.9:1（--brand 仅 3.7:1，小字号不可读） */
+  background: var(--brand-deep); color: #fff; font-size: 14px; line-height: 1.7;
   white-space: pre-wrap; word-break: break-word;
 }
 .msg.assistant { flex-direction: column; align-items: flex-start; max-width: 82%; }
@@ -451,12 +479,20 @@ onBeforeUnmount(() => {
   color: var(--text); font-size: 14px; line-height: 1.8; white-space: pre-wrap;
   word-break: break-word;
 }
-.reasoning {
-  max-width: 100%; padding: 8px 12px; margin-bottom: 8px; font-size: 12px;
-  border: 1px dashed var(--line); border-radius: 8px; color: var(--text-faint);
-  line-height: 1.6; white-space: pre-wrap;
+/* 本轮意图徽标（回答气泡右下角，弱化小字号） */
+.intent-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 18px;
+  vertical-align: middle;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
 }
-.thinking { color: var(--text-faint); }
+.thinking { color: var(--text-muted); }
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--brand); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .msg-refs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }

@@ -192,4 +192,50 @@ error   {message}
 
 ---
 
-*V1.0 为待确认稿；本版本记录用户拍板决策与最终落地实现，作为现行文档。*
+## 九、V1.2 修订记录（2026-10-13 用户反馈修复）
+
+用户对本方案落地成果提出 4 项反馈，全部修复并经 dev 环境实测通过：
+
+### 9.1 文档空间层级化（类文件夹）
+
+- **后端**：`document_spaces.parent_id` 自引用外键（ON DELETE SET NULL）+ 索引；创建/移动时校验父空间存在（404）；`_move_space` 防环（从新父级逐级上溯遇自身即 409「不能把空间移动到自己的子孙节点下」）；删除保护——空间下有文档 409、有子空间 409。
+- **前端**：文档库首页（根级）只列文档空间卡片（文件夹图标 + 文档/切片/子空间计数），点击进入对应文档库；面包屑导航（全部空间 / 上级 / 当前）；空间对话框支持选择父空间（缩进展示层级）；Chat 页空间选择器用 `spacePath()` 展示层级路径。
+- **迁移**：`alembic 0006_space_hierarchy_agent_trace.py`（已在 6.49 环境执行）。
+
+### 9.2 任务型意图误拒答 + 意图识别修复
+
+- **根因 1（误拒答）**：无检索结果时未区分意图规格，任务型请求也走了 direct_qa 的固定话术拒答。**修复**：`_run_direct_answer` 按 `get_spec(intent).allows_self_capability` 分流——任务型（draft/complex_task）以自身能力完成并追加甄别声明（`disclaimer=true`），仅确切回答型（direct_qa）保持委婉拒答。
+- **根因 2（任务/提问误判）**：路由器规则把"询问怎么做"误判为任务。**修复**：新增任务/提问区分规则 `has_task_verb and (has_imperative or not has_question)`——"通知怎么写"（任务动词+疑问+无祈使）→ direct_qa；"帮我写一份通知"（任务动词+祈使）→ draft；LLM 提示词同步增加该区分说明。
+- **根因 3（意图被覆盖）**：会话级意图字段被每轮覆盖。**修复**：`conversation_messages.intent` + `reasoning` 列随 assistant 消息独立落库，每轮意图不被后续轮覆盖；前端消息级意图徽标展示。
+
+### 9.3 思考过程折叠保留（含一个 Vue 坑）
+
+- **交互**：思考链流式中自动展开 → 正文首 token 自动收起 → **回答结束后面板保留**，默认折叠、点击标题栏随时展开/收起；历史消息的思考过程随消息持久化同样可展开。
+- **根因（Vue Boolean prop 隐式转换）**：组件早期为"受控/非受控混合"（`open?: boolean` + `update:open`），但 Vue 对 `type: Boolean` 的 prop 在父组件不传值时**隐式转为 `false` 而非 `undefined`**，`props.open !== undefined` 恒真，非受控用法永远读到 `false`，点击展开失效（流式用法因显式传 `:open` 侥幸正常）。
+- **修复**：彻底移除混合模式，ReasoningPanel 完全自管理展开状态（内部 `innerOpen` + `streaming` watch 驱动自动开合），父组件只传 `text`/`streaming`，从根上消除该类坑。
+- **验证**：dev 环境浏览器实测——历史面板默认折叠、点击展开/收起正常；流式时间线（MutationObserver 记录）`4.4s 自动展开 → 6.1s 自动收起 → 结束后可手动开合`。
+
+### 9.4 UI 配色与滚动条（WCAG AA 校准）
+
+- **对比度**：`--text-faint` #5d6c86（3.0:1）→ #8093ad（5.0:1）；新增 `--brand-deep: #2f6ae0` 专用于白字填充面（4.9:1，原 `--brand` 仅 3.7:1）；Element Plus `--el-color-primary` 覆写为深档智蓝；AgentStepPanel notice/warning 文字色提亮。
+- **滚动条**：webkit `background-clip: content-box` + 透明边框内缩效果、悬浮品牌蓝；Firefox `scrollbar-width: thin`；`::selection` 选中色同步品牌蓝。
+- **验证**：`vue-tsc` 0 错误、`vite build` 通过；浏览器实测各视图文字可读性。
+
+### 9.5 验证记录补充（2026-10-13）
+
+| 场景 | 结果 |
+|------|------|
+| 空间层级 | 子空间 parent_id 正确；删除有文档父空间 409、有子空间空父空间 409、父移子防环 409 |
+| 任务型无材料 | 「帮我创作一份元宇宙虚拟年会通知」→ intent=complex_task、disclaimer=true、完整成文（原 bug：误走 direct_qa 拒答） |
+| 提问守卫 | 「公文通知的格式要求是怎么样的」→ direct_qa（未误判为任务） |
+| 消息留痕 | 同会话两轮 assistant 各自 intent=complex_task/direct_qa + reasoning 351/1673 字符，不被覆盖 |
+| 历史思考面板 | 默认折叠；点击展开/收起正常（修复 Boolean prop 转换 bug 后） |
+| 流式思考面板 | MutationObserver 时间线：推理中自动展开 → 正文开始自动收起 → 结束后保留可开合 |
+| 文档库层级化 | 根级空间卡片 → 进入后面包屑 + 子空间卡片 + 文档表 |
+| 前端质量 | vue-tsc 0 错误；vite build 30.1s 通过 |
+
+> **环境备注**：本轮实测发现 `.env` 中云端生成模型 API key 已失效（阿里云百炼返回 401 invalid_api_key），流式端到端验证借助本地 mock OpenAI 服务完成；embedding/rerank（192.168.6.49）与 PostgreSQL（192.168.6.49）均正常。恢复线上生成需更新有效 key。
+
+---
+
+*V1.0 为待确认稿；V1.1 记录用户拍板决策与最终落地实现；V1.2 记录用户反馈修复，作为现行文档。*

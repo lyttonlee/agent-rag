@@ -5,10 +5,11 @@
 - 第三方：创建空间 → 向指定空间接入文档（/v1/documents/ingest 带 space_id）；
 - 运维台：空间管理（创建/重命名/删除）+ 按空间浏览文档。
 
-删除保护：
-- 默认空间（is_default）不可删除（存量数据归属，删了检索范围会乱）；
-- 非空空间拒绝删除（409），需先迁移或删除空间内文档，避免误删知识。
-"""
+    删除保护：
+    - 默认空间（is_default）不可删除（存量数据归属，删了检索范围会乱）；
+    - 非空空间拒绝删除（409），需先迁移或删除空间内文档，避免误删知识；
+    - 仍有子空间的空间拒绝删除（409）——层级结构下应先处理子空间。
+    """
 
 from __future__ import annotations
 
@@ -69,18 +70,28 @@ async def resolve_space_id(db: AsyncSession, space_id: str | None) -> str:
 
 @router.post("", response_model=SpaceResp, status_code=201)
 async def create_space(payload: SpaceCreate, db: AsyncSession = Depends(get_db)) -> SpaceResp:
-    """创建文档空间（运维台与第三方系统共用）。"""
+    """创建文档空间（运维台与第三方系统共用；支持指定父空间形成层级）。"""
     # code 唯一性校验（提前报友好错误，而非等唯一索引冲突）
     dup = (
         await db.execute(select(DocumentSpace).where(DocumentSpace.code == payload.code))
     ).scalar_one_or_none()
     if dup:
         raise HTTPException(status_code=409, detail=f"空间编码已存在：{payload.code}")
+    # 父空间校验（指定了就必须存在，避免写进幽灵父级）
+    if payload.parent_id:
+        parent = (
+            await db.execute(
+                select(DocumentSpace).where(DocumentSpace.id == payload.parent_id)
+            )
+        ).scalar_one_or_none()
+        if not parent:
+            raise HTTPException(status_code=404, detail=f"父空间不存在：{payload.parent_id}")
     row = DocumentSpace(
         name=payload.name,
         code=payload.code,
         description=payload.description,
         is_default=False,
+        parent_id=payload.parent_id,
     )
     db.add(row)
     await db.commit()
@@ -114,7 +125,11 @@ async def get_space(space_id: str, db: AsyncSession = Depends(get_db)) -> SpaceR
 async def update_space(
     space_id: str, payload: SpaceUpdate, db: AsyncSession = Depends(get_db)
 ) -> SpaceResp:
-    """更新空间（名称/描述）。"""
+    """更新空间（名称/描述/父空间）。
+
+    移动空间（parent_id）时的防环校验：不允许把空间设为自己的父空间，
+    或移动到自己的子孙节点下（否则树结构会出现环，遍历无限递归）。
+    """
     row = (
         await db.execute(select(DocumentSpace).where(DocumentSpace.id == space_id))
     ).scalar_one_or_none()
@@ -124,9 +139,44 @@ async def update_space(
         row.name = payload.name
     if payload.description is not None:
         row.description = payload.description
+    if payload.parent_id is not None:
+        await _move_space(db, row, payload.parent_id)
     await db.commit()
     await db.refresh(row)
     return await _space_resp(db, row)
+
+
+async def _move_space(db: AsyncSession, row: DocumentSpace, new_parent_id: str | None) -> None:
+    """把空间移动到新的父级下（含防环校验；仅改内存状态，由调用方 commit）。
+
+    防环策略：从 new_parent_id 逐级上溯，若途中遇到 row 自身（或
+    new_parent_id 就是 row 自身），说明会成环，拒绝（409）。
+    """
+    if new_parent_id == row.id:
+        raise HTTPException(status_code=409, detail="不能把空间移动到自己的下级")
+    if new_parent_id:
+        parent = (
+            await db.execute(
+                select(DocumentSpace).where(DocumentSpace.id == new_parent_id)
+            )
+        ).scalar_one_or_none()
+        if not parent:
+            raise HTTPException(status_code=404, detail=f"父空间不存在：{new_parent_id}")
+        # 上溯校验：new_parent 的祖先链中不能包含 row 自身
+        cursor = parent
+        while cursor is not None:
+            if cursor.id == row.id:
+                raise HTTPException(
+                    status_code=409, detail="不能把空间移动到自己的子孙节点下"
+                )
+            if cursor.parent_id is None:
+                break
+            cursor = (
+                await db.execute(
+                    select(DocumentSpace).where(DocumentSpace.id == cursor.parent_id)
+                )
+            ).scalar_one_or_none()
+    row.parent_id = new_parent_id
 
 
 @router.delete("/{space_id}")
@@ -156,6 +206,19 @@ async def delete_space(space_id: str, db: AsyncSession = Depends(get_db)) -> dic
             status_code=409,
             detail=f"空间内仍有 {doc_count} 篇文档，请先迁移或删除文档后再删除空间",
         )
+    # 层级保护：仍有子空间时拒绝删除（先处理或移动子空间，避免孤儿目录）
+    child_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DocumentSpace)
+            .where(DocumentSpace.parent_id == space_id)
+        )
+    ).scalar() or 0
+    if child_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"空间下仍有 {child_count} 个子空间，请先删除或移动子空间",
+        )
     await db.delete(row)
     await db.commit()
     return {"deleted": space_id}
@@ -179,6 +242,7 @@ async def _space_resp(db: AsyncSession, row: DocumentSpace) -> SpaceResp:
         code=row.code,
         description=row.description,
         is_default=row.is_default,
+        parent_id=row.parent_id,
         doc_count=doc_count,
         chunk_count=chunk_count,
         created_at=row.created_at,

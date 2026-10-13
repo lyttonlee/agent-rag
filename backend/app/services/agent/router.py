@@ -45,8 +45,17 @@ class IntentResult:
 
 # ---- 规则通道信号表（按优先级从上到下匹配，先命中先返回）----
 
-# 起草动词：出现即视为强起草意图
-_DRAFT_VERB = re.compile(r"起草|拟稿|撰写|写一份|写一篇|写个|生成一份|出一份|行文|发文")
+# 起草动词：出现即视为强起草意图（公文文稿类创作）
+_DRAFT_VERB = re.compile(r"起草|拟稿|撰写|编写|编制|写一份|写一篇|写个|写一版|生成一份|生成一篇|出一份|行文|发文")
+
+# 任务动词（非公文文稿的"完成任务"类：设计/整理/制定/完成…）
+_TASK_VERB = re.compile(r"创作|设计一|设计方案|整理成|整理一份|制定|拟定|做一份|做一个|搞一个|完成一|帮我完成|执行方案|策划")
+
+# 祈使/请求标记：出现即使用户是在"要求办事"而非"提问"
+_IMPERATIVE = re.compile(r"帮我|请|麻烦|给我|帮忙|来一|出一份|做一|搞一个|整个|弄一|劳烦")
+
+# 疑问标记：出现且无祈使标记时，视为"询问做法"（如"通知怎么写"）而非任务请求
+_QUESTION_MARK = re.compile(r"怎么|如何|什么是|是什么|为什么|为何|哪些|多少|吗|呢|？|\?|啥时候|哪里|谁")
 
 # 复杂任务信号（任一命中即 complex_task）
 _COMPLEX_SIGNALS: list[tuple[re.Pattern[str], str]] = [
@@ -68,11 +77,14 @@ _LLM_CLASSIFY_SYSTEM = (
     "你是企业公文知识库的意图分类器。根据用户输入判断意图，只输出 JSON，不要任何其他文字。\n"
     'JSON 格式：{"intent": "<意图>", "confidence": <0到1的小数>}\n'
     "意图取值与判定标准：\n"
-    "- direct_qa：希望获得确切回答的单一问题（事实/定义/流程/规定查询）；\n"
-    "- complex_task：需要多步骤完成的复杂任务（比较、汇总、排查、多条件检索）；\n"
-    "- draft：公文起草（按文种生成文稿）；\n"
+    "- direct_qa：希望获得确切回答的单一问题（事实/定义/流程/规定查询；"
+    "包括'通知怎么写''格式有什么要求'这类询问做法的提问）；\n"
+    "- complex_task：需要多步骤完成的复杂任务（比较、汇总、排查、多条件检索、"
+    "把材料整理成表格、设计一个方案等'完成任务'型诉求）；\n"
+    "- draft：公文起草（用户明确要求生成文稿：帮我写/请起草/生成一份通知…）；\n"
     "- chitchat：寒暄、问候、自我介绍等与知识库无关的对话；\n"
-    "- out_of_scope：超出企业公文知识库能力边界的问题（如天气、股价、娱乐）。"
+    "- out_of_scope：超出企业公文知识库能力边界的问题（如天气、股价、娱乐）。\n"
+    "判定要点：'询问怎么做'是 direct_qa；'明确要求生成/完成某物'是 draft 或 complex_task。"
 )
 
 # 意图 → LLM 输出中的合法取值（与 intents.py 注册表保持一致；
@@ -99,7 +111,18 @@ class IntentRouter:
         *,
         template_doc_type: str | None = None,
     ) -> IntentResult:
-        """判定用户意图：规则优先，规则不自信时 LLM 兜底，失败降级 direct_qa。"""
+        """判定用户意图：规则优先，规则不自信时 LLM 兜底，失败降级 direct_qa。
+
+        任务/提问区分（用户 2026-10-13 反馈：创作、完成任务型诉求不能被
+        误判为 direct_qa——后者无材料时会拒答，而任务型应走自身能力
+        完成 + 甄别声明）：
+        - 任务动词（起草/写一份/创作/设计/整理成…）+ 祈使标记（帮我/请…）
+          → 任务请求（"帮我写一份通知，要注意哪些格式？"仍是任务）；
+        - 任务动词 + 无疑问标记 → 任务请求（"写一份通知"）；
+        - 任务动词 + 疑问标记 + 无祈使 → 询问做法（"通知怎么写"），
+          按 direct_qa 处理；
+        - 无任务动词的祈使（"请介绍一下策略"）仍是提问，不当任务处理。
+        """
         text = (query or "").strip()
         if not text:
             return IntentResult("direct_qa", 1.0, "default", "空输入按直答处理")
@@ -108,9 +131,18 @@ class IntentRouter:
         if template_doc_type:
             return IntentResult("draft", 1.0, "explicit", f"显式文种 {template_doc_type}")
 
-        # 2) 起草动词 → draft
-        if _DRAFT_VERB.search(text):
-            return IntentResult("draft", 0.9, "rule", "命中起草动词")
+        # 2) 任务请求判定（创作/起草/完成任务 vs 询问做法）
+        #    任务动词 + （祈使标记 或 无疑问标记）→ 任务请求；
+        #    任务动词 + 疑问标记 + 无祈使 → 询问做法（"通知怎么写"→ direct_qa）；
+        #    无任务动词的祈使（"请介绍一下策略"）仍是提问，不当任务处理。
+        has_imperative = bool(_IMPERATIVE.search(text))
+        has_question = bool(_QUESTION_MARK.search(text))
+        has_task_verb = bool(_DRAFT_VERB.search(text) or _TASK_VERB.search(text))
+        is_task_request = has_task_verb and (has_imperative or not has_question)
+        if is_task_request:
+            if _DRAFT_VERB.search(text):
+                return IntentResult("draft", 0.9, "rule", "命中起草动词")
+            return IntentResult("complex_task", 0.85, "rule", "命中任务动词")
 
         # 3) 复杂任务信号 → complex_task
         for pattern, kind in _COMPLEX_SIGNALS:

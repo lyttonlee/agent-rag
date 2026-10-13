@@ -159,12 +159,17 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
         intent_result = None
 
     parts: list[str] = []
+    reasoning_parts: list[str] = []   # 思考链片段（随消息落库，回答后可展开查看）
     citations_holder: list[Citation] = []
     saved = False
     disclaimer = False
 
     async def _save_assistant(answer: str, citations: list, hits: list[str], model: str):
-        """落库助手消息（幂等由 saved 保证；无会话诉求时直接跳过）。"""
+        """落库助手消息（幂等由 saved 保证；无会话诉求时直接跳过）。
+
+        intent / reasoning 随消息留痕：起草链路的每轮意图与思考链
+        同样独立保存，历史会话可回看（回答结束后不丢失）。
+        """
         nonlocal saved
         if not conversation_id or saved or not answer.strip():
             return
@@ -186,6 +191,8 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
             ],
             sensitive_hits=hits,
             model=model,
+            intent=intent_result.intent if intent_result else None,
+            reasoning="".join(reasoning_parts) or None,
         )
         saved = True
 
@@ -229,6 +236,7 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
                 parts.append(text)
                 yield _sse({"type": "token", "text": text})
             else:
+                reasoning_parts.append(text)
                 yield _sse({"type": "reasoning", "text": text})
 
         # 4) 收尾：敏感词脱敏后回传完整答案 + 落库助手消息

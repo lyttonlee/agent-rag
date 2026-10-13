@@ -10,9 +10,11 @@ import { computed, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
+import ReasoningPanel from '@/components/ReasoningPanel.vue'
 import {
   caller,
   getConversation,
+  intentLabelOf,
   streamGenerate,
   type ConversationDetail,
   type ConversationMessage,
@@ -24,7 +26,6 @@ const topic = ref('关于开展第三季度安全生产大检查的通知')
 const loading = ref(false)
 const answer = ref('')
 const reasoning = ref('')
-const showReasoning = ref(false)
 const citations = ref<CitationPayload[]>([])
 const hits = ref<string[]>([])
 const modelName = ref('')
@@ -107,7 +108,6 @@ async function generate() {
   reasoning.value = ''
   citations.value = []
   hits.value = []
-  showReasoning.value = false
   // 重置本轮 Agent 展示状态
   intentLabel.value = ''
   intentKey.value = ''
@@ -141,13 +141,10 @@ async function generate() {
       },
       onReasoning: (text) => {
         reasoning.value += text
-        // 思考链进行中自动展开，让用户看到"正在推理"
-        showReasoning.value = true
+        // 思考面板的自动展开/收起由组件内部按 streaming 状态自行处理
       },
       onToken: (text) => {
         answer.value += text
-        // 正文开始输出后收起思考链，保持文稿区整洁
-        showReasoning.value = false
       },
       onDone: (finalAnswer, sensitiveHits, _model, extra) => {
         // 以服务端脱敏后的完整答案为准（流式片段未脱敏）
@@ -247,16 +244,18 @@ async function exportDocx() {
         <el-button :disabled="!answer" @click="exportDocx">导出 docx</el-button>
       </div>
 
-      <!-- 流式状态条：模型 / 耗时 / 思考链折叠 -->
+      <!-- 流式状态条：模型 / 耗时 -->
       <div v-if="loading || reasoning" class="stream-bar">
         <span v-if="loading" class="live"><i class="dot" />流式生成中</span>
         <span v-if="loading" class="mono text-muted">{{ elapsed.toFixed(1) }}s</span>
         <span v-if="modelName" class="text-muted">模型 {{ modelName }}</span>
-        <el-link v-if="reasoning" type="primary" @click="showReasoning = !showReasoning">
-          {{ showReasoning ? '收起思考过程' : `查看思考过程（${reasoning.length} 字）` }}
-        </el-link>
       </div>
-      <div v-if="showReasoning && reasoning" class="reasoning">{{ reasoning }}<span v-if="loading" class="cursor" /></div>
+      <!-- 思考过程：默认折叠、可展开查看；回答结束后不消失 -->
+      <ReasoningPanel
+        v-if="reasoning"
+        :text="reasoning"
+        :streaming="loading && !answer"
+      />
 
       <!-- Agent 执行过程（意图 + 无材料兜底提示；单步起草无拆解步骤） -->
       <AgentStepPanel
@@ -285,6 +284,9 @@ async function exportDocx() {
         <div class="hist-ttl text-muted">本轮会话历史（{{ history.length }} 条）</div>
         <div v-for="m in history" :key="m.id" class="hist-item">
           <span class="hist-role" :class="m.role">{{ m.role === 'user' ? '要求' : '草稿' }}</span>
+          <span v-if="m.role === 'assistant' && m.intent" class="intent-badge" :title="`本轮意图：${intentLabelOf(m.intent)}`">
+            {{ intentLabelOf(m.intent) }}
+          </span>
           <div class="hist-content">{{ m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content }}</div>
         </div>
       </div>
@@ -303,11 +305,6 @@ async function exportDocx() {
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--c-success); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-success); animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-.reasoning {
-  max-height: 120px; overflow: auto; padding: 10px 12px; margin-bottom: 12px;
-  border: 1px dashed var(--line); border-radius: 8px;
-  color: var(--text-faint); font-size: 12px; line-height: 1.6; white-space: pre-wrap;
-}
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--brand); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .paper { padding: 28px; max-width: 820px; margin: 0 auto; background: #f7f4ec; color: #1c1c1c; }
@@ -324,5 +321,15 @@ async function exportDocx() {
   border: 1px solid var(--line-strong); color: var(--text-muted);
 }
 .hist-role.user { color: var(--brand); border-color: var(--brand-line); }
+.intent-badge {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+}
 .hist-content { color: var(--text-muted); line-height: 1.6; }
 </style>

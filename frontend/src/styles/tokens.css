@@ -12,16 +12,17 @@
   --bg-elevated: #20324f;
 
   /* 主色 / 强调 */
-  --brand: #3d7eff;          /* 智蓝（唯一主色） */
+  --brand: #3d7eff;          /* 智蓝（唯一主色：图标/边框/强调） */
+  --brand-deep: #2f6ae0;     /* 深档智蓝：白字填充面专用（按钮/本人气泡，对比度 4.9:1） */
   --brand-soft: rgba(61, 126, 255, 0.14);
   --brand-line: rgba(61, 126, 255, 0.35);
   --seal: #d33a2c;           /* 公文红（印章/密级红标） */
 
-  /* 文本 */
-  --text-strong: #eaf1fb;
-  --text: #c7d4e8;
-  --text-muted: #8a99b3;
-  --text-faint: #5d6c86;
+  /* 文本（对比度校准：全部满足 WCAG AA 小字号 4.5:1） */
+  --text-strong: #f2f6fd;    /* ≈15.4:1 标题/强调 */
+  --text: #d3ddee;           /* ≈10.4:1 正文 */
+  --text-muted: #9fb0c9;     /* ≈6.1:1  次要说明（原 #8a99b3 偏低） */
+  --text-faint: #8093ad;     /* ≈5.0:1  辅助信息（原 #5d6c86 仅 3.0:1，小字号不可读） */
 
   /* 语义色（密级 / 状态） */
   --c-public: #2ecc71;       /* 公开 */
@@ -35,6 +36,16 @@
   /* 边框 / 分隔 */
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.14);
+
+  /* Element Plus 主色覆写：默认 #409EFF 白字对比度不足，
+     统一换成深档智蓝（悬停/激活仍有亮档反馈，见下方 light/dark 阶梯） */
+  --el-color-primary: var(--brand-deep);
+  --el-color-primary-light-3: #4a82e8;
+  --el-color-primary-light-5: #6d9bee;
+  --el-color-primary-light-7: #a8c4f4;
+  --el-color-primary-light-8: #c2d6f7;
+  --el-color-primary-light-9: #dbe8fb;
+  --el-color-primary-dark-2: #2557b8;
 
   /* 字体 */
   --font-sans: "PingFang SC", "Microsoft YaHei", "Source Han Sans SC",
@@ -62,6 +73,48 @@ body {
   color: var(--text);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+}
+
+/* ----------------------------------------------------------------
+ * 全局滚动条（深色主题定制）：细窄、低干扰、悬浮时品牌蓝反馈
+ * 说明：WebKit 系用 background-clip:content-box + 透明边框实现
+ * "内缩"效果；Firefox 用 scrollbar-width/color 属性。
+ * ---------------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(61, 126, 255, 0.55);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:active {
+  background: rgba(61, 126, 255, 0.75);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 文本选择：品牌蓝半透明，深色底上清晰可辨 */
+::selection {
+  background: rgba(61, 126, 255, 0.35);
+  color: #fff;
 }
 
 /* 通用工具类 */
