@@ -127,8 +127,27 @@ class Chunk(Base, TimestampMixin):
     space_id: Mapped[str | None] = mapped_column(String(32), index=True)
     search_vec: Mapped[object] = mapped_column(TSVECTOR)            # 中文 BM25 向量
     tokens: Mapped[int] = mapped_column(Integer, default=0)         # 字数，用于计费/统计
+    # ---- 长短切分（父子块，2026-10-13 P1）----
+    # granularity：small=检索单元（有向量/tsvector，入库即 embed）；
+    #   large=生成单元（纯文本，向量与 tsvector 均为 NULL，不占索引）。
+    #   存量行迁移时统一置 small（server_default），检索层只查 small。
+    granularity: Mapped[str] = mapped_column(
+        String(8), default="small", server_default="small", index=True
+    )
+    # parent_id：small 切片所属 large 父块；NULL=无父块（存量切片/单粒度模式）。
+    # 父块删除时置空而非级联删子块（SET NULL）：父块丢了退化为单粒度行为。
+    parent_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("chunks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+    # 父子自引用：small.parent -> large（仅用于 ORM 层便捷访问，检索回表用显式 SQL）
+    parent: Mapped[Chunk | None] = relationship(
+        "Chunk", remote_side="Chunk.id", back_populates="children"
+    )
+    children: Mapped[list[Chunk]] = relationship(
+        "Chunk", back_populates="parent", foreign_keys=[parent_id]
+    )
 
     __table_args__ = (
         # HNSW 向量索引（检索性能核心）

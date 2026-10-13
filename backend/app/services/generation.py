@@ -38,7 +38,7 @@ from app.services.agent import (
 from app.services.audit import record_audit
 from app.services.generation_prompt import build_generation_messages
 from app.services.model_provider import ModelProvider
-from app.services.retrieval import hybrid_retrieve
+from app.services.retrieval import retrieve_enhanced
 from app.services.runtime_config import load_prompt_templates, load_retrieval_config
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ async def generate_answer(db: AsyncSession, req: GenerateRequest) -> dict:
     与 stream_generate 保持一致的无材料兜底：未检索到参考材料时切换
     自身能力提示词，答案追加甄别声明。
     """
-    retrieve_resp = await hybrid_retrieve(db, req)  # type: ignore[arg-type]
+    retrieve_resp = await retrieve_enhanced(db, req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
     # 检索参数（向量距离阈值）与提示词模板均来自配置中心，缺项回退默认
     cfg = await load_retrieval_config(db)
@@ -204,7 +204,7 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
 
     try:
         # 1) 检索上下文（含 rerank 优雅降级）
-        retrieve_resp = await hybrid_retrieve(db, req)  # type: ignore[arg-type]
+        retrieve_resp = await retrieve_enhanced(db, req)  # type: ignore[arg-type]
         citations: list[Citation] = retrieve_resp.citations
         citations_holder[:] = citations
         # 无有用信息（双信号判定）：任务不失败，切换自身能力起草 + 甄别声明

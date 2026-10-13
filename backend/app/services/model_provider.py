@@ -10,10 +10,9 @@
 
 from __future__ import annotations
 
-import asyncio
-import httpx
 from typing import Literal
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.core.config import Settings, get_settings
@@ -126,16 +125,28 @@ class ModelProvider:
         响应体：{results:[{index, document:{text}, relevance_score}]}
           - results 按**原始输入顺序**给出，需按 index 对齐回输入顺序。
 
-        约定：rerank 端点应在 15s 内返回；超时或连接/协议错误时**抛出**，由检索
-        层捕获并降级为 RRF 排序（不阻断主链路）。用户侧已确认 rerank 部署后
-        「15s 超时则降级」的诉求。
+        文档截断（rerank_doc_max_chars，2026-10-13 实测后增加）：
+        内网 Qwen3-Reranker-0.6B 部署的最大上下文为 4096 tokens，存量文档
+        存在「整篇 1 个 chunk」的长块（实测最长 5760 字，query+doc ≈ 5775
+        tokens），直接投喂会被服务端 HTTP 400 确定性拒绝；且长文档打分
+        耗时劣化严重（单个 3829 字文档 ~38s）。公文的相关性信息高度集中在
+        标题与开头（文号、事由、总则），截断到前 N 字对重排判断影响可忽略，
+        却能把 8 文档批次从「>40s 超时」压到 ~6.5s。截断仅改变送评文本，
+        不改变文档数量，响应按 index 对齐的逻辑不受影响。
+
+        超时（30s）：截断后空闲态 8 文档 ~6.5s；共享模型服务器偶发拥塞
+        （串行处理，超时的客户端请求仍占用服务端）会劣化到 ~50s，30s 可
+        覆盖绝大多数正常态；仍然失败则由检索层降级 RRF，不阻断主链路。
         """
-        payload = {"model": self.model_name, "query": query, "documents": docs}
+        # 截断过长的文档，规避服务端 4096 tokens 上限与长文耗时劣化
+        cap = self.settings.rerank_doc_max_chars
+        clipped = [d[:cap] if len(d) > cap else d for d in docs]
+        payload = {"model": self.model_name, "query": query, "documents": clipped}
         if top_n:
             payload["top_n"] = top_n
 
-        # 单次调用，15s 超时；失败（超时/连接/协议错误）直接抛出，检索层降级 RRF。
-        RERANK_TIMEOUT = 15.0
+        # 单次调用，30s 超时；失败（超时/连接/协议错误）直接抛出，检索层降级 RRF。
+        RERANK_TIMEOUT = 30.0
         try:
             async with httpx.AsyncClient(timeout=RERANK_TIMEOUT) as client:
                 resp = await client.post(
@@ -151,12 +162,13 @@ class ModelProvider:
                 int(r["index"]): float(r.get("relevance_score", 0.0)) for r in results
             }
             scores = [score_map.get(i, 0.0) for i in range(len(docs))]
+            if top_n:
+                order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+                    :top_n
+                ]
+                scores = [scores[i] for i in order]
             return scores
         except Exception as exc:
-            # 连接/超时/协议错误：如实抛出，交给检索层降级（返回 RRF 顺序）。
+            # 连接/超时/协议错误（含长文 400）：如实抛出，交给检索层降级
+            # （返回 RRF 顺序）。截断后正常不再触发 400，此处是最后防线。
             raise exc
-
-        if top_n:
-            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
-            scores = [scores[i] for i in order]
-        return scores

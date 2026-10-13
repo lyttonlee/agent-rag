@@ -181,6 +181,11 @@ class Citation(BaseModel):
     doc_no: str | None = None
     snippet: str
     score: float
+    # 完整正文：仅条件父块注入的大块携带（生成提示词优先用它而非 200 字
+    # snippet，否则注入失去意义）；小块为 None，行为与旧版一致。
+    content: str | None = None
+    # 切片粒度：small=检索命中单元；large=父块注入单元（P1 长短切分）
+    granularity: str = "small"
 
 
 class RetrieveResp(BaseModel):

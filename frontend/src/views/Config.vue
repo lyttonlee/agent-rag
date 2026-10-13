@@ -38,7 +38,7 @@ const TABS = [
   {
     cat: 'retrieval',
     name: '检索参数',
-    desc: '检索链路运行参数：返回条数 top_k、双路召回宽度、重排开关、相关度阈值（向量距离 / rerank 分数，低于阈值视为无效检索）。保存即时生效，无需重启。',
+    desc: '检索链路运行参数：返回条数 top_k、双路召回宽度、重排开关、相关度阈值（向量距离 / rerank 分数）、长短切分（父子块 token 预算）、条件父块注入、查询改写。保存即时生效，无需重启。',
   },
   {
     cat: 'prompt',
@@ -54,11 +54,23 @@ const RETRIEVAL_DEFAULTS = {
   keyword_top_n: 50,
   rerank_enabled: true,
   vec_distance_threshold: 0.6,
-  rerank_min_score: 0.35,
-  // ---- 查询改写（《检索优化方案 V1.0》P1 规划项，功能上线前调整不生效）----
-  rewrite_enabled: false,
+  rerank_min_score: 0.15,
+  // ---- 长短切分（父子块 P1；单位 token，chonkie 计量）----
+  dual_granularity_enabled: true,
+  small_max_tokens: 150,
+  small_overlap_tokens: 20,
+  large_max_tokens: 1200,
+  large_overlap_tokens: 100,
+  // ---- 条件父块注入（P1）----
+  parent_inject_enabled: true,
+  parent_inject_max_count: 2,
+  parent_inject_max_tokens: 3000,
+  parent_inject_min_rerank: 0.15,
+  // ---- 查询改写（P2）----
+  rewrite_enabled: true,
+  rewrite_strategy: 'synonym',
   rewrite_max_rounds: 2,
-  rewrite_timeout_ms: 8000,
+  rewrite_timeout_ms: 25000,
 }
 const retrievalForm = reactive({ ...RETRIEVAL_DEFAULTS })
 
@@ -478,16 +490,108 @@ function currentDesc() {
       <div class="agent-row">
         <div class="agent-info">
           <div class="agent-name">Rerank 分数阈值（有效检索线）</div>
-          <div class="agent-sub">rerank top1 低于该分数视为无效检索——查询改写的触发线之一（《检索优化方案 V1.0》P1 上线后参与判定，待评测台标定）</div>
+          <div class="agent-sub">rerank top1 低于该分数视为无效检索——查询改写与父块注入的共同触发线。实测标定（Qwen3-Reranker，非 0-1 归一化）：精确命中 ≈0.34、词汇鸿沟 ≈0.03、无关 ≈0.016；默认 0.15，换模型需重标</div>
         </div>
         <el-input-number v-model="retrievalForm.rerank_min_score" :min="0" :max="1" :step="0.05" :precision="2" />
       </div>
+      <!-- ============ 长短切分（父子块 P1）============ -->
       <div class="agent-row">
         <div class="agent-info">
-          <div class="agent-name">查询改写（P1 规划）</div>
-          <div class="agent-sub">检索不到时改写 query 重检（同义扩展 / HyDE / 子问题拆解）。功能尚未上线，提前配置备用；上线后在此启用</div>
+          <div class="agent-name">长短切分总开关</div>
+          <div class="agent-sub">开启：新入库文档按 token 双粒度切分（小块检索 + 大块补上下文）；关闭：回退单粒度 800 字符存量路径。存量文档不受影响</div>
         </div>
-        <el-switch v-model="retrievalForm.rewrite_enabled" active-text="开" inactive-text="关" disabled />
+        <el-switch v-model="retrievalForm.dual_granularity_enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">小块 token 上限</div>
+          <div class="agent-sub">检索单元尺寸（用户需求区间 100–200）。小块进向量/BM25 索引，越小匹配越精准、索引越大</div>
+        </div>
+        <el-input-number v-model="retrievalForm.small_max_tokens" :min="50" :max="400" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">小块重叠 token</div>
+          <div class="agent-sub">相邻小块尾部重叠预算（按单元回填，保持段落/条款完整），缓解边界信息丢失</div>
+        </div>
+        <el-input-number v-model="retrievalForm.small_overlap_tokens" :min="0" :max="100" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">大块 token 上限</div>
+          <div class="agent-sub">生成单元尺寸（用户需求区间 800–2000）。大块纯文本不建索引，仅在小块命中后按需注入</div>
+        </div>
+        <el-input-number v-model="retrievalForm.large_max_tokens" :min="400" :max="4000" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">大块重叠 token</div>
+          <div class="agent-sub">相邻大块尾部重叠预算</div>
+        </div>
+        <el-input-number v-model="retrievalForm.large_overlap_tokens" :min="0" :max="400" />
+      </div>
+      <!-- ============ 条件父块注入（P1）============ -->
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">条件父块注入</div>
+          <div class="agent-sub">上下文不足时（空结果/双信号异常/rerank 低于阈值）回表注入命中小块所属大块，补充生成上下文；父块权限与小块同款二次校验</div>
+        </div>
+        <el-switch v-model="retrievalForm.parent_inject_enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">父块注入数量上限</div>
+          <div class="agent-sub">单次检索最多注入几个大块（命中小块按父块去重）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.parent_inject_max_count" :min="1" :max="8" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">父块注入 token 预算</div>
+          <div class="agent-sub">注入大块的总 token 硬顶（超出按相关度截断），防生成上下文膨胀</div>
+        </div>
+        <el-input-number v-model="retrievalForm.parent_inject_max_tokens" :min="500" :max="16000" :step="500" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">父块注入触发线</div>
+          <div class="agent-sub">rerank top1 低于该分数才注入父块（与改写触发线同源，默认 0.15；调大更难注入、调小更易注入）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.parent_inject_min_rerank" :min="0" :max="1" :step="0.05" :precision="2" />
+      </div>
+      <!-- ============ 查询改写（P2）============ -->
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">查询改写重检</div>
+          <div class="agent-sub">弱信号触发时改写 query 重检（救回「词汇鸿沟」型失败）；失败/超时自动降级保留原结果，不阻断检索</div>
+        </div>
+        <el-switch v-model="retrievalForm.rewrite_enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">改写策略</div>
+          <div class="agent-sub">synonym=同义扩展（默认，单次 LLM ≈11s）；auto=多部查询先拆解、否则同义+假想双路（≈22s，需调大超时）；hyde=假想段落；decompose=子问题拆解</div>
+        </div>
+        <el-select v-model="retrievalForm.rewrite_strategy" style="width:160px">
+          <el-option label="synonym（同义扩展）" value="synonym" />
+          <el-option label="auto（自动）" value="auto" />
+          <el-option label="hyde（假想段落）" value="hyde" />
+          <el-option label="decompose（子问题拆解）" value="decompose" />
+        </el-select>
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">改写轮次上限</div>
+          <div class="agent-sub">每次检索最多尝试几个改写变体（每轮一次检索，受总超时约束；至少保证完成一轮）</div>
+        </div>
+        <el-input-number v-model="retrievalForm.rewrite_max_rounds" :min="1" :max="4" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">改写总超时（毫秒）</div>
+          <div class="agent-sub">改写生成+重检总预算（实测单次 LLM ≈11s）；默认 25000 适配 synonym，auto 双路建议 35000+。超时即用已得候选，不阻断检索</div>
+        </div>
+        <el-input-number v-model="retrievalForm.rewrite_timeout_ms" :min="1000" :max="60000" :step="1000" />
       </div>
       <div class="agent-actions">
         <el-button type="primary" size="small" @click="saveRetrieval">保存参数</el-button>

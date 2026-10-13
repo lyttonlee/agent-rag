@@ -52,6 +52,24 @@ def _pick(templates: dict[str, str] | None, key: str, default: str) -> str:
     return default
 
 
+def _render_context(citations: list[Citation]) -> str:
+    """渲染检索材料上下文。
+
+    父块注入的大块（granularity='large'）携带完整正文 content——生成时
+    必须用它而非 200 字 snippet，否则"补上下文"的注入失去意义；
+    小块仍用 snippet（与旧行为一致，控制上下文体积）。
+    """
+    if not citations:
+        return "（无可用检索材料）"
+    parts = []
+    for i, c in enumerate(citations):
+        body = c.content if (c.granularity == "large" and c.content) else c.snippet
+        parts.append(
+            f"[{i+1}] 《{c.title}》{('（' + c.doc_no + '）') if c.doc_no else ''}：\n{body}"
+        )
+    return "\n\n".join(parts)
+
+
 def build_generation_messages(
     req: GenerateRequest,
     citations: list[Citation],
@@ -62,7 +80,7 @@ def build_generation_messages(
 
     Args:
         req: 起草请求（query / template_doc_type）。
-        citations: 检索引用材料。
+        citations: 检索引用材料（可含父块注入的大块，见 _render_context）。
         no_materials: 未检索到材料时的"自身能力起草"模式——提示词切换为
             通用写作能力指令，并明确不得虚构知识库依据（答案由调用方追加
             甄别声明，见 agent.policies.TASK_DISCLAIMER）。
@@ -78,12 +96,7 @@ def build_generation_messages(
     if req.template_doc_type:
         system += f"4. 按「{req.template_doc_type}」文种格式起草。\n"
 
-    context = "\n\n".join(
-        f"[{i+1}] 《{c.title}》{('（' + c.doc_no + '）') if c.doc_no else ''}：\n{c.snippet}"
-        for i, c in enumerate(citations)
-    ) or "（无可用检索材料）"
-
-    user = f"【检索材料】\n{context}\n\n【用户问题】\n{req.query}"
+    user = f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{req.query}"
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -124,12 +137,8 @@ def build_chat_messages(
     # 历史轮次（content 截断，防止早期超长答案挤占上下文窗口）
     for role, content in history:
         messages.append({"role": role, "content": content[:2000]})
-    context = "\n\n".join(
-        f"[{i+1}] 《{c.title}》{('（' + c.doc_no + '）') if c.doc_no else ''}：\n{c.snippet}"
-        for i, c in enumerate(citations)
-    ) or "（无可用检索材料）"
     messages.append({
         "role": "user",
-        "content": f"【检索材料】\n{context}\n\n【用户问题】\n{query}",
+        "content": f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{query}",
     })
     return messages

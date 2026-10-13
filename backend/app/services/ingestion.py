@@ -19,11 +19,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.db.models import Chunk as ChunkModel
 from app.db.models import Document as DocumentModel
-from app.db.models import IngestionJob
+from app.db.models import IngestionJob, _uuid
 from app.db.session import AsyncSessionLocal
-from app.services.chunker import build_prefix, chunk_document
+from app.services.chunker import (
+    build_prefix,
+    chunk_document,
+    chunk_document_dual,
+    mount_parents,
+)
 from app.services.model_provider import ModelProvider
 from app.services.parser import parse_bytes
+from app.services.runtime_config import RetrievalConfig, load_retrieval_config
 from app.services.storage import get_storage
 
 _settings = get_settings()
@@ -33,8 +39,94 @@ logger = logging.getLogger(__name__)
 _NON_TERMINAL = {"PENDING", "PARSING", "CHUNKING", "EMBEDDING"}
 
 
+async def _prepare_dual_chunks(
+    db: AsyncSession,
+    content: str,
+    prefix: str,
+    strategy: str,
+) -> tuple[list, list, RetrievalConfig | None]:
+    """按配置中心做双粒度切分（长短切分 P1）。
+
+    Returns:
+        (smalls, larges, cfg)；cfg.dual_granularity_enabled=False 时返回
+        ([], [], cfg)——调用方据此回退存量单粒度路径（chunk_document）。
+        切分本身不依赖 DB，此处仅读取配置；任何异常由调用方按失败任务处理。
+    """
+    cfg = await load_retrieval_config(db)
+    if not cfg.dual_granularity_enabled:
+        return [], [], cfg
+    smalls, larges = chunk_document_dual(
+        content or "",
+        prefix,
+        strategy=strategy,  # type: ignore[arg-type]
+        small_max_tokens=cfg.small_max_tokens,
+        small_overlap_tokens=cfg.small_overlap_tokens,
+        large_max_tokens=cfg.large_max_tokens,
+        large_overlap_tokens=cfg.large_overlap_tokens,
+    )
+    mount_parents(smalls, larges)
+    return smalls, larges, cfg
+
+
+def _insert_dual_chunks(
+    db: AsyncSession,
+    doc: DocumentModel,
+    prefix: str,
+    smalls: list,
+    larges: list,
+    embeddings: list[list[float]],
+) -> None:
+    """双粒度落库：先落大块（纯文本，无向量/tsvector），再落小块（带父块指针）。
+
+    大块不 embed、不建 tsvector——检索只走小块（granularity='small'），
+    大块仅在小块命中后按需回表注入（services/retrieval.py 条件注入），
+    这是 small-to-large 模式在单库 PG 上的存储形态：向量/索引增长仅
+    来自小块，大块只增文本。
+
+    大块先插入并显式指定 ID，小块 parent_id 直接引用（同事务，无顺序问题）。
+    """
+    large_ids = [_uuid() for _ in larges]
+    for seq, (lg, lg_id) in enumerate(zip(larges, large_ids, strict=True), start=1):
+        db.add(
+            ChunkModel(
+                id=lg_id,
+                document_id=doc.id,
+                seq=seq,
+                content=lg.content,
+                content_prefix=prefix,
+                embedding=None,                       # 大块不做向量检索
+                security_level=doc.security_level,     # 冗余密级/权限：父块注入时
+                permission_tags=doc.permission_tags,   # 与小块同款过滤（双保险）
+                space_id=doc.space_id,
+                tokens=len(lg.content),
+                granularity="large",
+                search_vec=None,                       # 大块不进 BM25 索引
+            )
+        )
+    for seq, (sm, vec) in enumerate(zip(smalls, embeddings, strict=True), start=1):
+        parent_idx = getattr(sm, "parent_index", None)
+        db.add(
+            ChunkModel(
+                document_id=doc.id,
+                seq=seq,
+                content=sm.content,
+                content_prefix=prefix,
+                embedding=vec,
+                security_level=doc.security_level,
+                permission_tags=doc.permission_tags,
+                space_id=doc.space_id,
+                tokens=len(sm.content),
+                granularity="small",
+                parent_id=large_ids[parent_idx] if parent_idx is not None else None,
+                # 中文 BM25 向量（zhparser）：入库时即时生成；
+                # 生产环境另有触发器兜底（见迁移 0002），确保 dev/prod 一致。
+                search_vec=func.to_tsvector("chinese", sm.content),
+            )
+        )
+
+
 async def _embed_batched(
-    provider: "ModelProvider",
+    provider: ModelProvider,
     texts: list[str],
     batch_size: int = 8,
     max_retries: int = 2,
@@ -122,41 +214,51 @@ async def ingest_document(
         get_storage().save(key, raw_bytes)
         doc.content_ref = key
 
-    # 3) 切片：按接入方指定的策略 / 尺寸切分（RAG 切分核心）
+    # 3) 切片：双粒度（长短切分 P1，配置中心可关）；关闭时回退单粒度 800 字符
     prefix = build_prefix(doc.title, doc.issuer, payload.get("publish_date"))
-    pieces = chunk_document(
-        content or "",
-        prefix,
-        strategy=payload.get("chunk_strategy", "paragraph"),
-        max_chars=payload.get("chunk_size", 800),
-        overlap=payload.get("chunk_overlap", 80),
-    )
+    strategy = payload.get("chunk_strategy", "paragraph")
+    smalls, larges, rcfg = await _prepare_dual_chunks(db, content or "", prefix, strategy)
 
-    # 4) 向量化（分批调用 emb Provider + 超时重试，避免大文档单批卡死）
-    emb_provider = ModelProvider(role="emb")
-    texts = [p.content for p in pieces]
-    embeddings = await _embed_batched(emb_provider, texts, batch_size=8, max_retries=2)
-
-    # 5) 落库切片（冗余密级/权限用于检索下推）
-    for seq, (piece, vec) in enumerate(zip(pieces, embeddings), start=1):
-        db.add(
-            ChunkModel(
-                document_id=doc.id,
-                seq=seq,
-                content=piece.content,
-                content_prefix=prefix,
-                embedding=vec,
-                security_level=doc.security_level,
-                permission_tags=doc.permission_tags,
-                space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
-                tokens=len(piece.content),
-                # 中文 BM25 向量（zhparser）：入库时即时生成；
-                # 生产环境另有触发器兜底（见迁移 0002），确保 dev/prod 一致。
-                search_vec=func.to_tsvector("chinese", piece.content),
-            )
+    if rcfg is not None and rcfg.dual_granularity_enabled:
+        # 4) 向量化：仅小块（大块纯文本不 embed，small-to-large 核心性能设计）
+        emb_provider = ModelProvider(role="emb")
+        texts = [s.content for s in smalls]
+        embeddings = await _embed_batched(emb_provider, texts, batch_size=8, max_retries=2)
+        # 5) 双粒度落库（大块先落，小块带 parent_id）
+        _insert_dual_chunks(db, doc, prefix, smalls, larges, embeddings)
+        chunk_count = len(smalls)
+    else:
+        # 单粒度存量路径（dual_granularity_enabled=false 时行为与迁移前一致）
+        pieces = chunk_document(
+            content or "",
+            prefix,
+            strategy=strategy,
+            max_chars=payload.get("chunk_size", 800),
+            overlap=payload.get("chunk_overlap", 80),
         )
+        emb_provider = ModelProvider(role="emb")
+        texts = [p.content for p in pieces]
+        embeddings = await _embed_batched(emb_provider, texts, batch_size=8, max_retries=2)
+        for seq, (piece, vec) in enumerate(zip(pieces, embeddings, strict=True), start=1):
+            db.add(
+                ChunkModel(
+                    document_id=doc.id,
+                    seq=seq,
+                    content=piece.content,
+                    content_prefix=prefix,
+                    embedding=vec,
+                    security_level=doc.security_level,
+                    permission_tags=doc.permission_tags,
+                    space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
+                    tokens=len(piece.content),
+                    # 中文 BM25 向量（zhparser）：入库时即时生成；
+                    # 生产环境另有触发器兜底（见迁移 0002），确保 dev/prod 一致。
+                    search_vec=func.to_tsvector("chinese", piece.content),
+                )
+            )
+        chunk_count = len(pieces)
 
-    doc.chunk_count = len(pieces)
+    doc.chunk_count = chunk_count
     doc.status = "INDEXED"
     await db.commit()
     await db.refresh(doc)
@@ -222,29 +324,44 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 content = parsed.text
                 logger.info("入库任务 %s 解析完成：%d 字符，扫描件=%s", job_id, len(content or ""), parsed.is_scanned)
 
-            # 阶段：切片
+            # 阶段：切片（双粒度 P1；配置关闭时回退单粒度 800 字符存量路径）
             job.status = "CHUNKING"
             job.progress = 20
             await db.commit()
             prefix = build_prefix(
                 meta.get("title", ""), meta.get("issuer"), meta.get("publish_date")
             )
-            pieces = chunk_document(
-                content or "",
-                prefix,
-                strategy=meta.get("chunk_strategy", "paragraph"),
-                max_chars=meta.get("chunk_size", 800),
-                overlap=meta.get("chunk_overlap", 80),
+            strategy = meta.get("chunk_strategy", "paragraph")
+            smalls, larges, rcfg = await _prepare_dual_chunks(
+                db, content or "", prefix, strategy
             )
-            job.total_chunks = len(pieces)
-            logger.info("入库任务 %s 切片完成：%d 片", job_id, len(pieces))
+            dual = rcfg is not None and rcfg.dual_granularity_enabled
+            pieces = (
+                []
+                if dual
+                else chunk_document(
+                    content or "",
+                    prefix,
+                    strategy=strategy,
+                    max_chars=meta.get("chunk_size", 800),
+                    overlap=meta.get("chunk_overlap", 80),
+                )
+            )
+            job.total_chunks = len(smalls) if dual else len(pieces)
+            logger.info(
+                "入库任务 %s 切片完成：%s",
+                job_id,
+                f"小块 {len(smalls)} + 大块 {len(larges)}（双粒度）"
+                if dual
+                else f"{len(pieces)} 片（单粒度）",
+            )
 
-            # 阶段：向量化（分批，逐批回写进度）
+            # 阶段：向量化（分批，逐批回写进度；双粒度仅嵌小块）
             job.status = "EMBEDDING"
             job.progress = 40
             await db.commit()
             emb_provider = ModelProvider(role="emb")
-            texts = [p.content for p in pieces]
+            texts = [s.content for s in smalls] if dual else [p.content for p in pieces]
 
             async def _progress(done: int, total: int):
                 job.processed_chunks = done
@@ -274,7 +391,7 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 owner_org=meta.get("owner_org"),
                 source_system=meta.get("source_system"),
                 status="INDEXED",
-                chunk_count=len(pieces),
+                chunk_count=len(smalls) if dual else len(pieces),
                 space_id=space_id,
             )
             db.add(doc)
@@ -286,33 +403,37 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 get_storage().save(key, raw_bytes)
                 doc.content_ref = key
 
-            for seq, (piece, vec) in enumerate(zip(pieces, embeddings), start=1):
-                db.add(
-                    ChunkModel(
-                        document_id=doc.id,
-                        seq=seq,
-                        content=piece.content,
-                        content_prefix=prefix,
-                        embedding=vec,
-                        security_level=doc.security_level,
-                        permission_tags=doc.permission_tags,
-                        space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
-                        tokens=len(piece.content),
-                        search_vec=func.to_tsvector("chinese", piece.content),
+            if dual:
+                # 双粒度落库：大块先落（纯文本），小块带 parent_id
+                _insert_dual_chunks(db, doc, prefix, smalls, larges, embeddings)
+            else:
+                for seq, (piece, vec) in enumerate(zip(pieces, embeddings, strict=True), start=1):
+                    db.add(
+                        ChunkModel(
+                            document_id=doc.id,
+                            seq=seq,
+                            content=piece.content,
+                            content_prefix=prefix,
+                            embedding=vec,
+                            security_level=doc.security_level,
+                            permission_tags=doc.permission_tags,
+                            space_id=doc.space_id,  # 冗余空间，检索切片粒度下推
+                            tokens=len(piece.content),
+                            search_vec=func.to_tsvector("chinese", piece.content),
+                        )
                     )
-                )
 
             # 收尾：任务完成
             job.status = "INDEXED"
             job.progress = 100
-            job.processed_chunks = len(pieces)
+            job.processed_chunks = len(smalls) if dual else len(pieces)
             job.document_id = doc.id
             await db.commit()
-            logger.info("入库任务 %s 完成：document_id=%s 切片=%d", job_id, doc.id, len(pieces))
+            logger.info("入库任务 %s 完成：document_id=%s", job_id, doc.id)
         except Exception as exc:  # 任意阶段异常 → 标记失败，不阻塞服务
             await db.rollback()
             job.status = "FAILED"
-            job.error_message = f"{type(ex).__name__}: {str(ex)[:500]}"
+            job.error_message = f"{type(exc).__name__}: {str(exc)[:500]}"
             job.progress = 0
             await db.commit()
             logger.exception("入库任务 %s 失败：%s", job_id, exc)

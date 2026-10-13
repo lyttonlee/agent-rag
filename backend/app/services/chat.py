@@ -71,7 +71,7 @@ from app.services.agent import (
 from app.services.audit import record_audit
 from app.services.generation_prompt import build_chat_messages
 from app.services.model_provider import ModelProvider
-from app.services.retrieval import hybrid_retrieve
+from app.services.retrieval import retrieve_enhanced
 from app.services.runtime_config import (
     RetrievalConfig,
     load_prompt_templates,
@@ -217,7 +217,7 @@ async def _run_direct_answer(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
       改用模型自身能力完成任务（提示词切换 no_materials 模式），答案末尾
       追加甄别声明（disclaimer=True）。
     """
-    retrieve_resp = await hybrid_retrieve(ctx.db, ctx.req)  # type: ignore[arg-type]
+    retrieve_resp = await retrieve_enhanced(ctx.db, ctx.req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
     ctx.citations[:] = citations
     # "无有用信息"双信号判定（向量距离 + 关键词命中，见 policies.is_no_useful_info）；
@@ -351,7 +351,7 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
     conv = await _ensure_conversation(db, req)
     conversation_id = conv.id
     space_ids = _resolve_space_ids(req, conv.space_ids or [])
-    # 把收敛后的空间范围写回请求对象：hybrid_retrieve 从 req.space_ids 读取，
+    # 把收敛后的空间范围写回请求对象：retrieve_enhanced 从 req.space_ids 读取，
     # 否则"会话绑定空间"对检索不生效（请求未显式带 space_ids 时为 None）。
     req.space_ids = space_ids
 

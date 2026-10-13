@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     model_rerank_api_key: str = "EMPTY"
     model_rerank_name: str = "qwen3-reranker-0.6b"
     rerank_top_n: int = 50
+    # 送 rerank 的单文档最大字符数（2026-10-13 实测标定）：
+    # 内网 Qwen3-Reranker-0.6B 最大上下文 4096 tokens，存量长块（整篇 1 chunk，
+    # 实测最长 5760 字）超限会被服务端 HTTP 400 拒绝，且长文打分耗时劣化严重。
+    # 公文相关性信息集中在标题与开头，截断到 1200 字可把 8 文档批次从 >40s
+    # 压到 ~6.5s。部署方若使用更大上下文的 reranker（如 32k），可调大本值。
+    rerank_doc_max_chars: int = 1200
 
     # ---- 涉密不出网：生产环境拒绝云端 Provider ----
     # 部署方若使用 std（自有算力中心），其 base_url 必须为内网地址
