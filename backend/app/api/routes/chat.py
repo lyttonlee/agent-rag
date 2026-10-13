@@ -9,27 +9,32 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.contracts import ChatRequest
+from app.services.audit import actor_from_request
 from app.services.chat import stream_chat
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
 @router.post("/stream")
-async def chat_stream(req: ChatRequest, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+async def chat_stream(
+    req: ChatRequest, request: Request, db: AsyncSession = Depends(get_db)
+) -> StreamingResponse:
     """智能问答流式接口（SSE）。
 
     conversation_id 为空时自动创建会话；多轮上下文由后端自动拼接。
+    Agent 模式（默认开）下先做意图路由再分发策略，SSE 事件增加
+    intent/plan/step_*（老客户端忽略新事件即可兼容）。
     前端用 fetch + ReadableStream 消费，实时渲染；点「停止」时后端
     自动保存已生成部分为助手消息。
     """
     return StreamingResponse(
-        stream_chat(db, req),
+        stream_chat(db, req, actor=actor_from_request(request)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

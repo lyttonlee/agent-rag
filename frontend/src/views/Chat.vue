@@ -13,6 +13,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
+import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import {
   caller,
   getConversation,
@@ -23,6 +24,7 @@ import {
   type ConversationMessage,
   type CitationPayload,
   type DocSpace,
+  type PlanStep,
 } from '@/api/client'
 
 // ---- 知识空间（问答范围多选）----
@@ -48,6 +50,17 @@ const hits = ref<string[]>([])
 const modelName = ref('')
 let controller: AbortController | null = null
 const listRef = ref<HTMLElement | null>(null)
+
+// ---- Agent 状态（意图路由 + 分步执行过程可见）----
+const intentLabel = ref('')
+const intentKey = ref('')
+const turnSteps = ref<PlanStep[]>([])
+const noResult = ref(false)
+const disclaimer = ref(false)
+/** 本轮 Agent 信息是否展示（流式中或流式结束后到下一次发送前） */
+const showAgentPanel = computed(
+  () => loading.value || !!intentLabel.value || turnSteps.value.length > 0 || noResult.value || disclaimer.value,
+)
 
 const hasMessages = computed(() => messages.value.length > 0 || loading.value)
 
@@ -95,6 +108,16 @@ function newConversation() {
   reasoning.value = ''
   citations.value = []
   hits.value = []
+  resetAgentTurn()
+}
+
+/** 重置本轮 Agent 展示状态（新发送 / 新会话时调用） */
+function resetAgentTurn() {
+  intentLabel.value = ''
+  intentKey.value = ''
+  turnSteps.value = []
+  noResult.value = false
+  disclaimer.value = false
 }
 
 /** 切换知识范围：持久化到会话绑定（换范围继续聊） */
@@ -147,6 +170,7 @@ function send(text?: string) {
   citations.value = []
   hits.value = []
   showReasoning.value = false
+  resetAgentTurn()
   input.value = ''
   scrollBottom()
 
@@ -160,13 +184,41 @@ function send(text?: string) {
       rerank: true,
     },
     {
-      onMeta: (conversationId, model, cits) => {
+      onMeta: (conversationId, model, cits, _truncated, meta) => {
         // 首轮：后端自动创建会话并回传 ID，后续轮次复用
         if (conversationId && conversationId !== activeId.value) {
           activeId.value = conversationId
         }
         modelName.value = model
         citations.value = cits
+        // Agent 意图信息（meta 可能来自老后端，缺省时保持空）
+        if (meta) {
+          intentLabel.value = meta.intent_label || ''
+          intentKey.value = meta.intent || ''
+          noResult.value = !!meta.no_result
+        }
+        scrollBottom()
+      },
+      onPlan: (steps) => {
+        // 复杂任务计划到达：渲染步骤时间线（过程可见）
+        turnSteps.value = steps.map((s) => ({ ...s, status: s.status || 'pending' }))
+        scrollBottom()
+      },
+      onStepStart: (step) => {
+        const target = turnSteps.value.find((s) => s.id === step.id)
+        if (target) {
+          target.status = 'running'
+        } else {
+          turnSteps.value.push({ ...step, status: 'running' })
+        }
+        scrollBottom()
+      },
+      onStepEnd: (stepId, ok, summary) => {
+        const target = turnSteps.value.find((s) => s.id === stepId)
+        if (target) {
+          target.status = ok ? 'done' : 'failed'
+          target.summary = summary
+        }
         scrollBottom()
       },
       onReasoning: (t) => {
@@ -179,12 +231,17 @@ function send(text?: string) {
         showReasoning.value = false
         scrollBottom()
       },
-      onDone: (finalAnswer, sensitiveHits, model, conversationId) => {
+      onDone: (finalAnswer, sensitiveHits, model, conversationId, extra) => {
         // 以服务端脱敏后的完整答案为准（流式片段未脱敏）
         answer.value = finalAnswer
         hits.value = sensitiveHits
         modelName.value = model
         if (conversationId) activeId.value = conversationId
+        if (extra) {
+          disclaimer.value = !!extra.disclaimer
+          noResult.value = !!extra.no_result
+          if (extra.intent && !intentKey.value) intentKey.value = extra.intent
+        }
         // 落库完成：整页刷新历史（含本轮 user/assistant 消息）
         if (activeId.value) {
           getConversation(activeId.value)
@@ -337,6 +394,17 @@ onBeforeUnmount(() => {
           </div>
         </template>
       </div>
+
+      <!-- Agent 执行过程（意图 + 步骤时间线 + 状态提示；保留到下次发送） -->
+      <AgentStepPanel
+        v-if="showAgentPanel"
+        :intent="intentKey"
+        :intent-label="intentLabel"
+        :steps="turnSteps"
+        :loading="loading"
+        :no-result="noResult"
+        :disclaimer="disclaimer"
+      />
 
       <!-- 输入区 -->
       <footer class="chat-input">

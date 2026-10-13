@@ -60,7 +60,10 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         .limit(_settings.retrieve_vector_top_n)
     )
     vec_q = _apply(vec_q)
-    vec_rows = (await db.execute(vec_q)).scalars().all()
+    # .all() 保留 (Chunk, dist) 元组：既供 RRF 融合取 Chunk，
+    # 也供"无有用信息"判定取 top1 向量距离（见文件末尾信号计算）。
+    vec_result = (await db.execute(vec_q)).all()
+    vec_rows = [row[0] for row in vec_result]
 
     # ---- 关键词召回（zhparser 中文分词 + ts_rank）----
     kw_ts = func.plainto_tsquery("chinese", req.query)
@@ -116,9 +119,18 @@ async def hybrid_retrieve(db: AsyncSession, req: RetrieveRequest) -> RetrieveRes
         )
         for (c, _), s in ranked
     ]
+    # ---- "无有用信息"判定信号（供 Agent 直答拒答 / 任务型兜底决策）----
+    # top_vector_distance：向量路 top1 的余弦距离（已按距离升序，取首个）。
+    #   实测标定（Qwen3-Embedding-4B）：主题相关查询 ≈0.28，无关查询 ≈0.64~0.70；
+    # keyword_hits：关键词路命中数（zhparser 分词后与语料的词汇重叠度）。
+    # 两者需同时异常才判定"无有用信息"（见 agent/policies.is_no_useful_info），
+    # 单一脸弱信号误杀率高；rerank 可用时该信号依然有效（距离与分词不依赖 rerank）。
+    top_vector_distance = float(vec_result[0][1]) if vec_result else None
     return RetrieveResp(
         query=req.query,
         citations=citations,
         total_matched=len(fused),
         truncated_by_security=False,
+        top_vector_distance=top_vector_distance,
+        keyword_hits=len(kw_rows),
     )

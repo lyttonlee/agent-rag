@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.contracts import GenerateRequest, GenerateResp
+from app.services.audit import actor_from_request
 from app.services.generation import generate_answer, stream_generate
 
 router = APIRouter(prefix="/generate", tags=["generate"])
@@ -24,14 +25,16 @@ async def generate(
 
 @router.post("/stream")
 async def generate_stream(
-    req: GenerateRequest, db: AsyncSession = Depends(get_db)
+    req: GenerateRequest, request: Request, db: AsyncSession = Depends(get_db)
 ) -> StreamingResponse:
     """流式生成（SSE）：先回传检索元数据，再逐 token 返回正文，结尾脱敏。
 
-    前端用 fetch + ReadableStream 消费，实时渲染，避免大草稿被判定超时。
+    Agent 模式（默认开）下 meta/done 事件携带 intent 与 disclaimer
+    （无材料兜底的甄别声明标志）。前端用 fetch + ReadableStream 消费，
+    实时渲染，避免大草稿被判定超时。
     """
     return StreamingResponse(
-        stream_generate(db, req),
+        stream_generate(db, req, actor=actor_from_request(request)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

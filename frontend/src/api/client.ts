@@ -312,15 +312,45 @@ export interface CitationPayload {
   score: number
 }
 
+/** Agent 计划步骤（complex_task 拆步，过程对用户可见） */
+export interface PlanStep {
+  id: string
+  action: 'retrieve' | 'generate'
+  query: string
+  status?: 'pending' | 'running' | 'done' | 'failed'
+  /** 步骤结论摘要（step_end 事件带回，done/failed 时展示） */
+  summary?: string
+}
+
+/** 流式 meta 事件中的 Agent 信息（问答/起草共用） */
+export interface AgentMeta {
+  conversation_id?: string
+  model: string
+  intent?: string | null
+  intent_label?: string | null
+  agent_mode?: boolean
+  no_result?: boolean
+  disclaimer?: boolean
+  truncated_by_security: boolean
+  citations: CitationPayload[]
+}
+
+/** 流式 done 事件中的 Agent 收尾信息 */
+export interface DoneExtra {
+  intent?: string | null
+  no_result?: boolean
+  disclaimer?: boolean
+}
+
 export interface StreamHandlers {
-  /** 检索元数据（引用列表）到达；conversationId 为起草会话 ID（首轮后端创建并回传） */
-  onMeta?: (model: string, citations: CitationPayload[], truncated: boolean, conversationId?: string) => void
+  /** 检索元数据（引用列表）到达；conversationId 为起草会话 ID；meta 携带 Agent 意图信息 */
+  onMeta?: (model: string, citations: CitationPayload[], truncated: boolean, conversationId?: string, meta?: AgentMeta) => void
   /** 正文 token 逐片到达 */
   onToken?: (text: string) => void
   /** 思考链片段到达（推理模型） */
   onReasoning?: (text: string) => void
-  /** 流式完成（含脱敏后完整答案与敏感词命中） */
-  onDone?: (answer: string, sensitiveHits: string[], model: string) => void
+  /** 流式完成（含脱敏后完整答案与敏感词命中）；extra 携带意图/无材料/甄别声明标志 */
+  onDone?: (answer: string, sensitiveHits: string[], model: string, extra?: DoneExtra) => void
   /** 出错（后端推送 error 事件或网络异常） */
   onError?: (message: string) => void
 }
@@ -334,6 +364,7 @@ export interface StreamGenerateOpts {
   max_clearance?: SecurityLevel
   rerank?: boolean
   top_n?: number
+  agent_mode?: boolean
 }
 
 /**
@@ -361,6 +392,7 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
           max_clearance: opts.max_clearance ?? 'INTERNAL',
           rerank: opts.rerank ?? false,
           top_n: opts.top_n ?? 8,
+          agent_mode: opts.agent_mode ?? null,
         }),
         signal: controller.signal,
       })
@@ -402,6 +434,17 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
                 evt.citations ?? [],
                 !!evt.truncated_by_security,
                 evt.conversation_id ?? undefined,
+                {
+                  conversation_id: evt.conversation_id,
+                  model: evt.model ?? '',
+                  intent: evt.intent ?? null,
+                  intent_label: evt.intent_label ?? null,
+                  agent_mode: evt.agent_mode,
+                  no_result: !!evt.no_result,
+                  disclaimer: !!evt.disclaimer,
+                  truncated_by_security: !!evt.truncated_by_security,
+                  citations: evt.citations ?? [],
+                },
               )
               break
             case 'token':
@@ -411,7 +454,11 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
               handlers.onReasoning?.(evt.text ?? '')
               break
             case 'done':
-              handlers.onDone?.(evt.answer ?? '', evt.sensitive_hits ?? [], evt.model ?? '')
+              handlers.onDone?.(evt.answer ?? '', evt.sensitive_hits ?? [], evt.model ?? '', {
+                intent: evt.intent ?? null,
+                no_result: !!evt.no_result,
+                disclaimer: !!evt.disclaimer,
+              })
               break
             case 'error':
               handlers.onError?.(evt.message ?? '生成失败')
@@ -439,15 +486,22 @@ export interface StreamChatOpts {
   max_clearance?: SecurityLevel
   rerank?: boolean
   top_n?: number
+  agent_mode?: boolean
 }
 
 export interface ChatHandlers {
-  /** 会话与检索元数据到达（conversation_id 供前端后续轮次复用） */
-  onMeta?: (conversationId: string, model: string, citations: CitationPayload[], truncated: boolean) => void
+  /** 会话与检索元数据到达（conversation_id 供前端后续轮次复用；meta 携带意图/无材料标志） */
+  onMeta?: (conversationId: string, model: string, citations: CitationPayload[], truncated: boolean, meta?: AgentMeta) => void
+  /** 复杂任务计划到达（步骤列表，过程可见） */
+  onPlan?: (steps: PlanStep[]) => void
+  /** 某步骤开始执行 */
+  onStepStart?: (step: PlanStep) => void
+  /** 某步骤执行结束（ok=false 时 summary 为失败原因） */
+  onStepEnd?: (stepId: string, ok: boolean, summary: string) => void
   onToken?: (text: string) => void
   onReasoning?: (text: string) => void
-  /** 流式完成（含脱敏后完整答案、敏感词命中、会话 ID） */
-  onDone?: (answer: string, sensitiveHits: string[], model: string, conversationId: string) => void
+  /** 流式完成（含脱敏后完整答案、敏感词命中、会话 ID、Agent 收尾信息） */
+  onDone?: (answer: string, sensitiveHits: string[], model: string, conversationId: string, extra?: DoneExtra) => void
   onError?: (message: string) => void
 }
 
@@ -476,6 +530,7 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
           max_clearance: opts.max_clearance ?? 'INTERNAL',
           rerank: opts.rerank ?? true,
           top_n: opts.top_n ?? 8,
+          agent_mode: opts.agent_mode ?? null,
         }),
         signal: controller.signal,
       })
@@ -516,7 +571,32 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
                 evt.model ?? '',
                 evt.citations ?? [],
                 !!evt.truncated_by_security,
+                {
+                  conversation_id: evt.conversation_id,
+                  model: evt.model ?? '',
+                  intent: evt.intent ?? null,
+                  intent_label: evt.intent_label ?? null,
+                  agent_mode: evt.agent_mode,
+                  no_result: !!evt.no_result,
+                  disclaimer: !!evt.disclaimer,
+                  truncated_by_security: !!evt.truncated_by_security,
+                  citations: evt.citations ?? [],
+                },
               )
+              break
+            case 'plan':
+              // 复杂任务计划：步骤列表（老客户端无此分支，自动忽略，向前兼容）
+              handlers.onPlan?.((evt.steps ?? []).map((s: any) => ({
+                id: s.id, action: s.action, query: s.query, status: s.status ?? 'pending',
+              })))
+              break
+            case 'step_start':
+              handlers.onStepStart?.({
+                id: evt.id, action: evt.action, query: evt.query, status: 'running',
+              })
+              break
+            case 'step_end':
+              handlers.onStepEnd?.(evt.id ?? '', !!evt.ok, evt.summary ?? '')
               break
             case 'token':
               handlers.onToken?.(evt.text ?? '')
@@ -530,6 +610,11 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
                 evt.sensitive_hits ?? [],
                 evt.model ?? '',
                 evt.conversation_id ?? '',
+                {
+                  intent: evt.intent ?? null,
+                  no_result: !!evt.no_result,
+                  disclaimer: !!evt.disclaimer,
+                },
               )
               break
             case 'error':

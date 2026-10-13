@@ -5,13 +5,33 @@ from __future__ import annotations
 from app.schemas.contracts import Citation, GenerateRequest
 
 
-def build_generation_messages(req: GenerateRequest, citations: list[Citation]) -> list[dict]:
-    system = (
-        "你是企业公文辅助写作引擎。请基于【检索材料】回答，并遵守：\n"
-        "1. 所有事实性陈述必须标注引用，格式 [n] 对应材料序号；\n"
-        "2. 检索材料未覆盖的内容，必须明确说明'依据不足，建议核实'，不得编造；\n"
-        "3. 用语符合公文规范，结构清晰。\n"
-    )
+def build_generation_messages(
+    req: GenerateRequest, citations: list[Citation], no_materials: bool = False
+) -> list[dict]:
+    """构造公文起草 messages。
+
+    Args:
+        req: 起草请求（query / template_doc_type）。
+        citations: 检索引用材料。
+        no_materials: 未检索到材料时的"自身能力起草"模式——提示词切换为
+            通用写作能力指令，并明确不得虚构知识库依据（答案由调用方追加
+            甄别声明，见 agent.policies.TASK_DISCLAIMER）。
+    """
+    if no_materials:
+        system = (
+            "你是企业公文辅助写作引擎。本次未检索到知识库参考材料，请基于你的"
+            "通用公文写作能力完成起草，并遵守：\n"
+            "1. 不得声称引用了知识库文档、内部规定或具体文号（没有材料可引）；\n"
+            "2. 涉及具体数据、时限、责任人等处使用占位符或说明'需按实际情况填写'；\n"
+            "3. 用语符合公文规范，结构清晰。\n"
+        )
+    else:
+        system = (
+            "你是企业公文辅助写作引擎。请基于【检索材料】回答，并遵守：\n"
+            "1. 所有事实性陈述必须标注引用，格式 [n] 对应材料序号；\n"
+            "2. 检索材料未覆盖的内容，必须明确说明'依据不足，建议核实'，不得编造；\n"
+            "3. 用语符合公文规范，结构清晰。\n"
+        )
     if req.template_doc_type:
         system += f"4. 按「{req.template_doc_type}」文种格式起草。\n"
 

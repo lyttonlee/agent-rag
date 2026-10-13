@@ -9,6 +9,7 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
+import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import {
   caller,
   getConversation,
@@ -31,6 +32,16 @@ const elapsed = ref(0)
 let timer: number | null = null
 let controller: AbortController | null = null
 let startedAt = 0
+
+// ---- Agent 状态（意图识别 + 无材料兜底甄别声明）----
+const intentLabel = ref('')
+const intentKey = ref('')
+const noResult = ref(false)
+const disclaimer = ref(false)
+/** 有 Agent 信息时展示面板（流式中 / 结束后保留到下次起草） */
+const showAgentPanel = computed(
+  () => loading.value || !!intentLabel.value || noResult.value || disclaimer.value,
+)
 
 // ---- 会话（多轮修改）----
 const sidebar = ref<InstanceType<typeof ConversationSidebar> | null>(null)
@@ -97,6 +108,11 @@ async function generate() {
   citations.value = []
   hits.value = []
   showReasoning.value = false
+  // 重置本轮 Agent 展示状态
+  intentLabel.value = ''
+  intentKey.value = ''
+  noResult.value = false
+  disclaimer.value = false
   startTimer()
 
   controller = streamGenerate(
@@ -109,12 +125,18 @@ async function generate() {
       rerank: false,
     },
     {
-      onMeta: (model, cits, _truncated, conversationId) => {
+      onMeta: (model, cits, _truncated, conversationId, meta) => {
         modelName.value = model
         citations.value = cits
         // 首轮：后端自动创建起草会话并回传 ID，后续修改轮次复用
         if (conversationId && conversationId !== activeId.value) {
           activeId.value = conversationId
+        }
+        // Agent 意图信息（老后端无此字段时保持空）
+        if (meta) {
+          intentLabel.value = meta.intent_label || ''
+          intentKey.value = meta.intent || ''
+          noResult.value = !!meta.no_result
         }
       },
       onReasoning: (text) => {
@@ -127,10 +149,15 @@ async function generate() {
         // 正文开始输出后收起思考链，保持文稿区整洁
         showReasoning.value = false
       },
-      onDone: (finalAnswer, sensitiveHits) => {
+      onDone: (finalAnswer, sensitiveHits, _model, extra) => {
         // 以服务端脱敏后的完整答案为准（流式片段未脱敏）
         answer.value = finalAnswer
         hits.value = sensitiveHits
+        if (extra) {
+          disclaimer.value = !!extra.disclaimer
+          noResult.value = !!extra.no_result
+          if (extra.intent && !intentKey.value) intentKey.value = extra.intent
+        }
         loading.value = false
         stopTimer()
         // 落库完成：刷新会话历史（meta 事件已回传 conversation_id 到 activeId）
@@ -231,6 +258,17 @@ async function exportDocx() {
       </div>
       <div v-if="showReasoning && reasoning" class="reasoning">{{ reasoning }}<span v-if="loading" class="cursor" /></div>
 
+      <!-- Agent 执行过程（意图 + 无材料兜底提示；单步起草无拆解步骤） -->
+      <AgentStepPanel
+        v-if="showAgentPanel"
+        :intent="intentKey"
+        :intent-label="intentLabel"
+        :steps="[]"
+        :loading="loading"
+        :no-result="noResult"
+        :disclaimer="disclaimer"
+      />
+
       <div class="paper panel">
         <div class="red">{{ docType }}</div>
         <p class="body">{{ answer || '在上方输入主题并点击「起草」，系统将基于知识库检索材料生成带引用的公文草稿，正文实时流式输出。在同一会话中继续输入修改意见即可多轮完善。' }}<span v-if="loading" class="cursor" /></p>
@@ -239,6 +277,7 @@ async function exportDocx() {
           <div v-for="(c, i) in citations" :key="c.chunk_id">[{{ i + 1 }}] 《{{ c.title }}》</div>
         </div>
         <div v-if="hits.length" class="warn-chip">敏感词命中：{{ hits.join('、') }}（已脱敏）</div>
+        <div v-if="disclaimer" class="warn-chip">提示：本次未检索到参考材料，文稿由 AI 通用能力生成，请自行甄别后使用</div>
       </div>
 
       <!-- 历史轮次（当前会话的往轮问答，只读时间线） -->

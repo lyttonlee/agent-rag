@@ -8,7 +8,7 @@ import {
   type ConfigItem,
 } from '@/api/client'
 
-/** 配置中心四大类：每类都是"明确的项目"，用户填写结构化字段，不接触 JSON。 */
+/** 配置中心分类：每类都是"明确的项目"，用户填写结构化字段，不接触 JSON。 */
 const TABS = [
   {
     cat: 'sensitive_word',
@@ -30,7 +30,21 @@ const TABS = [
     name: '自定义词典',
     desc: '机构/人名/术语的标准化映射，用于检索与生成时的用语统一。',
   },
+  {
+    cat: 'agent',
+    name: 'Agent 设置',
+    desc: '智能体（Agent）运行参数：总开关、LLM 意图分类兜底、复杂任务步骤上限。关闭总开关后，问答与起草完全走原直答链路。',
+  },
 ] as const
+
+/** Agent 配置项（与后端 app/services/agent/config.py 的键一一对应） */
+const AGENT_DEFAULTS = {
+  enabled: true,
+  llm_classify: true,
+  llm_classify_timeout_ms: 3000,
+  max_steps: 6,
+}
+const agentForm = reactive({ ...AGENT_DEFAULTS })
 
 const active = ref<string>('sensitive_word')
 const rows = ref<ConfigItem[]>([])
@@ -70,6 +84,7 @@ async function load() {
   loading.value = true
   try {
     rows.value = await getConfigItems(active.value)
+    if (active.value === 'agent') fillAgentForm()
   } catch {
     rows.value = []
   } finally {
@@ -78,7 +93,53 @@ async function load() {
 }
 onMounted(load)
 
+/** 行 → Agent 表单（缺项用默认值；is_active=false 视为未配置） */
+function fillAgentForm() {
+  Object.assign(agentForm, AGENT_DEFAULTS)
+  for (const row of rows.value) {
+    if (!row.is_active) continue
+    const v = (row.value as Record<string, any>)?.value
+    if (row.key in agentForm && v !== undefined && v !== null) {
+      ;(agentForm as Record<string, any>)[row.key] = v
+    }
+  }
+}
+
+/** 保存 Agent 配置（逐项写入，保存即生效） */
+async function saveAgent() {
+  try {
+    for (const key of Object.keys(AGENT_DEFAULTS) as (keyof typeof AGENT_DEFAULTS)[]) {
+      await saveConfigItem({
+        category: 'agent',
+        key,
+        value: { value: agentForm[key] },
+        scope: null,
+        is_active: true,
+      })
+    }
+    ElMessage.success('Agent 配置已保存，即时生效')
+    load()
+  } catch (e: any) {
+    ElMessage.error('保存失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
+/** 恢复代码默认值（删除配置项，后端回落默认） */
+async function resetAgent() {
+  try {
+    for (const key of Object.keys(AGENT_DEFAULTS)) {
+      await deleteConfigItem('agent', key).catch(() => undefined)
+    }
+    ElMessage.success('已恢复默认设置')
+    load()
+  } catch (e: any) {
+    ElMessage.error('重置失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
 function openAdd() {
+  // Agent 设置为开关表单（非条目表），不走新增对话框
+  if (active.value === 'agent') return
   Object.assign(form, emptyForms())
   editing.value = false
   dialog.value = true
@@ -182,7 +243,44 @@ function currentDesc() {
 
     <el-alert :title="currentDesc()" type="info" show-icon :closable="false" class="tip" />
 
-    <div class="bar">
+    <!-- Agent 设置：开关表单（非条目表），保存即生效 -->
+    <div v-if="active === 'agent'" class="agent-settings panel" v-loading="loading">
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">Agent 总开关</div>
+          <div class="agent-sub">开启后，问答与起草先做意图路由再分发策略（复杂任务分步执行、过程可见）；关闭后完全走原直答链路</div>
+        </div>
+        <el-switch v-model="agentForm.enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">LLM 意图分类兜底</div>
+          <div class="agent-sub">规则通道无法判断意图时，用生成模型做一次轻量分类（3 秒超时）；关闭后未命中规则一律按「确切回答」处理</div>
+        </div>
+        <el-switch v-model="agentForm.llm_classify" :disabled="!agentForm.enabled" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">LLM 分类超时（毫秒）</div>
+          <div class="agent-sub">超时未返回则放弃分类，按「确切回答」处理，保证问答可用</div>
+        </div>
+        <el-input-number v-model="agentForm.llm_classify_timeout_ms" :min="500" :max="30000" :step="500" :disabled="!agentForm.enabled || !agentForm.llm_classify" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">复杂任务步骤上限</div>
+          <div class="agent-sub">单次复杂任务最多拆解为几步（超出限制的任务直接综合直答）</div>
+        </div>
+        <el-input-number v-model="agentForm.max_steps" :min="1" :max="12" :disabled="!agentForm.enabled" />
+      </div>
+      <div class="agent-actions">
+        <el-button type="primary" size="small" @click="saveAgent">保存设置</el-button>
+        <el-button size="small" @click="resetAgent">恢复默认</el-button>
+        <span class="text-muted">修改即时生效，无需重启</span>
+      </div>
+    </div>
+
+    <div v-if="active !== 'agent'" class="bar">
       <el-button type="primary" size="small" @click="openAdd">
         + 新增{{ active === 'sensitive_word' ? '敏感词' : active === 'format_adapter' ? '适配器' : active === 'model_profile' ? 'Profile' : '词条' }}
       </el-button>
@@ -263,7 +361,7 @@ function currentDesc() {
     </el-table>
 
     <!-- 自定义词典表 -->
-    <el-table v-else :data="rows" v-loading="loading" empty-text="暂无词条">
+    <el-table v-else-if="active === 'dict_custom'" :data="rows" v-loading="loading" empty-text="暂无词条">
       <el-table-column prop="key" label="词条" min-width="180" />
       <el-table-column label="标准映射" min-width="260">
         <template #default="{ row }">{{ (row.value as any).mapping || '—' }}</template>
@@ -353,4 +451,17 @@ function currentDesc() {
 .st { color: var(--text-muted); font-size: 12px; }
 .st.ok { color: var(--c-success); }
 .mono { font-family: var(--font-mono, monospace); font-size: 12px; }
+
+/* Agent 设置卡片 */
+.agent-settings { padding: 8px 18px 14px; margin-bottom: 14px; }
+.agent-row {
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px 0; border-bottom: 1px solid var(--line);
+}
+.agent-row:last-of-type { border-bottom: none; }
+.agent-info { flex: 1; min-width: 0; }
+.agent-name { color: var(--text-strong); font-size: 14px; font-weight: 600; }
+.agent-sub { color: var(--text-faint); font-size: 12px; line-height: 1.6; margin-top: 2px; }
+.agent-actions { display: flex; align-items: center; gap: 10px; padding-top: 12px; }
+.agent-actions .text-muted { font-size: 12px; }
 </style>

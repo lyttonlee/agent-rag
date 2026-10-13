@@ -178,6 +178,8 @@ class RetrieveResp(BaseModel):
     citations: list[Citation]
     total_matched: int
     truncated_by_security: bool = False   # 是否存在因密级/权限被过滤的结果
+    top_vector_distance: float | None = None  # 向量路 top1 余弦距离（"无有用信息"判定信号）
+    keyword_hits: int = 0                 # 关键词路命中数（"无有用信息"判定信号）
 
 
 # ---- 推理生成 ----
@@ -194,6 +196,9 @@ class GenerateRequest(BaseModel):
     )
     rerank: bool = Field(
         False, description="生成链路是否启用重排；起草场景默认关闭（重排端点慢时避免久等，检索问答默认开启）"
+    )
+    agent_mode: bool | None = Field(
+        None, description="Agent 模式：意图路由 + 分步执行；缺省走配置中心开关（默认开启），false 强制回退纯直答"
     )
     stream: bool = False
 
@@ -274,6 +279,9 @@ class ChatRequest(BaseModel):
     max_clearance: SecurityLevel = "INTERNAL"
     top_n: int | None = 8
     rerank: bool = Field(True, description="问答链路默认启用重排（提升引用质量）")
+    agent_mode: bool | None = Field(
+        None, description="Agent 模式：意图路由 + 分步执行；缺省走配置中心开关（默认开启），false 强制回退纯直答"
+    )
     sensitive_words: list[str] | None = None
 
 

@@ -32,7 +32,7 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import AsyncSessionLocal, engine
-from app.services.audit import record_audit
+from app.services.audit import actor_from_request, record_audit
 from app.services.ingestion import reconcile_stuck_jobs
 from app.api.routes.spaces import ensure_default_space
 from app.api.routes.templates import ensure_seed_templates
@@ -51,11 +51,6 @@ def _client_ip(request: Request) -> str | None:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else None
-
-
-def _actor(request: Request) -> str:
-    """操作者身份：信任上游网关下发的 X-Operator / X-User-Id，缺省 anonymous。"""
-    return request.headers.get("X-Operator") or request.headers.get("X-User-Id") or "anonymous"
 
 
 @asynccontextmanager
@@ -114,7 +109,7 @@ async def audit_middleware(request: Request, call_next):
 
     try:
         await record_audit(
-            actor=_actor(request),
+            actor=actor_from_request(request),
             actor_ip=_client_ip(request),
             method=request.method,
             endpoint=path,

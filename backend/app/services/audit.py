@@ -14,6 +14,7 @@ import logging
 import re
 import uuid
 
+from fastapi import Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,15 @@ from app.db.models import AuditLog
 from app.db.session import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
+
+
+def actor_from_request(request: Request) -> str:
+    """操作者身份：信任上游网关下发的 X-Operator / X-User-Id，缺省 anonymous。
+
+    提取逻辑从 main.py 中间件下沉至此：服务层（如 Agent 意图识别留痕）
+    需要同一套身份语义，避免两处定义漂移。
+    """
+    return request.headers.get("X-Operator") or request.headers.get("X-User-Id") or "anonymous"
 
 # 路由 → 语义动作 / 客体类型 的映射（正则按前缀匹配）
 _PATH_RULES: list[tuple[re.Pattern[str], str, str | None]] = [
@@ -87,17 +97,24 @@ async def record_audit(
     subject_id: str | None = None,
     object_type: str | None = None,
     object_id: str | None = None,
+    action: str | None = None,
     result: str | None = None,
     detail: str = "",
 ) -> None:
-    """写入一条审计日志（失败仅记录日志，不影响主流程）。"""
+    """写入一条审计日志（失败仅记录日志，不影响主流程）。
+
+    action 可显式指定（如 Agent 的「意图识别」「任务计划」）——
+    这类语义动作无法从 URL 推断，由调用方按业务语义传入；
+    缺省时仍按路径规则自动分类。
+    """
     try:
-        if object_type is None or object_id is None:
-            action, guessed_obj = _classify(endpoint or "", method)
-            object_type = object_type or guessed_obj
-            object_id = object_id or _extract_object_id(endpoint or "")
-        else:
-            action, _ = _classify(endpoint or "", method)
+        if action is None:
+            if object_type is None or object_id is None:
+                action, guessed_obj = _classify(endpoint or "", method)
+                object_type = object_type or guessed_obj
+                object_id = object_id or _extract_object_id(endpoint or "")
+            else:
+                action, _ = _classify(endpoint or "", method)
         if result is None:
             result = "success" if 200 <= status_code < 400 else "failure"
         log = AuditLog(
