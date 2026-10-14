@@ -279,12 +279,16 @@ _PROVIDER: StorageProvider | None = None
 
 
 def get_storage() -> StorageProvider:
-    """返回进程内单例存储后端（按 settings.storage_provider 切换）。"""
+    """返回进程内单例存储后端（按 settings.storage_provider 切换）。
+
+    `s3` 与 `SeaweedFS` 等价，均走 S3Storage 后端（指向任意 S3 兼容端点，
+    含 SeaweedFS / Ceph RGW / 国产对象存储）；其余值（含默认 `local`）走本地文件系统。
+    """
     global _PROVIDER
     if _PROVIDER is not None:
         return _PROVIDER
-    kind: Literal["local", "s3"] = _settings.storage_provider
-    if kind == "s3":
+    kind: Literal["local", "s3", "SeaweedFS"] = _settings.storage_provider
+    if kind in ("s3", "SeaweedFS"):
         _PROVIDER = S3Storage(
             endpoint=_settings.storage_s3_endpoint,
             bucket=_settings.storage_s3_bucket,
@@ -302,11 +306,12 @@ def get_storage() -> StorageProvider:
 def storage_info() -> dict:
     """当前存储后端摘要（健康检查/启动日志用，不做网络探测）。
 
-    返回：{"provider": "local|s3", "ok": bool, "detail": {...}}
-    ok 为 ping() 结果（local 探根目录可写；s3 探 head_bucket）。
+    返回：{"provider": "local|s3|SeaweedFS", "ok": bool, "detail": {...}}
+    ok 为 ping() 结果（local 探根目录可写；s3/SeaweedFS 探 head_bucket）。
+    provider 字段原样回显配置值（"s3" 与 "SeaweedFS" 均表示 S3 兼容后端）。
     """
     kind = _settings.storage_provider
-    if kind == "s3":
+    if kind in ("s3", "SeaweedFS"):
         detail = {
             "endpoint": _settings.storage_s3_endpoint,
             "bucket": _settings.storage_s3_bucket,

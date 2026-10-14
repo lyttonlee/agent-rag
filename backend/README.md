@@ -23,9 +23,9 @@
 |---|---|---|---|
 | 基础 | `APP_NAME` / `APP_VERSION` / `ENVIRONMENT` / `LOG_LEVEL` | `GovDoc-RAG` / `1.2.0` / `dev` / `INFO` | 应用元信息；`ENVIRONMENT=production` 触发云端 Provider 启动自检拒绝 |
 | PostgreSQL | `PG_HOST` / `PG_PORT` / `PG_USER` / `PG_PASSWORD` / `PG_DATABASE` | `127.0.0.1` / `5432` / `rag` / `rag123456` / `gov_doc_rag` | 数据库连接；含 pgvector + zhparser |
-| 存储（抽象层） | `STORAGE_PROVIDER` | `local` | `local` 或 `s3` |
+| 存储（抽象层） | `STORAGE_PROVIDER` | `local` | `local` 或 `s3`（二者等价，均走 S3Storage 后端，可指向 SeaweedFS/Ceph RGW/国产对象存储） |
 | | `STORAGE_ROOT` | `./data/gov-doc` | `local` 模式根目录 |
-| | `STORAGE_S3_ENDPOINT` / `STORAGE_S3_BUCKET` / `STORAGE_S3_ACCESS_KEY` / `STORAGE_S3_SECRET_KEY` / `STORAGE_S3_REGION` / `STORAGE_S3_SECURE` | `127.0.0.1:8333` / `gov-doc` / `admin` / `admin123` / `us-east-1` / `false` | 仅 `s3` 模式使用 |
+| | `STORAGE_S3_ENDPOINT` / `STORAGE_S3_BUCKET` / `STORAGE_S3_ACCESS_KEY` / `STORAGE_S3_SECRET_KEY` / `STORAGE_S3_REGION` / `STORAGE_S3_SECURE` | `127.0.0.1:8333` / `gov-doc` / `admin` / `admin123` / `us-east-1` / `false` | 仅 `s3` / `SeaweedFS` 模式使用 |
 | 模型·生成 | `MODEL_GEN_BASE_URL` / `MODEL_GEN_API_KEY` / `MODEL_GEN_NAME` | `http://127.0.0.1:8000/v1` / `EMPTY` / `qwen3-32b-instruct` | OpenAI 兼容 chat 端点 |
 | 模型·向量 | `MODEL_EMB_BASE_URL` / `MODEL_EMB_API_KEY` / `MODEL_EMB_NAME` / `EMBEDDING_DIM` | `http://127.0.0.1:8001/v1` / `EMPTY` / `qwen3-embedding-4b` / `1024` | 离线 Embedding |
 | 模型·重排 | `MODEL_RERANK_BASE_URL` / `MODEL_RERANK_API_KEY` / `MODEL_RERANK_NAME` | `http://127.0.0.1:8002/v1` / `EMPTY` / `qwen3-reranker-0.6b` | 在线 Rerank |

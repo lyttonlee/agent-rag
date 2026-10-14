@@ -54,8 +54,10 @@ class Settings(BaseSettings):
 
     # ---- 对象存储（抽象层：local 本地文件系统 / s3 兼容 SeaweedFS 等）----
     # 默认 local：零镜像、零协议风险，适合本项目 20 万文档 / ~44GB 规模。
-    # s3 模式可指向 SeaweedFS（Apache 2.0）/ Ceph RGW / 国产私有化对象存储。
-    storage_provider: Literal["local", "s3"] = "local"
+    # s3 模式可指向 SeaweedFS（Apache 2.0）/ Ceph RGW / 国产私有化对象存储；
+    # 为兼容「按厂商命名」的直觉，STORAGE_PROVIDER 同时接受 "s3" 与 "SeaweedFS"
+    # （二者等价，均走 S3Storage 后端，唯一区别是语义标签）。
+    storage_provider: Literal["local", "s3", "SeaweedFS"] = "local"
     storage_root: str = "./data/gov-doc"               # local 模式根目录
     # s3 模式（可选）
     storage_s3_endpoint: str = "127.0.0.1:8333"
