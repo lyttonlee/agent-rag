@@ -259,6 +259,7 @@ export interface Conversation {
   id: string
   title: string
   conv_type: ConvType
+  doc_type: string | null
   space_ids: string[]
   message_count: number
   last_message_at: string | null
@@ -281,6 +282,7 @@ export interface ConversationMessage {
 }
 
 export interface ConversationDetail extends Conversation {
+  doc_type: string | null
   messages: ConversationMessage[]
 }
 
@@ -497,6 +499,7 @@ export interface StreamHandlers {
 export interface StreamGenerateOpts {
   query: string
   template_doc_type?: string
+  template_code?: string
   conversation_id?: string
   space_ids?: string[]
   caller_scope?: string[]
@@ -525,6 +528,7 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
         body: JSON.stringify({
           query: opts.query,
           template_doc_type: opts.template_doc_type,
+          template_code: opts.template_code ?? null,
           conversation_id: opts.conversation_id,
           space_ids: opts.space_ids ?? null,
           caller_scope: opts.caller_scope ?? [],
@@ -814,8 +818,10 @@ export interface TemplateLayout {
 }
 
 export interface TemplateItem {
+  /** 模板唯一编码（同一文种可有多条，code 不同） */
   key: string
   value: {
+    doc_type: string
     name: string
     layout: TemplateLayout
     content_ref?: string | null
@@ -840,19 +846,19 @@ export async function uploadTemplate(
 }
 
 export async function saveTemplate(
-  docType: string,
-  value: { name: string; layout: TemplateLayout },
+  code: string,
+  value: { doc_type: string; name: string; layout: TemplateLayout },
 ): Promise<TemplateItem> {
   const r = await client.post<TemplateItem>('/templates', {
     category: 'template',
-    key: docType,
+    key: code,
     value,
   })
   return r.data
 }
 
-export async function deleteTemplate(docType: string): Promise<void> {
-  await client.delete(`/templates/${encodeURIComponent(docType)}`)
+export async function deleteTemplate(code: string): Promise<void> {
+  await client.delete(`/templates/${encodeURIComponent(code)}`)
 }
 
 export async function seedTemplates(): Promise<{ added: number; message: string }> {
@@ -860,14 +866,14 @@ export async function seedTemplates(): Promise<{ added: number; message: string 
   return r.data
 }
 
-export async function downloadTemplate(docType: string): Promise<void> {
-  const r = await client.get(`/templates/${encodeURIComponent(docType)}/file`, {
+export async function downloadTemplate(code: string): Promise<void> {
+  const r = await client.get(`/templates/${encodeURIComponent(code)}/file`, {
     responseType: 'blob',
   })
   const url = URL.createObjectURL(r.data as Blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${docType}_template`
+  a.download = `${code}_template`
   a.click()
   URL.revokeObjectURL(url)
 }

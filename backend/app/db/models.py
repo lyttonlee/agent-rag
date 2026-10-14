@@ -164,14 +164,21 @@ class Chunk(Base, TimestampMixin):
 
 
 class Template(Base, TimestampMixin):
-    """文种模板库（我方维护，第三方可导入样式）。"""
+    """文种模板库（我方维护，第三方可导入样式）。
+
+    支持同一文种配置多个模板（如多类「通知」），通过 code 唯一标识；
+    doc_type 退化为文种分类（非唯一），起草时用户先选文种、再选具体模板。
+    """
 
     __tablename__ = "templates"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    doc_type: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # 文种分类（非唯一：同一文种可挂多个模板，如「会议通知」「放假通知」）
+    doc_type: Mapped[str] = mapped_column(String(64), index=True)
+    # 模板唯一编码（起草时按 code 精确定位某一具体模板；种子模板 code 与 doc_type 同名）
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(128))
-    # 版式 / 字体 / 落款等结构化模板（JSON 描述，渲染导出时使用）
+    # 版式 / 字体 / 落款等结构化模板（JSON 描述，起草参考与导出时使用）
     layout: Mapped[dict] = mapped_column(JSON, default=dict)
     content_ref: Mapped[str | None] = mapped_column(String(512))   # 模板样例文件
     is_active: Mapped[bool] = mapped_column(default=True)
@@ -275,6 +282,8 @@ class Conversation(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     title: Mapped[str] = mapped_column(String(256), default="新会话")
     conv_type: Mapped[str] = mapped_column(String(16), default="chat", index=True)  # chat/draft
+    # 起草会话绑定的文种（draft 类型才有意义；历史还原时回显用）
+    doc_type: Mapped[str | None] = mapped_column(String(64), index=True, default=None)
     # 会话绑定的知识空间（多选）；空列表 = 不限空间（受密级/权限约束）
     space_ids: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
     message_count: Mapped[int] = mapped_column(Integer, default=0)

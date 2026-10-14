@@ -204,7 +204,8 @@ class GenerateRequest(BaseModel):
     space_ids: list[str] | None = Field(None, description="限定检索的文档空间（多选）；缺省不限空间")
     caller_scope: list[str] = Field(default_factory=list)
     max_clearance: SecurityLevel = "INTERNAL"
-    template_doc_type: str | None = None  # 按文种模板起草
+    template_doc_type: str | None = None  # 按文种模板起草（文种分类）
+    template_code: str | None = None  # 具体模板编码（同一文种可配置多模板，精确选择某一类）
     conversation_id: str | None = Field(None, description="所属会话（公文起草多轮修改）；缺省自动创建")
     sensitive_words: list[str] | None = Field(
         None, description="请求级敏感词覆盖；缺省用配置中心词库"
@@ -275,6 +276,8 @@ class ConversationResp(BaseModel):
     id: str
     title: str
     conv_type: str
+    # 起草会话绑定的文种（draft 类型才有意义；历史还原时回显用）
+    doc_type: str | None = None
     space_ids: list[str] = Field(default_factory=list)
     message_count: int = 0
     last_message_at: datetime | None = None

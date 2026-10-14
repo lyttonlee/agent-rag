@@ -19,12 +19,17 @@ async def create_conversation(
     conv_type: str = "chat",
     title: str | None = None,
     space_ids: list[str] | None = None,
+    doc_type: str | None = None,
 ) -> Conversation:
-    """创建会话（标题缺省取"新会话"，首条消息到达时可再更新）。"""
+    """创建会话（标题缺省取"新会话"，首条消息到达时可再更新）。
+
+    draft 会话可绑定 doc_type（文种），用于历史还原时回显正确的文种与模板。
+    """
     row = Conversation(
         title=title or "新会话",
         conv_type=conv_type,
         space_ids=space_ids or [],
+        doc_type=doc_type,
         message_count=0,
     )
     db.add(row)

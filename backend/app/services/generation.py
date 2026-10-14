@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import redact_sensitive
-from app.db.models import ConfigKV, Conversation
+from app.db.models import ConfigKV, Conversation, Template
 from app.schemas.contracts import Citation, GenerateRequest
 from app.services import conversation as conv_service
 from app.services.agent import (
@@ -64,8 +64,13 @@ async def _resolve_sensitive_words(db: AsyncSession, req: GenerateRequest) -> li
     return [w for w in rows if w]
 
 
-async def _ensure_draft_conversation(db: AsyncSession, req: GenerateRequest) -> str | None:
-    """确保起草会话存在（缺省创建）；返回会话 ID（无会话诉求时 None）。"""
+async def _ensure_draft_conversation(
+    db: AsyncSession, req: GenerateRequest, doc_type: str | None = None
+) -> str | None:
+    """确保起草会话存在（缺省创建）；返回会话 ID（无会话诉求时 None）。
+
+    doc_type 仅 draft 会话有意义，随会话落库，供历史还原时回显文种。
+    """
     if not req.conversation_id:
         return None
     conv = (
@@ -74,8 +79,38 @@ async def _ensure_draft_conversation(db: AsyncSession, req: GenerateRequest) -> 
     if conv:
         return conv.id
     logger.warning("起草会话 %s 不存在，自动创建", req.conversation_id)
-    row = await conv_service.create_conversation(db, conv_type="draft")
+    row = await conv_service.create_conversation(db, conv_type="draft", doc_type=doc_type)
     return row.id
+
+
+async def _resolve_template(db: AsyncSession, req: GenerateRequest) -> tuple[str | None, str | None]:
+    """解析起草模板：优先 template_code 精确定位，否则按 doc_type 取首个启用模板。
+
+    返回 (doc_type, name)；均未命中时回退 (req.template_doc_type, None)。
+    同文种可配置多模板（如多类「通知」），用户选定具体模板后 code 精确命中，
+    使文种指令带出"模板：XXX"，生成更贴合所选模板。
+    """
+    if req.template_code:
+        row = (
+            await db.execute(
+                select(Template).where(
+                    Template.code == req.template_code, Template.is_active.is_(True)
+                )
+            )
+        ).scalar_one_or_none()
+        if row:
+            return row.doc_type, row.name
+    if req.template_doc_type:
+        row = (
+            await db.execute(
+                select(Template)
+                .where(Template.doc_type == req.template_doc_type, Template.is_active.is_(True))
+                .order_by(Template.created_at)
+            )
+        ).scalars().first()
+        if row:
+            return row.doc_type, row.name
+    return req.template_doc_type, None
 
 
 async def generate_answer(db: AsyncSession, req: GenerateRequest) -> dict:
@@ -91,9 +126,14 @@ async def generate_answer(db: AsyncSession, req: GenerateRequest) -> dict:
     templates = await load_prompt_templates(db)
     no_materials = is_no_useful_info(retrieve_resp, cfg.vec_distance_threshold)
 
+    # 解析起草模板（code 优先 / doc_type 兜底），把文种与模板名注入提示词
+    resolved_doc_type, template_name = await _resolve_template(db, req)
+    req.template_doc_type = resolved_doc_type
+
     gen = ModelProvider(role="gen")
     messages = build_generation_messages(
-        req, citations, no_materials=no_materials, templates=templates
+        req, citations, no_materials=no_materials, templates=templates,
+        template_name=template_name,
     )
     raw = await gen.generate(messages)
     if no_materials:
@@ -132,8 +172,13 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
     Agent（P1）：意图识别结果进 meta/审计；未检索到材料时切换自身能力
     起草并追加甄别声明（disclaimer）。
     """
+    # 解析起草模板（code 优先 / doc_type 兜底）：拿到文种与模板名，供文种指令
+    # 与（draft 会话）文种落库回显使用。需在建会话前完成，以便把 doc_type 写入会话。
+    resolved_doc_type, template_name = await _resolve_template(db, req)
+    req.template_doc_type = resolved_doc_type
+
     # 会话收敛：无 conversation_id 时不建会话（保持旧行为兼容）
-    conversation_id = await _ensure_draft_conversation(db, req)
+    conversation_id = await _ensure_draft_conversation(db, req, doc_type=resolved_doc_type)
     if conversation_id:
         await conv_service.append_message(db, conversation_id, "user", req.query)
 
@@ -215,7 +260,8 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
         disclaimer = no_materials  # 无材料兜底：答案需追加甄别声明
         gen = ModelProvider(role="gen")
         messages = build_generation_messages(
-            req, citations, no_materials=no_materials, templates=templates
+            req, citations, no_materials=no_materials, templates=templates,
+            template_name=template_name,
         )
 
         # 2) 先回传检索元数据，前端可立即渲染"参考材料"与意图标签

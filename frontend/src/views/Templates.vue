@@ -114,8 +114,13 @@ function removeSection(i: number) {
 }
 
 async function submitEditor() {
-  const name = rows.value.find((r) => r.key === editingKey.value)?.value.name || editingKey.value
+  // 保存版式时回传 doc_type（文种分类），code 保持编辑中的模板编码不变，
+  // 从而支持同一文种配置多个模板（如多类「通知」各自独立编码）。
+  const row = rows.value.find((r) => r.key === editingKey.value)
+  const docTypeForSave = row?.value.doc_type || editingKey.value
+  const name = row?.value.name || editingKey.value
   await saveTemplate(editingKey.value, {
+    doc_type: docTypeForSave,
     name,
     layout: JSON.parse(JSON.stringify(layout)),
   })
@@ -151,7 +156,8 @@ async function download(row: TemplateItem) {
     </div>
 
     <el-table :data="rows" v-loading="loading" empty-text="暂无模板，点击「初始化标准模板」或「上传模板文件」">
-      <el-table-column prop="key" label="文种" width="100" />
+      <el-table-column prop="value.doc_type" label="文种" width="100" />
+      <el-table-column prop="key" label="模板编码" width="180" show-overflow-tooltip />
       <el-table-column prop="value.name" label="名称" min-width="200" show-overflow-tooltip />
       <el-table-column label="来源" width="110">
         <template #default="{ row }">
@@ -207,7 +213,7 @@ async function download(row: TemplateItem) {
   </el-dialog>
 
   <!-- 可视化版式编辑对话框 -->
-  <el-dialog v-model="editorDialog" :title="`编辑版式：${editingKey}`" width="640px">
+  <el-dialog v-model="editorDialog" :title="`编辑版式：${rows.find((r) => r.key === editingKey)?.value.name || editingKey}`" width="640px">
     <el-form :model="layout" label-width="92px">
       <el-form-item label="红头">
         <el-switch v-model="layout.red_head" />

@@ -13,6 +13,7 @@ const routes = [
   { path: '/draft', name: 'draft', component: () => import('@/views/Draft.vue'), meta: { title: '智能起草' } },
   { path: '/templates', name: 'templates', component: () => import('@/views/Templates.vue'), meta: { title: '模板库' } },
   { path: '/auth', name: 'auth', component: () => import('@/views/AuthManager.vue'), meta: { title: '认证管理' } },
+  { path: '/client-register', name: 'client-register', component: () => import('@/views/ClientRegister.vue'), meta: { title: '应用注册' } },
   { path: '/config', name: 'config', component: () => import('@/views/Config.vue'), meta: { title: '配置中心' } },
   { path: '/audit', name: 'audit', component: () => import('@/views/AuditLog.vue'), meta: { title: '审计日志' } },
   { path: '/ops', name: 'ops', component: () => import('@/views/Ops.vue'), meta: { title: '运维台' } },

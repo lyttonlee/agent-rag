@@ -200,13 +200,20 @@ def _extract_layout(text: str) -> dict:
 
 
 async def ensure_seed_templates() -> int:
-    """启动种子：若模板库为空，写入 8 类标准公文模板。返回新增数量。"""
+    """启动种子：若模板库为空，写入 8 类标准公文模板。返回新增数量。
+
+    种子模板的 code 与 doc_type 同名（如「通知」），作为该文种的默认模板；
+    后续可在「模板库」页为同一文种增配多个模板（code 不同）。
+    """
     async with AsyncSessionLocal() as db:
         existing = (await db.execute(select(Template))).scalars().all()
         if existing:
             return 0
         for t in _SEED_TEMPLATES:
-            db.add(Template(doc_type=t["doc_type"], name=t["name"], layout=t["layout"], is_active=True))
+            db.add(Template(
+                doc_type=t["doc_type"], code=t["doc_type"], name=t["name"],
+                layout=t["layout"], is_active=True,
+            ))
         await db.commit()
         return len(_SEED_TEMPLATES)
 
@@ -243,52 +250,61 @@ async def upload_template(
     key = f"templates/{uuid.uuid4().hex}.{ext}"
     get_storage().save(key, raw)
 
-    existing = (
-        await db.execute(select(Template).where(Template.doc_type == resolved_type))
-    ).scalar_one_or_none()
-    if existing:
-        existing.name = name or filename
-        existing.layout = layout
-        existing.content_ref = key
-        existing.is_active = True
-        row = existing
-    else:
-        row = Template(
-            doc_type=resolved_type,
-            name=name or filename,
-            layout=layout,
-            content_ref=key,
-            is_active=True,
-        )
-        db.add(row)
+    # 每次上传作为**独立模板**（支持同一文种配置多个模板）：以 code 唯一标识，
+    # 缺省用「文种_随机」生成，避免与同文种其它模板冲突；同名文种已有模板不再被覆盖。
+    code = f"{resolved_type}_{uuid.uuid4().hex[:6]}"
+    row = Template(
+        doc_type=resolved_type,
+        code=code,
+        name=name or filename,
+        layout=layout,
+        content_ref=key,
+        is_active=True,
+    )
+    db.add(row)
     await db.commit()
     await db.refresh(row)
     return ConfigItem(
         category="template",
-        key=row.doc_type,
-        value={"name": row.name, "layout": row.layout, "content_ref": row.content_ref},
+        key=row.code,
+        value={
+            "doc_type": row.doc_type,
+            "name": row.name,
+            "layout": row.layout,
+            "content_ref": row.content_ref,
+        },
     )
 
 
 @router.get("", summary="列出模板库")
 async def list_templates(db: AsyncSession = Depends(get_db)) -> list[ConfigItem]:
-    rows = (await db.execute(select(Template).where(Template.is_active.is_(True)))).scalars().all()
+    """列出全部启用模板（同一文种可有多条，以 code 区分）。"""
+    rows = (await db.execute(select(Template).where(Template.is_active.is_(True)).order_by(Template.doc_type, Template.created_at))).scalars().all()
     return [
-        ConfigItem(category="template", key=t.doc_type, value={"name": t.name, "layout": t.layout, "content_ref": t.content_ref})
+        ConfigItem(
+            category="template",
+            key=t.code,
+            value={
+                "doc_type": t.doc_type,
+                "name": t.name,
+                "layout": t.layout,
+                "content_ref": t.content_ref,
+            },
+        )
         for t in rows
     ]
 
 
-@router.get("/{doc_type}/file", summary="下载模板原始文件")
-async def download_template(doc_type: str, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
-    """按文种下载上传的模板原件（无上传文件时返回 404）。"""
+@router.get("/{code}/file", summary="下载模板原始文件")
+async def download_template(code: str, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+    """按模板 code 下载上传的模板原件（无上传文件时返回 404）。"""
     row = (
-        await db.execute(select(Template).where(Template.doc_type == doc_type))
+        await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if not row or not row.content_ref:
         from fastapi import HTTPException
 
-        raise HTTPException(status_code=404, detail="该文种暂无上传的模板文件")
+        raise HTTPException(status_code=404, detail="该模板暂无上传的模板文件")
     data = get_storage().get(row.content_ref)
     ext = row.content_ref.rsplit(".", 1)[-1].lower()
     media = {
@@ -315,26 +331,47 @@ async def download_template(doc_type: str, db: AsyncSession = Depends(get_db)) -
 
 @router.post("", summary="新增/更新模板（结构化版式）")
 async def create_template(item: ConfigItem, db: AsyncSession = Depends(get_db)) -> ConfigItem:
-    """按文种保存结构化版式（红头/字体/纸张/章节），来自前端可视化编辑器。"""
+    """按 code 保存结构化版式（红头/字体/纸张/章节），来自前端可视化编辑器。
+
+    code 为模板唯一标识（同一文种可有多条，code 不同）；已存在则更新，否则新建。
+    value 内需携带 doc_type（文种分类）与 name（模板名称）。
+    """
+    code = item.key
+    if not code or not code.strip():
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=400, detail="模板 code 不能为空")
+    doc_type = (item.value.get("doc_type") or "").strip() or code
+    name = item.value.get("name") or doc_type
     layout = item.value.get("layout", item.value)
     existing = (
-        await db.execute(select(Template).where(Template.doc_type == item.key))
+        await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if existing:
-        existing.name = item.value.get("name", item.key)
+        existing.doc_type = doc_type
+        existing.name = name
         existing.layout = layout
     else:
-        existing = Template(doc_type=item.key, name=item.value.get("name", item.key), layout=layout)
+        existing = Template(doc_type=doc_type, code=code, name=name, layout=layout)
         db.add(existing)
     await db.commit()
     await db.refresh(existing)
-    return ConfigItem(category="template", key=existing.doc_type, value={"name": existing.name, "layout": existing.layout, "content_ref": existing.content_ref})
+    return ConfigItem(
+        category="template",
+        key=existing.code,
+        value={
+            "doc_type": existing.doc_type,
+            "name": existing.name,
+            "layout": existing.layout,
+            "content_ref": existing.content_ref,
+        },
+    )
 
 
-@router.delete("/{doc_type}", summary="删除模板")
-async def delete_template(doc_type: str, db: AsyncSession = Depends(get_db)) -> dict:
+@router.delete("/{code}", summary="删除模板")
+async def delete_template(code: str, db: AsyncSession = Depends(get_db)) -> dict:
     existing = (
-        await db.execute(select(Template).where(Template.doc_type == doc_type))
+        await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if existing:
         await db.delete(existing)

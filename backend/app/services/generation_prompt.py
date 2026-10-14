@@ -75,11 +75,12 @@ def build_generation_messages(
     citations: list[Citation],
     no_materials: bool = False,
     templates: dict[str, str] | None = None,
+    template_name: str | None = None,
 ) -> list[dict]:
     """构造公文起草 messages。
 
     Args:
-        req: 起草请求（query / template_doc_type）。
+        req: 起草请求（query / template_doc_type / template_code）。
         citations: 检索引用材料（可含父块注入的大块，见 _render_context）。
         no_materials: 未检索到材料时的"自身能力起草"模式——提示词切换为
             通用写作能力指令，并明确不得虚构知识库依据（答案由调用方追加
@@ -87,6 +88,8 @@ def build_generation_messages(
         templates: 配置中心提示词模板（{key: 文本}，key ∈ draft_system /
             no_materials_system / chat_system / chat_no_materials_system）；
             None 或缺键时用代码默认文案。
+        template_name: 具体模板名称（同一文种可配置多模板，用户选定后传入）；
+            用于在文种指令中带出"模板：XXX"，让生成更贴合所选模板。
     """
     system = _pick(
         templates,
@@ -94,7 +97,11 @@ def build_generation_messages(
         DEFAULT_NO_MATERIALS_SYSTEM if no_materials else DEFAULT_DRAFT_SYSTEM,
     )
     if req.template_doc_type:
-        system += f"4. 按「{req.template_doc_type}」文种格式起草。\n"
+        line = f"4. 按「{req.template_doc_type}」文种格式起草。"
+        if template_name:
+            line += f"（采用模板：{template_name}）"
+        line += "\n"
+        system += line
 
     user = f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{req.query}"
     return [

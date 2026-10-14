@@ -6,7 +6,7 @@
  * meta 事件回传）；后续在同一会话中输入修改意见（如"语气更严厉一些"），
  * 后端将该轮 user 消息落库，历史在左侧会话栏可回看。
  */
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
@@ -15,11 +15,14 @@ import MarkdownText from '@/components/MarkdownText.vue'
 import {
   caller,
   getConversation,
+  getToken,
   intentLabelOf,
+  listTemplates,
   streamGenerate,
   type ConversationDetail,
   type ConversationMessage,
   type CitationPayload,
+  type TemplateItem,
 } from '@/api/client'
 
 const docType = ref('通知')
@@ -31,6 +34,41 @@ const citations = ref<CitationPayload[]>([])
 const hits = ref<string[]>([])
 const modelName = ref('')
 const elapsed = ref(0)
+
+// ---- 模板（支持同一文种多模板，起草时可选具体一类）----
+const templates = ref<TemplateItem[]>([])
+const templatesByType = ref<Record<string, { code: string; name: string }[]>>({})
+const selectedTemplate = ref<string>('') // 当前选中的模板 code
+const templateLoading = ref(false)
+
+async function loadTemplates() {
+  templateLoading.value = true
+  try {
+    const items = await listTemplates()
+    templates.value = items
+    const grouped: Record<string, { code: string; name: string }[]> = {}
+    for (const it of items) {
+      const t = it.value.doc_type
+      ;(grouped[t] ||= []).push({ code: it.key, name: it.value.name })
+    }
+    templatesByType.value = grouped
+    // 默认选中当前文种的首个模板
+    syncDefaultTemplate()
+  } catch {
+    templatesByType.value = {}
+  } finally {
+    templateLoading.value = false
+  }
+}
+
+/** 当前文种下的可选模板清单 */
+const typeTemplates = computed(() => templatesByType.value[docType.value] || [])
+
+/** 文种变化时，默认选中该文种首个模板 */
+function syncDefaultTemplate() {
+  const list = templatesByType.value[docType.value] || []
+  selectedTemplate.value = list.length ? list[0].code : ''
+}
 let timer: number | null = null
 let controller: AbortController | null = null
 let startedAt = 0
@@ -70,6 +108,27 @@ async function openConversation(id: string) {
     const detail: ConversationDetail = await getConversation(id)
     activeTitle.value = detail.title
     history.value = detail.messages
+    // 还原起草文种：历史会话绑定的 doc_type 回显到文种选择框，
+    // 并由 watch(docType) 自动让模板选择框默认选中该文种的首个模板，
+    // 使「打开历史即可在正确文种/模板下继续生成」。
+    if (detail.doc_type) {
+      docType.value = detail.doc_type
+      syncDefaultTemplate()
+    }
+    // 还原内容：把最近一条助手草稿回填到正文区，并把首条用户消息（原始主题）
+    // 回填到主题输入框，使「打开历史即可看到文稿、并在此基础上继续生成」可用。
+    const lastAssistant = [...detail.messages].reverse().find((m) => m.role === 'assistant')
+    answer.value = lastAssistant?.content || ''
+    const firstUser = detail.messages.find((m) => m.role === 'user')
+    if (firstUser) topic.value = firstUser.content
+    // 还原后清理本轮流式态，避免与历史内容混淆
+    reasoning.value = ''
+    citations.value = []
+    hits.value = []
+    intentLabel.value = ''
+    intentKey.value = ''
+    noResult.value = false
+    disclaimer.value = false
   } catch (e: any) {
     ElMessage.error('加载会话失败：' + (e?.response?.data?.detail || e.message))
   } finally {
@@ -120,6 +179,7 @@ async function generate() {
     {
       query: topic.value,
       template_doc_type: docType.value,
+      template_code: selectedTemplate.value || undefined,
       conversation_id: activeId.value ?? undefined,
       caller_scope: caller.caller_scope,
       max_clearance: caller.max_clearance,
@@ -193,11 +253,21 @@ onBeforeUnmount(() => {
   stopTimer()
 })
 
+onMounted(loadTemplates)
+// 文种切换时，默认选中该文种首个模板（如从「通知」切到「报告」）
+watch(docType, syncDefaultTemplate)
+
 async function exportDocx() {
-  // 直接触发文件下载（后端 /v1/export/docx 返回 FileResponse）
+  // 直接触发文件下载（后端 /v1/export/docx 返回 FileResponse，需 JWT 鉴权）。
+  // 注意：必须用同源 fetch 并显式附加 Authorization 头——浏览器对 fetch
+  // 不会自动带上 localStorage 的 JWT，漏带会触发 401「没有权限需要 JWT」。
+  const token = getToken()
   const r = await fetch('/v1/export/docx', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({
       query: topic.value,
       template_doc_type: docType.value,
@@ -205,6 +275,18 @@ async function exportDocx() {
       max_clearance: caller.max_clearance,
     }),
   })
+  if (!r.ok) {
+    // 非 200：后端返回的是 JSON 错误信息（而非 docx），不能当作文件下载
+    let msg = `导出失败（HTTP ${r.status}）`
+    try {
+      const err = await r.json()
+      msg = err.detail || msg
+    } catch {
+      /* 忽略解析失败，沿用状态码提示 */
+    }
+    ElMessage.error('导出失败：' + msg)
+    return
+  }
   const blob = await r.blob()
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -212,6 +294,7 @@ async function exportDocx() {
   a.download = `${topic.value.slice(0, 20)}.docx`
   a.click()
   URL.revokeObjectURL(url)
+  ElMessage.success('已导出 docx')
 }
 </script>
 
@@ -236,8 +319,16 @@ async function exportDocx() {
         <span class="text-muted" style="font-size: 12px">当前会话：{{ activeTitle }}</span>
       </div>
       <div class="bar">
-        <el-select v-model="docType" style="width: 140px">
+        <el-select v-model="docType" style="width: 120px" placeholder="文种">
           <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
+        </el-select>
+        <el-select
+          v-model="selectedTemplate"
+          style="width: 200px"
+          placeholder="选择具体模板"
+          :disabled="!typeTemplates.length"
+        >
+          <el-option v-for="t in typeTemplates" :key="t.code" :label="t.name" :value="t.code" />
         </el-select>
         <el-input v-model="topic" placeholder="起草主题 / 修改意见（如：语气更严厉）" style="flex: 1" @keyup.enter="generate" />
         <el-button type="primary" :loading="loading" @click="generate">{{ loading ? '生成中…' : '起草' }}</el-button>
