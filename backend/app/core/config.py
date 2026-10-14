@@ -11,9 +11,17 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# .env 定位：固定为本文件的上两级目录（backend/.env），与进程 CWD 解耦。
+# 历史教训：此前用相对路径 ".env"，若从项目根等其他目录执行
+# `uvicorn app.main:app`，.env 加载不到，全部配置静默回退默认值——
+# PG 指向 127.0.0.1:5432（无监听）→ 表现为"数据库连接不上"。
+# 环境变量优先级仍高于 .env（12-factor 不变），容器部署只注环境变量即可。
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 # 我方制定的标准密级枚举（第三方映射自身分级到此枚举）
 SecurityLevel = Literal["PUBLIC", "INTERNAL", "RESTRICTED", "SECRET"]
@@ -30,7 +38,7 @@ class Settings(BaseSettings):
     """全局配置。读取顺序：环境变量 > .env > 默认值。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

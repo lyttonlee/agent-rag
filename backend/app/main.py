@@ -33,7 +33,6 @@ from app.api.routes import (
 from app.api.routes.spaces import ensure_default_space
 from app.api.routes.templates import ensure_seed_templates
 from app.core.config import get_settings
-from app.db.base import Base
 from app.db.session import AsyncSessionLocal, engine
 from app.services.audit import actor_from_request, record_audit
 from app.services.auth import ensure_admin_user, get_caller
@@ -58,13 +57,24 @@ def _client_ip(request: Request) -> str | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：建表（dev）→ 回收残留任务 → 种子模板库 → 确保默认空间。"""
-    # 开发环境自动建表（生产由 Alembic 迁移管理）
-    if settings.environment in ("dev", "test"):
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("开发模式：已初始化数据表")
-    # 启动回收：将崩溃/重启残留的非终态入库任务标记为 FAILED，避免"永久 5%"
+    """应用生命周期：DB 自检（致命）→ 自动建表/更新 → 回收/种子 → 依赖自检（降级）。"""
+    # 1) 数据库预检：连不上直接 fail-fast，给出可操作排障提示
+    #    （而不是让 create_all 抛裸 traceback，或把问题留到首个业务请求）
+    from app.services.startup_checks import check_database, log_check_results, run_startup_checks
+
+    db_check = await check_database()
+    if not db_check.ok:
+        logger.error("启动中止：%s", db_check.detail)
+        raise RuntimeError(f"数据库不可用，服务无法启动：{db_check.detail}")
+    logger.info("数据库预检通过：%s", db_check.detail)
+
+    # 2) 自动建表/更新：alembic upgrade head（咨询锁防多进程竞争，dev 兜底 create_all）。
+    #    覆盖"创建或更新"两种语义——create_all 只能建缺失表，无法加列/改索引。
+    from app.db.migrate import upgrade_schema
+
+    await upgrade_schema()
+
+    # 3) 启动回收：将崩溃/重启残留的非终态入库任务标记为 FAILED，避免"永久 5%"
     try:
         await reconcile_stuck_jobs()
     except Exception as exc:
@@ -90,24 +100,6 @@ async def lifespan(app: FastAPI):
         logger.info("管理员账号就绪：%s（角色 %s）", admin.username, admin.role)
     except Exception as exc:
         logger.warning("种子管理员初始化失败：%s", exc)
-    # 对象存储自检：local 探根目录可写；s3 探 SeaweedFS 连通性与 bucket（自动创建）
-    try:
-        from app.services.storage import storage_info
-
-        info = storage_info()
-        if info["ok"]:
-            logger.info(
-                "对象存储就绪：%s 模式 %s",
-                info["provider"], info["detail"],
-            )
-        else:
-            logger.warning(
-                "对象存储不可用（%s 模式 %s）：s3 模式请确认 SeaweedFS 已部署、"
-                "端点/凭证/桶配置正确（见 docs/SeaweedFS部署与联调指南.md）",
-                info["provider"], info["detail"],
-            )
-    except Exception as exc:
-        logger.warning("对象存储自检失败：%s", exc)
     # 配置中心种子：默认检索参数写入 ConfigKV（幂等，不覆盖用户已改值），
     # 使「配置中心 → 检索参数」开箱即见、可调（用户 2026-10-13 需求）
     try:
@@ -119,6 +111,13 @@ async def lifespan(app: FastAPI):
             logger.info("配置中心种子：新增 %d 项默认检索配置", added)
     except Exception as exc:
         logger.warning("配置中心种子失败：%s", exc)
+    # 依赖自检（存储 / Embedding / Rerank；数据库已在入口预检）：
+    # 真实探测而非配置检查，失败记 WARNING 不阻断启动——相关功能降级
+    # （如 rerank 失败 → 检索层回退 RRF），与运行时策略一致。
+    check_results = await run_startup_checks()
+    log_check_results(check_results)
+    # 缓存到 app.state：GET /health 回报上次启动结果；GET /health/check 实时复检
+    app.state.startup_checks = [r.to_dict() for r in check_results]
     yield
     await engine.dispose()
 
@@ -189,16 +188,42 @@ app.include_router(audit.router, prefix=API_PREFIX, dependencies=[Depends(get_ca
 
 @app.get("/health", tags=["health"])
 async def health():
-    """健康检查（开放）：进程状态 + 对象存储后端与连通性（联调排障用）。"""
+    """健康检查（开放）：进程状态 + 数据库/存储连通性 + 上次启动自检结果。
+
+    联调排障入口：``storage``/``db`` 为实时轻量探测（SELECT 1 / ping），
+    ``checks`` 为启动时四项自检的缓存结果（含 embedding/rerank 真实调用）。
+    """
+    from app.services.startup_checks import check_database
     from app.services.storage import storage_info
 
     try:
         storage = storage_info()
     except Exception as exc:  # pragma: no cover - 存储配置错误不应压垮探活
         storage = {"provider": "unknown", "ok": False, "detail": {"error": str(exc)}}
+    try:
+        db = (await check_database()).to_dict()
+    except Exception as exc:  # pragma: no cover
+        db = {"name": "database", "ok": False, "latency_ms": 0, "detail": str(exc)}
     return {
         "status": "ok",
         "version": settings.app_version,
         "environment": settings.environment,
         "storage": storage,
+        "db": db,
+        "checks": getattr(app.state, "startup_checks", []),
     }
+
+
+@app.get("/health/check", tags=["health"])
+async def health_check():
+    """实时复检（开放）：对 数据库/存储/Embedding/Rerank 重新执行一次真实探测。
+
+    运维排障一键入口：修改 .env 或重启依赖服务后，无需重启后端即可核验
+    四项依赖的当前可用性。探测方式与启动自检、业务调用同源。
+    """
+    from app.services.startup_checks import log_check_results, run_startup_checks
+
+    results = await run_startup_checks()
+    log_check_results(results)
+    app.state.startup_checks = [r.to_dict() for r in results]
+    return {"all_ok": all(r.ok for r in results), "checks": [r.to_dict() for r in results]}

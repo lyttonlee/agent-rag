@@ -19,6 +19,9 @@
 
 复制 `.env.example` 为 `.env` 后按需修改。下表为全部字段：
 
+> **`.env` 定位**：固定读取 `backend/.env`（按代码路径解析，与进程 CWD 无关）。
+> 从任意目录启动 `uvicorn app.main:app` 都能正确加载；环境变量优先级仍高于 `.env`。
+
 | 分组 | 变量 | 默认 | 说明 |
 |---|---|---|---|
 | 基础 | `APP_NAME` / `APP_VERSION` / `ENVIRONMENT` / `LOG_LEVEL` | `GovDoc-RAG` / `1.2.0` / `dev` / `INFO` | 应用元信息；`ENVIRONMENT=production` 触发云端 Provider 启动自检拒绝 |
@@ -70,11 +73,36 @@ uv run alembic upgrade head     # 应用全部迁移（建表 + zhparser 配置 
   - ⚠️ PostgreSQL 不支持 `CREATE TEXT SEARCH CONFIGURATION IF NOT EXISTS`，迁移采用 `DROP ... IF EXISTS` 后 `CREATE`。
 - `alembic/versions/0002_search_vec_trigger.py`：`chunks.search_vec` 的 BEFORE INSERT/UPDATE 触发器（自动维护 tsvector）+ 一次性回填。
 
-开发模式启动 `uvicorn` 时会尝试自动建表；**生产建议显式执行 Alembic**。
+**启动自动建表/更新**：应用启动时自动执行 `alembic upgrade head`（`app/db/migrate.py`），
+覆盖"创建或更新"两种语义——`create_all` 只能建缺失表、无法加列/改索引。
+多进程场景用 PG 咨询锁（`pg_advisory_lock` + `lock_timeout`）保证只有一个进程执行迁移，
+抢不到锁的进程跳过（对方在迁，结果一致）。dev/test 环境迁移异常时兜底 `create_all`
+（保证起得来，但会打 WARNING）；**生产不兜底**，schema 漂移比启动失败更危险。
 
 ---
 
-## 五、运行
+## 五、启动自检（数据库 / 存储 / Embedding / Rerank）
+
+启动时对四项外部依赖做**真实探测**（连通 + 认证 + 最小请求，与业务调用同源）：
+
+| 依赖 | 探测方式 | 失败影响 |
+|---|---|---|
+| 数据库 | `SELECT 1` + 版本/表数/alembic 版本 | **致命**：启动中止并给出排障提示 |
+| 对象存储 | `storage_info()`（local 探根目录可写；s3 探 head_bucket） | 降级：WARNING，服务仍起 |
+| Embedding | 真实 `embed()` 一次，校验维度 = `EMBEDDING_DIM` | 降级：WARNING |
+| Rerank | 真实 `rerank()` 一次，验证端点 + 模型名 | 降级：WARNING（检索层回退 RRF） |
+
+排障入口：
+
+- `GET /health`：进程状态 + 数据库/存储实时探测 + **上次启动自检结果缓存**；
+- `GET /health/check`：**实时复检**四项（改完 `.env` 或重启依赖服务后无需重启后端即可核验）。
+
+常见失败：rerank/embedding 报 404 多为**模型名与服务端 `/v1/models` 列表不一致**
+（用 `curl $BASE_URL/v1/models` 核对）；数据库连接被拒查 PG 状态、端口放通、`pg_hba.conf`。
+
+---
+
+## 六、运行
 
 ```bash
 cd backend
@@ -89,7 +117,7 @@ uv run uvicorn app.main:app --reload --port 8000
 
 ---
 
-## 六、测试
+## 七、测试
 
 ### 6.1 真实环境冒烟（推荐，已部署 `192.168.6.49`）
 
@@ -112,7 +140,7 @@ uv run python -m scripts.smoke_remote
 
 ---
 
-## 七、Mock 联调服务
+## 八、Mock 联调服务
 
 见 `mock_api/README.md`：
 
@@ -121,7 +149,7 @@ uv run python -m scripts.smoke_remote
 
 ---
 
-## 八、目录结构
+## 九、目录结构
 
 ```
 backend/
@@ -141,7 +169,7 @@ backend/
 
 ---
 
-## 九、关键约束
+## 十、关键约束
 
 - 密级 / 权限过滤**必须在检索阶段下推到数据库 WHERE**（见 `app/core/security.py` 的 `build_visibility_filter`），涉密 / 越权内容不进入模型上下文。
 - 公开 / 无权限约束（空 `permission_tags`）的切片对**所有调用方可见**（含带 `caller_scope` 者）。
