@@ -329,7 +329,7 @@ onBeforeUnmount(() => {
           <el-option
             v-for="s in spaces"
             :key="s.id"
-            :label="`${spacePath(s.id)}（${s.doc_count} 篇）`"
+            :label="`${spacePath(s.id)}（${s.doc_count} 篇${s.is_default ? '·公共' : s.is_mine ? '·我的' : ''}）`"
             :value="s.id"
           />
         </el-select>

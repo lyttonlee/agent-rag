@@ -151,6 +151,9 @@ export interface DocSummary {
   doc_no: string | null
   security_level: SecurityLevel
   permission_tags: string[]
+  /** 所属文档空间 ID / 名称（名称由后端冗余返回） */
+  space_id: string | null
+  space_name: string | null
   status: string
   chunk_count: number
   created_at: string | null
@@ -204,6 +207,16 @@ export interface DocSpace {
   is_default: boolean
   /** 父空间 ID（层级结构）；null = 根级空间 */
   parent_id: string | null
+  /** 所有者类型：system=公共（默认空间）/ user=运维用户 / client=第三方 */
+  owner_type: 'system' | 'user' | 'client'
+  /** 所有者 ID（user.id / client.client_id）；system 为 null */
+  owner_id: string | null
+  /** 所有者展示名（冗余存储） */
+  owner_name: string | null
+  /** 当前调用方是否为创建者（前端据此开放编辑/删除） */
+  is_mine: boolean
+  /** 当前调用方是否可向该空间上传文档 */
+  can_upload: boolean
   doc_count: number
   chunk_count: number
   created_at: string | null

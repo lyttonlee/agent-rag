@@ -22,7 +22,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -48,6 +47,14 @@ class DocumentSpace(Base, TimestampMixin):
     - parent_id 自引用外键，支撑"父空间/子空间"树（根空间 parent_id=NULL）；
     - 删除父空间时子空间挂起到根级（ON DELETE SET NULL），不级联丢数据；
     - 空间内仍有文档或仍有子空间时拒绝删除（409），避免误删知识。
+
+    所有权（用户 2026-10-14 需求：空间归属具象化 + 隔离）：
+    - owner_type：system=系统公共空间（默认空间，所有人可见可上传）；
+      user=运维台用户私有；client=第三方客户端私有；
+    - owner_id：user.id / client.client_id（system 为 NULL）；
+    - 隔离规则：非 system 空间仅 owner 本人可见、可上传、可检索，
+      他人（含其他用户/其他第三方）不可见（列表/详情 404）、
+      不可上传（403）、不可纳入检索范围（403）。
     """
 
     __tablename__ = "document_spaces"
@@ -65,16 +72,30 @@ class DocumentSpace(Base, TimestampMixin):
         ForeignKey("document_spaces.id", ondelete="SET NULL"),
         index=True,
     )
+    # ---- 所有权（2026-10-14）----
+    # system=公共（默认空间，所有人可见/可上传）；user/client=创建者私有
+    owner_type: Mapped[str] = mapped_column(
+        String(16), default="user", server_default="user", index=True
+    )
+    # 所有者 ID：user.id 或 client.client_id；owner_type=system 时为 NULL
+    owner_id: Mapped[str | None] = mapped_column(String(48), index=True)
+    # 所有者展示名（冗余存储，避免列表场景反查 users/api_clients）
+    owner_name: Mapped[str | None] = mapped_column(String(128))
 
     # 父子关系（parent 侧 remote_side 指向自身主键，自引用）
-    parent: Mapped["DocumentSpace | None"] = relationship(
+    parent: Mapped[DocumentSpace | None] = relationship(
         back_populates="children", remote_side=[id]
     )
-    children: Mapped[list["DocumentSpace"]] = relationship(
+    children: Mapped[list[DocumentSpace]] = relationship(
         back_populates="parent", passive_deletes=True
     )
 
-    documents: Mapped[list["Document"]] = relationship(back_populates="space")
+    documents: Mapped[list[Document]] = relationship(back_populates="space")
+
+    __table_args__ = (
+        # 所有权复合索引：列表/可见性过滤固定按 (owner_type, owner_id) 命中
+        Index("ix_document_spaces_owner", "owner_type", "owner_id"),
+    )
 
 
 class Document(Base, TimestampMixin):
@@ -102,8 +123,8 @@ class Document(Base, TimestampMixin):
         ForeignKey("document_spaces.id", ondelete="SET NULL"), index=True
     )
 
-    chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
-    space: Mapped["DocumentSpace | None"] = relationship(back_populates="documents")
+    chunks: Mapped[list[Chunk]] = relationship(back_populates="document")
+    space: Mapped[DocumentSpace | None] = relationship(back_populates="documents")
 
 
 class Chunk(Base, TimestampMixin):
@@ -140,7 +161,7 @@ class Chunk(Base, TimestampMixin):
         String(32), ForeignKey("chunks.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
-    document: Mapped["Document"] = relationship(back_populates="chunks")
+    document: Mapped[Document] = relationship(back_populates="chunks")
     # 父子自引用：small.parent -> large（仅用于 ORM 层便捷访问，检索回表用显式 SQL）
     parent: Mapped[Chunk | None] = relationship(
         "Chunk", remote_side="Chunk.id", back_populates="children"
@@ -237,6 +258,14 @@ class IngestionJob(Base, TimestampMixin):
     security_level: Mapped[str] = mapped_column(String(16), default="INTERNAL")
     doc_type: Mapped[str] = mapped_column(String(64), default="通知")
 
+    # ---- 任务归属（2026-10-14 所有权隔离）----
+    # 提交者身份（user.id / client.client_id）：任务列表/详情仅本人可见，
+    # 避免跨租户看到他人入库任务的文件名与进度。
+    owner_type: Mapped[str] = mapped_column(
+        String(16), default="user", server_default="user", index=True
+    )
+    owner_id: Mapped[str] = mapped_column(String(48), default="", server_default="", index=True)
+
 
 class AuditLog(Base, TimestampMixin):
     """审计日志：记录"谁 / 何时 / 做了什么 / 结果如何 / 主题 / 客体"。
@@ -289,7 +318,7 @@ class Conversation(Base, TimestampMixin):
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime)
 
-    messages: Mapped[list["ConversationMessage"]] = relationship(
+    messages: Mapped[list[ConversationMessage]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
 
@@ -324,7 +353,7 @@ class ConversationMessage(Base, TimestampMixin):
     # 模型思考链全文（assistant 消息；无推理过程时为 NULL）
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
 
 # =========================================================================

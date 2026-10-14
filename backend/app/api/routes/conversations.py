@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.routes.spaces import check_space_ids_visible
 from app.db.models import Conversation, ConversationMessage
 from app.db.session import get_db
 from app.schemas.contracts import (
@@ -23,6 +24,7 @@ from app.schemas.contracts import (
     MessageResp,
 )
 from app.services import conversation as conv_service
+from app.services.auth import Caller, get_caller
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -56,9 +58,16 @@ def _msg_resp(m: ConversationMessage) -> MessageResp:
 
 @router.post("", response_model=ConversationResp, status_code=201)
 async def create_conversation(
-    payload: ConversationCreate, db: AsyncSession = Depends(get_db)
+    payload: ConversationCreate,
+    db: AsyncSession = Depends(get_db),
+    caller: Caller = Depends(get_caller),
 ) -> ConversationResp:
-    """创建会话（chat 问答 / draft 起草）。"""
+    """创建会话（chat 问答 / draft 起草）。
+
+    空间所有权（2026-10-14）：绑定的 space_ids 必须本人可见
+    （默认公共 + 本人创建），他人空间 403。
+    """
+    await check_space_ids_visible(db, payload.space_ids, caller)
     row = await conv_service.create_conversation(
         db,
         conv_type=payload.conv_type,
@@ -121,8 +130,14 @@ async def update_conversation(
     conversation_id: str,
     payload: ConversationUpdate,
     db: AsyncSession = Depends(get_db),
+    caller: Caller = Depends(get_caller),
 ) -> ConversationResp:
-    """重命名会话 / 更新绑定的知识空间。"""
+    """重命名会话 / 更新绑定的知识空间。
+
+    空间所有权（2026-10-14）：新绑定的 space_ids 必须本人可见，
+    他人空间 403。
+    """
+    await check_space_ids_visible(db, payload.space_ids, caller)
     try:
         row = await conv_service.rename_conversation(
             db, conversation_id, payload.title or "", payload.space_ids

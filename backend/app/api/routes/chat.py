@@ -38,11 +38,17 @@ async def chat_stream(
     认证（2026-10-13）：双模认证（用户 JWT / 第三方 X-API-Key）；
     请求声明的 max_clearance 会被调用方额度压低（权限管控入口），
     第三方客户端还需具备 chat 能力域。
+    空间所有权（2026-10-14）：请求/会话绑定的 space_ids 仅可纳入
+    本人可见空间（默认公共 + 本人创建），他人空间 403。
     """
     if not caller.allows_scope("chat"):
         from fastapi import HTTPException
 
         raise HTTPException(status_code=403, detail="该客户端无 chat 能力域权限")
+    # 空间所有权：请求显式携带的空间必须可见（会话绑定在创建/更新时已校验）
+    from app.api.routes.spaces import check_space_ids_visible
+
+    await check_space_ids_visible(db, req.space_ids, caller)
     # 权限管控：请求密级不得超过调用方额度（密级过滤下推的入口）
     req.max_clearance = caller.cap_clearance(req.max_clearance)
     return StreamingResponse(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.routes.spaces import check_space_ids_visible
 from app.db.session import get_db
 from app.schemas.contracts import RetrieveRequest, RetrieveResp
 from app.services.auth import Caller, get_caller
@@ -22,8 +23,11 @@ async def retrieve(
 
     结果已做密级/权限下推过滤；认证（2026-10-13）：双模认证，
     请求 max_clearance 被调用方额度压低，第三方客户端需具备 retrieve 能力域。
+    空间所有权（2026-10-14）：space_ids 仅可纳入本人可见空间
+    （默认公共 + 本人创建），他人空间 403。
     """
     if not caller.allows_scope("retrieve"):
         raise HTTPException(status_code=403, detail="该客户端无 retrieve 能力域权限")
+    await check_space_ids_visible(db, req.space_ids, caller)
     req.max_clearance = caller.cap_clearance(req.max_clearance)
     return await retrieve_enhanced(db, req)

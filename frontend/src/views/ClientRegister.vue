@@ -79,6 +79,10 @@ function reset() {
       之后在请求头携带 <b>X-API-Key: sk-xxxx</b> 调用业务接口。能力域（scopes）与最高可检索密级（max_clearance）
       在注册时限定，服务端强制执行。
     </p>
+    <p class="desc text-muted">
+      <b>空间所有权：</b>通过本应用 Key 创建的文档空间<b>仅本应用可见、可上传、可检索</b>（其他应用与运维用户均不可见）；
+      <b>默认空间</b>为公共空间，所有应用可见、可上传。上传文档时指定 <code>space_id</code> 即可归入本人空间。
+    </p>
 
     <!-- 注册表单 -->
     <div v-if="!newKey" class="reg-card panel">

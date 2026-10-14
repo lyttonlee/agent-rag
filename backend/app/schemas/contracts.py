@@ -91,6 +91,8 @@ class DocumentSummary(BaseModel):
     security_level: str
     permission_tags: list[str] = Field(default_factory=list)
     space_id: str | None = None
+    # 所属空间名称（冗余展示，避免前端反查空间列表）
+    space_name: str | None = None
     status: str
     chunk_count: int = 0
     created_at: datetime | None = None
@@ -107,6 +109,7 @@ class DocumentDetail(BaseModel):
     security_level: str
     permission_tags: list[str] = Field(default_factory=list)
     space_id: str | None = None
+    space_name: str | None = None
     owner_org: str | None = None
     source_system: str | None = None
     status: str
@@ -127,6 +130,8 @@ class SpaceCreate(BaseModel):
     """创建文档空间（运维台与第三方系统共用）。
 
     parent_id：父空间 ID（层级结构，类似文件夹）；缺省/None = 根级空间。
+    所有权：owner 由服务端按调用方身份写入（用户 JWT / 第三方 API Key），
+    不接受客户端指定——空间仅创建者可见、可上传、可检索。
     """
 
     name: str = Field(..., min_length=1, max_length=128)
@@ -139,7 +144,7 @@ class SpaceUpdate(BaseModel):
     """更新文档空间（名称/描述/父空间；code 与默认标记不可改）。
 
     parent_id 支持把空间移动到其他父级下；服务端会阻止把空间移动到
-    自己的子孙节点下（防环）。
+    自己的子孙节点下（防环）。仅 owner 可更新；默认空间仅 admin。
     """
 
     name: str | None = Field(None, min_length=1, max_length=128)
@@ -148,7 +153,14 @@ class SpaceUpdate(BaseModel):
 
 
 class SpaceResp(BaseModel):
-    """文档空间响应（含实时文档数统计与层级信息）。"""
+    """文档空间响应（含实时文档数统计、层级与所有权视图）。
+
+    所有权字段（2026-10-14）：
+    - owner_type：system=公共（默认空间）/ user / client；
+    - owner_id / owner_name：创建者标识与展示名；
+    - is_mine：当前调用方是否为创建者（前端据此开放编辑/删除操作）；
+    - can_upload：当前调用方是否可向该空间上传文档。
+    """
 
     id: str
     name: str
@@ -156,6 +168,11 @@ class SpaceResp(BaseModel):
     description: str | None = None
     is_default: bool = False
     parent_id: str | None = None
+    owner_type: str = "user"
+    owner_id: str | None = None
+    owner_name: str | None = None
+    is_mine: bool = False
+    can_upload: bool = False
     doc_count: int = 0
     chunk_count: int = 0
     created_at: datetime | None = None

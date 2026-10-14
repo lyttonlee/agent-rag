@@ -11,6 +11,13 @@
  *   保护，前端给出明确提示）；
  * - 接入文档默认归属当前所在空间。
  *
+ * 空间所有权（用户 2026-10-14 需求：归属具象化 + 隔离）：
+ * - 本人创建的空间仅本人可见、可上传、可检索（列表/详情/上传/检索
+ *   均由后端按调用方身份隔离，前端只负责"看得见"的呈现）；
+ * - 默认空间为 system 公共空间：所有人可见、可上传；
+ * - 空间卡片以徽章标示归属（默认·公共 / 我的 / 仅自己可见），
+ *   编辑/删除仅对本人空间开放（is_mine），默认空间仅 admin 可改名。
+ *
  * 数据：空间为扁平列表（/v1/spaces 返回 parent_id），树形结构由前端
  * 按 parent_id 组装（childrenOf / breadcrumb），避免后端维护递归接口。
  */
@@ -18,6 +25,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   createSpace,
+  currentUser,
   deleteSpace,
   getDocument,
   getJob,
@@ -97,6 +105,30 @@ const currentSpaceObj = computed(() =>
   currentSpace.value ? spaceById.value.get(currentSpace.value) ?? null : null,
 )
 
+// ---- 所有权视图（2026-10-14）----
+/** 是否 admin（默认空间仅 admin 可改名，与后端权限一致） */
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+
+/** 空间归属徽章：默认·公共 / 我的 / 第三方 等 */
+function ownerTag(s: DocSpace): { text: string; type: 'info' | 'success' | 'warning' } {
+  if (s.is_default || s.owner_type === 'system') return { text: '默认·公共', type: 'info' }
+  if (s.is_mine) return { text: '我的', type: 'success' }
+  if (s.owner_type === 'client') return { text: '第三方', type: 'warning' }
+  return { text: '他人', type: 'warning' }
+}
+
+/** 空间可否编辑/删除：本人空间随时可管；默认空间仅 admin 可改名（不可删） */
+function canManageSpace(s: DocSpace): boolean {
+  if (s.is_default) return isAdmin.value
+  return s.is_mine
+}
+
+/** 上传对话框的空间选项标签（带归属提示） */
+function spaceOptionLabel(s: DocSpace): string {
+  const tag = ownerTag(s)
+  return `${spacePathLabel(s.id)}（${tag.text}${s.is_default ? '·人人可上传' : ''}）`
+}
+
 /** 空间的完整路径标签（"父 / 子"），用于下拉选项等场景 */
 function spacePathLabel(id: string | null): string {
   if (!id) return '—'
@@ -159,6 +191,11 @@ const fileRef = ref<File | null>(null)
 
 /** 打开上传对话框：默认把文档放到当前正在浏览的空间 */
 function openUpload() {
+  // 防御：当前空间不可上传（他人空间，理论上列表已过滤不会出现）时阻止并提示
+  if (currentSpaceObj.value && !currentSpaceObj.value.can_upload) {
+    ElMessage.warning(`空间「${currentSpaceObj.value.name}」仅创建者可上传文档`)
+    return
+  }
   form.space_id = currentSpace.value || ''
   dialog.value = true
 }
@@ -401,6 +438,19 @@ async function quickIngest() {
         <el-button type="primary" @click="openUpload()">接入文档</el-button>
       </div>
 
+      <!-- 空间所有权说明（用户 2026-10-14：归属规则具象化） -->
+      <div class="own-banner">
+        <span class="own-banner-icon">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 018 0v3" />
+          </svg>
+        </span>
+        <span>
+          <b>空间所有权：</b>你创建的空间<b>仅你可见、仅你可上传与检索</b>；第三方应用同理（其空间仅该应用可用）。
+          <b>默认空间</b>为公共空间，所有人可见、可上传。
+        </span>
+      </div>
+
       <!-- 空间卡片网格（根级视图列根空间；空间内列子空间） -->
       <div v-if="visibleSpaces.length" class="space-grid">
         <div
@@ -416,29 +466,39 @@ async function quickIngest() {
               </svg>
             </span>
             <span class="sc-name">{{ s.name }}</span>
-            <el-tag v-if="s.is_default" size="small" type="info" effect="dark">默认</el-tag>
+            <el-tag :type="ownerTag(s).type" size="small" effect="dark">{{ ownerTag(s).text }}</el-tag>
+            <el-tooltip v-if="!s.is_default" content="仅创建者可见、可上传、可检索" placement="top">
+              <span class="sc-lock">
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 018 0v3" />
+                </svg>
+              </span>
+            </el-tooltip>
           </div>
           <div class="sc-desc text-muted">{{ s.description || '暂无描述' }}</div>
           <div class="sc-meta">
             <span>{{ s.doc_count }} 篇文档</span>
             <span>{{ s.chunk_count }} 切片</span>
             <span v-if="childrenOf(s.id).length">{{ childrenOf(s.id).length }} 个子空间</span>
+            <span v-if="!s.is_default" class="sc-owner">所有者：{{ s.owner_name || '—' }}</span>
           </div>
           <div class="sc-ops" @click.stop>
             <el-button link type="primary" size="small" @click="enterSpace(s.id)">进入</el-button>
             <el-button link size="small" @click="openCreateSpace(s.id)">新建子空间</el-button>
-            <el-button link size="small" @click="editSpace(s)">重命名</el-button>
+            <el-button v-if="canManageSpace(s)" link size="small" @click="editSpace(s)">重命名</el-button>
             <el-button
-              v-if="!s.is_default"
+              v-if="s.is_mine"
               link
               type="danger"
               size="small"
               @click="removeSpace(s)"
             >删除</el-button>
+            <span v-if="!s.is_mine && !s.is_default" class="sc-readonly text-muted">只读（他人空间）</span>
+            <span v-else-if="s.is_default && !isAdmin" class="sc-readonly text-muted">公共空间（仅管理员可改名）</span>
           </div>
         </div>
       </div>
-      <el-empty v-else-if="!currentSpace" description="还没有文档空间，点击右上角「新建空间」开始" :image-size="70" />
+      <el-empty v-else-if="!currentSpace" description="还没有文档空间，点击右上角「新建空间」开始（空间仅创建者可见）" :image-size="70" />
 
       <!-- 空间内：过滤 + 文档表格 -->
       <template v-if="currentSpace">
@@ -456,6 +516,9 @@ async function quickIngest() {
 
         <el-table :data="rows" v-loading="loading" style="width: 100%" empty-text="该空间暂无文档（点击「接入文档」上传）">
           <el-table-column prop="title" label="标题" min-width="240" show-overflow-tooltip />
+          <el-table-column label="所属空间" width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.space_name || '默认空间' }}</template>
+          </el-table-column>
           <el-table-column prop="doc_type" label="文种" width="90" />
           <el-table-column label="密级" width="100">
             <template #default="{ row }"><span class="badge" :class="row.security_level">{{ row.security_level }}</span></template>
@@ -486,15 +549,15 @@ async function quickIngest() {
       <el-form :model="form" label-width="92px" style="margin-top: 14px">
         <el-form-item label="标题"><el-input v-model="form.title" placeholder="默认取文件名" /></el-form-item>
         <el-form-item label="文档空间">
-          <el-select v-model="form.space_id" placeholder="默认空间" style="width: 240px">
+          <el-select v-model="form.space_id" placeholder="默认空间（公共）" style="width: 300px">
             <el-option
               v-for="s in spaces"
               :key="s.id"
-              :label="spacePathLabel(s.id) + (s.is_default ? '（默认）' : '')"
+              :label="spaceOptionLabel(s)"
               :value="s.id"
             />
           </el-select>
-          <span class="hint">文档将归属到所选空间，检索可按空间过滤</span>
+          <span class="hint">仅显示你可用的空间：默认公共空间 + 本人空间（他人空间不可见、不可上传）</span>
         </el-form-item>
         <el-form-item label="文种">
           <el-select v-model="form.doc_type" style="width: 160px">
@@ -666,6 +729,23 @@ async function quickIngest() {
 .space-card:hover .sc-ops { opacity: 1; }
 
 .filters { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+
+/* 空间所有权说明横幅（2026-10-14） */
+.own-banner {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 9px 12px; margin-bottom: 14px;
+  border: 1px solid var(--brand-line); border-radius: 8px;
+  background: var(--brand-soft);
+  font-size: 12px; line-height: 1.7; color: var(--text);
+}
+.own-banner b { color: var(--text-strong); }
+.own-banner-icon { color: var(--brand); flex-shrink: 0; margin-top: 2px; }
+
+/* 空间卡片：所有权徽章 / 锁标 / 所有者 / 只读提示 */
+.sc-lock { display: inline-flex; color: var(--text-faint); flex-shrink: 0; }
+.sc-owner { color: var(--text-faint); }
+.sc-readonly { font-size: 12px; align-self: center; }
+
 .badge { color: var(--text); }
 .st { color: var(--text-muted); font-size: 13px; }
 .st.ok { color: var(--c-success); }
