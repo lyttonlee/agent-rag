@@ -335,6 +335,20 @@ class LoginReq(BaseModel):
     password: str
 
 
+class RegisterReq(BaseModel):
+    """运维台用户自助注册（用户 2026-10-14 需求：登录/注册功能）。
+
+    与第三方「注册调用」（/auth/clients/register 拿 API Key）是两套体系：
+    本端点面向**自然人**——前端控制台的登录账号，注册成功直接下发 JWT
+    （免去再登录一次），角色固定为最低权限的 viewer，禁用/提权由 admin
+    在运维台侧操作（本期不做用户管理页，DB 侧维护）。
+    """
+
+    username: str = Field(..., min_length=2, max_length=64, description="登录用户名（唯一）")
+    password: str = Field(..., min_length=6, max_length=128, description="口令（至少 6 位）")
+    display_name: str = Field(default="", max_length=64, description="显示名（可选）")
+
+
 class UserResp(BaseModel):
     """用户信息（不含口令哈希等敏感字段）。"""
 

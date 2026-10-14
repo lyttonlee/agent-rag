@@ -2,7 +2,9 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { getToken } from '@/api/client'
 
 const routes = [
+  // 登录/注册为独立全屏页（无侧边栏壳，meta.public 由 App.vue 识别后裸渲染）
   { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { title: '登录', public: true } },
+  { path: '/register', name: 'register', component: () => import('@/views/Register.vue'), meta: { title: '注册', public: true } },
   { path: '/', redirect: '/overview' },
   { path: '/overview', name: 'overview', component: () => import('@/views/Overview.vue'), meta: { title: '概览' } },
   { path: '/docs', name: 'docs', component: () => import('@/views/DocLibrary.vue'), meta: { title: '文档库' } },
@@ -21,9 +23,16 @@ const router = createRouter({
   routes,
 })
 
-// 全局前置守卫：未登录访问业务页 → 跳登录页（带上原路径，登录后回跳）
+// 全局前置守卫：
+// - 未登录访问业务页 → 跳登录页（带上原路径，登录后回跳）；
+// - 已登录访问登录/注册页 → 回主页（避免登录态下反复看到登录表单）。
 router.beforeEach((to) => {
-  if (to.meta.public) return true
+  if (to.meta.public) {
+    if (getToken() && (to.path === '/login' || to.path === '/register')) {
+      return { path: '/overview' }
+    }
+    return true
+  }
   if (!getToken()) {
     return { path: '/login', query: { redirect: to.fullPath } }
   }

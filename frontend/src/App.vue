@@ -28,7 +28,11 @@ function onLogout() {
 </script>
 
 <template>
-  <div class="layout">
+  <!-- 登录/注册为独立全屏页：不带侧边栏与顶栏壳（用户 2026-10-14 需求）。
+       路由 meta.public 标记独立页；业务页才渲染完整运维台壳。 -->
+  <router-view v-if="route.meta.public" />
+
+  <div v-else class="layout">
     <!-- 侧边栏 -->
     <aside class="sidebar">
       <div class="brand-bar">

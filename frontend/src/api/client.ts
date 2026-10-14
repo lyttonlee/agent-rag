@@ -74,6 +74,22 @@ export async function login(username: string, password: string): Promise<{ acces
   return data
 }
 
+/**
+ * 运维台用户自助注册（用户 2026-10-14 需求）。
+ * 注册成功后端直接下发 JWT（注册即登录），前端落同样的登录态即可进主界面。
+ * 用户名冲突返回 HTTP 409，detail 由调用方展示。
+ */
+export async function register(username: string, password: string, displayName: string): Promise<{ access_token: string; user: AuthUser }> {
+  const { data } = await client.post('/auth/register', {
+    username,
+    password,
+    display_name: displayName,
+  })
+  setToken(data.access_token)
+  currentUser.value = data.user
+  return data
+}
+
 export function logout(): void {
   setToken(null)
   currentUser.value = null

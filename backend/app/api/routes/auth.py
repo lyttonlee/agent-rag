@@ -1,11 +1,13 @@
 """认证路由：/v1/auth。
 
-三类接口：
-1. **登录（用户）**：POST /v1/auth/login 换 JWT；GET /v1/auth/me 查当前用户。
-2. **第三方注册（注册调用）**：POST /v1/auth/clients/register——
+四类接口：
+1. **用户注册（运维台）**：POST /v1/auth/register——自然人自助注册控制台
+   账号，成功直接下发 JWT（注册即登录）；角色固定 viewer（最低权限）。
+2. **登录（用户）**：POST /v1/auth/login 换 JWT；GET /v1/auth/me 查当前用户。
+3. **第三方注册（注册调用）**：POST /v1/auth/clients/register——
    第三方系统自助注册，返回 client_id + api_key（仅一次明文）。
    注册端点本身开放（未认证）：这是"注册调用"的入口，注册即拿凭证。
-3. **客户端管理（admin）**：列表 / 禁用 / 启用。api_key 永不明文返回。
+4. **客户端管理（admin）**：列表 / 禁用 / 启用。api_key 永不明文返回。
 
 调用方在业务请求头携带：
 - 用户（运维台）：Authorization: Bearer <JWT>
@@ -29,6 +31,7 @@ from app.schemas.contracts import (
     ClientResp,
     LoginReq,
     LoginResp,
+    RegisterReq,
     UserResp,
 )
 from app.services.auth import (
@@ -83,6 +86,46 @@ async def login(req: LoginReq, db: AsyncSession = Depends(get_db)) -> LoginResp:
         raise HTTPException(status_code=401, detail="用户名或口令错误")
     user.last_login_at = datetime.now(timezone.utc)
     await db.commit()
+    return LoginResp(
+        access_token=create_access_token(user),
+        token_type="bearer",
+        expires_in=settings.jwt_expire_hours * 3600,
+        user=_user_resp(user),
+    )
+
+
+@router.post("/register", response_model=LoginResp, summary="运维台用户自助注册（注册即登录）")
+async def register(req: RegisterReq, db: AsyncSession = Depends(get_db)) -> LoginResp:
+    """自然人用户自助注册（用户 2026-10-14 需求：登录注册功能）。
+
+    与第三方「注册调用」是两套体系：本端点创建的是**前端控制台登录账号**
+    （users 表），注册成功直接下发 JWT，前端免去二次登录。
+
+    安全边界（内网运维台定位，非互联网产品）：
+    - 角色固定 viewer（最低权限）：看不见认证管理，管理操作一律做不了；
+      提权/禁用由 admin 直接改库（users.role/enabled），本期不做用户管理页。
+    - 用户名唯一，冲突返回 409（注册场景必须让用户知道重名了，不同于登录的
+      防枚举策略）。
+    - 口令下限 6 位由 schema 约束；哈希沿用 pbkdf2-sha256（auth.hash_password）。
+    - 端点开放（无需认证）——否则未登录用户无法注册，与登录页可达性一致；
+      滥用防护依赖内网边界 + admin 可禁用账号兜底。
+    """
+    username = req.username.strip()
+    existing = (
+        await db.execute(select(User).where(User.username == username))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="用户名已被注册，请更换")
+    user = User(
+        username=username,
+        password_hash=hash_password(req.password),
+        display_name=req.display_name.strip() or username,
+        role="viewer",  # 自助注册一律最低权限，提权走 admin 侧
+        enabled=True,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
     return LoginResp(
         access_token=create_access_token(user),
         token_type="bearer",
