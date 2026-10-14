@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  currentUser,
   deleteTemplate,
   downloadTemplate,
   listTemplates,
@@ -19,6 +20,24 @@ const PAPERS = ['A4', 'A3', '16开', 'B5']
 
 const rows = ref<TemplateItem[]>([])
 const loading = ref(false)
+
+// ---- 所有权视图（2026-10-14：模板管理与空间管理同一套所有者逻辑）----
+/** 是否 admin（系统标准模板仅 admin 可维护，与后端权限一致） */
+const isAdmin = computed(() => currentUser.value?.role === 'admin')
+
+/** 模板归属徽章：公共 / 我的 / 第三方 */
+function ownerTag(row: TemplateItem): { text: string; type: 'info' | 'success' | 'warning' } {
+  if (row.value.owner_type === 'system') return { text: '系统·公共', type: 'info' }
+  if (row.value.is_mine) return { text: '我的', type: 'success' }
+  if (row.value.owner_type === 'client') return { text: '第三方', type: 'warning' }
+  return { text: '他人', type: 'warning' }
+}
+
+/** 模板可否编辑/删除：本人模板随时可管；系统模板仅 admin */
+function canEditTemplate(row: TemplateItem): boolean {
+  if (row.value.owner_type === 'system') return isAdmin.value
+  return !!row.value.is_mine
+}
 
 async function load() {
   loading.value = true
@@ -151,14 +170,39 @@ async function download(row: TemplateItem) {
       <div class="ttl serif">文种模板库</div>
       <span class="text-muted">上传模板文件自动解析版式，或直接编辑标准模板</span>
       <div class="spacer" />
-      <el-button @click="seed">初始化标准模板</el-button>
+      <el-button v-if="isAdmin" @click="seed">初始化标准模板</el-button>
       <el-button type="primary" @click="uploadDialog = true">上传模板文件</el-button>
+    </div>
+
+    <!-- 模板所有权说明（用户 2026-10-14：与空间管理同一套所有者逻辑） -->
+    <div class="own-banner">
+      <span class="own-banner-icon">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 018 0v3" />
+        </svg>
+      </span>
+      <span>
+        <b>模板所有权：</b>你上传/创建的模板<b>仅你可见、仅你可编辑与删除</b>，起草时也仅你可引用；
+        第三方应用同理（其模板仅该应用可用）。<b>系统标准模板</b>为公共模板，所有人可见、可引用，仅管理员可维护。
+      </span>
     </div>
 
     <el-table :data="rows" v-loading="loading" empty-text="暂无模板，点击「初始化标准模板」或「上传模板文件」">
       <el-table-column prop="value.doc_type" label="文种" width="100" />
       <el-table-column prop="key" label="模板编码" width="180" show-overflow-tooltip />
-      <el-table-column prop="value.name" label="名称" min-width="200" show-overflow-tooltip />
+      <el-table-column prop="value.name" label="名称" min-width="180" show-overflow-tooltip />
+      <el-table-column label="归属" width="120">
+        <template #default="{ row }">
+          <el-tooltip
+            v-if="row.value.owner_type !== 'system'"
+            content="仅创建者可见、可编辑、可引用起草"
+            placement="top"
+          >
+            <el-tag :type="ownerTag(row).type" size="small" effect="dark">{{ ownerTag(row).text }}</el-tag>
+          </el-tooltip>
+          <el-tag v-else :type="ownerTag(row).type" size="small" effect="dark">{{ ownerTag(row).text }}</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="来源" width="110">
         <template #default="{ row }">
           <el-tag :type="row.value.content_ref ? 'success' : 'info'" size="small">
@@ -166,22 +210,25 @@ async function download(row: TemplateItem) {
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="版式要点" min-width="220">
+      <el-table-column label="版式要点" min-width="200">
         <template #default="{ row }">
           {{ row.value.layout.red_head ? '红头 · ' : '' }}{{ row.value.layout.font }} · {{ row.value.layout.paper }} ·
           {{ (row.value.layout.sections || []).length }} 个章节
         </template>
       </el-table-column>
-      <el-table-column label="章节结构" min-width="220" show-overflow-tooltip>
+      <el-table-column label="章节结构" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
           {{ (row.value.layout.sections || []).map((s: TemplateSection) => s.label).join(' → ') || '—' }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="220">
+      <el-table-column label="操作" width="250">
         <template #default="{ row }">
-          <el-button link type="primary" @click="openEditor(row)">编辑版式</el-button>
-          <el-button link type="primary" @click="download(row)">下载文件</el-button>
-          <el-button link type="danger" @click="remove(row)">删除</el-button>
+          <template v-if="canEditTemplate(row)">
+            <el-button link type="primary" @click="openEditor(row)">编辑版式</el-button>
+            <el-button link type="primary" @click="download(row)">下载文件</el-button>
+            <el-button link type="danger" @click="remove(row)">删除</el-button>
+          </template>
+          <span v-else class="tpl-readonly text-muted">只读（{{ ownerTag(row).text === '系统·公共' ? '系统模板仅管理员可维护' : '他人模板' }}）</span>
         </template>
       </el-table-column>
     </el-table>
@@ -206,6 +253,8 @@ async function download(row: TemplateItem) {
     </el-form>
     <el-alert type="info" :closable="false" show-icon
       title="上传后自动解析正文，按编号标题（一、/（一）/1.）提取章节结构，可在「编辑版式」中调整。" />
+    <el-alert type="warning" :closable="false" show-icon style="margin-top: 8px"
+      title="上传的模板仅你（或你的应用）可见、可编辑、可引用；他人不可见（用户 2026-10-14 所有权规则）。" />
     <template #footer>
       <el-button @click="uploadDialog = false">取消</el-button>
       <el-button type="primary" :loading="uploading" @click="submitUpload">上传并解析</el-button>
@@ -261,4 +310,15 @@ async function download(row: TemplateItem) {
 .up-tip { color: var(--text-muted); padding: 18px 0; }
 .sections { display: flex; flex-direction: column; gap: 8px; width: 100%; }
 .sec-row { display: flex; align-items: center; gap: 8px; }
+/* 模板所有权横幅（与文档库空间所有权同一风格） */
+.own-banner {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 9px 12px; margin-bottom: 14px;
+  border: 1px solid var(--brand-line); border-radius: 8px;
+  background: var(--brand-soft);
+  font-size: 12px; line-height: 1.7; color: var(--text);
+}
+.own-banner b { color: var(--text-strong); }
+.own-banner-icon { color: var(--brand); flex-shrink: 0; margin-top: 2px; }
+.tpl-readonly { font-size: 12px; }
 </style>

@@ -5,16 +5,20 @@
   B. 他人空间不可上传（403）、不可检索（403）、不可绑定会话（403）；
   C. 默认空间为公共空间：所有人可见、可上传；
   D. 文档列表/任务列表按所有权过滤；
-  E. 删除/更新仅 owner 可操作。
+  E. 删除/更新仅 owner 可操作；
+  F. 模板所有权（2026-10-14 追加）：本人模板仅本人可见/可编辑/可删除/
+     可引用起草；系统标准模板公共可见，仅 admin 可维护。
 
 用法：PYTHONPATH=. uv run python scripts/verify_ownership.py
 """
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 BASE = "http://127.0.0.1:8000/v1"
 
@@ -34,7 +38,41 @@ def _req(method: str, path: str, body: dict | None = None, token: str | None = N
     if api_key:
         r.add_header("X-API-Key", api_key)
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            raw = resp.read().decode()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw
+
+
+def _upload(path: str, fields: dict[str, str], file_field: str, filename: str,
+            content: bytes, token: str | None = None,
+            api_key: str | None = None) -> tuple[int, object]:
+    """multipart/form-data 上传（模板文件上传用），返回 (status, json_or_text)。"""
+    boundary = f"----wb{secrets.token_hex(8)}"
+    parts: list[bytes] = []
+    for k, v in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+        f'filename="{filename}"\r\nContent-Type: text/plain\r\n\r\n'.encode()
+        + content + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    r = urllib.request.Request(BASE + path, data=b"".join(parts), method="POST")
+    r.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    if token:
+        r.add_header("Authorization", f"Bearer {token}")
+    if api_key:
+        r.add_header("X-API-Key", api_key)
+    try:
+        with urllib.request.urlopen(r, timeout=60) as resp:
             raw = resp.read().decode()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -75,7 +113,6 @@ def register_client(name: str) -> str:
 
 def main() -> None:
     # 每次运行使用唯一编码（空间 code 全局唯一，保证脚本可重复执行）
-    import secrets
     tag = secrets.token_hex(3)
 
     # ---- 身份准备 ----
@@ -181,6 +218,108 @@ def main() -> None:
     check("用户A 重命名本人空间 → 200", st == 200, f"got {st}")
     st, _ = _req("DELETE", "/spaces/spcdefault0000000000000000000", token=admin_tok)
     check("默认空间不可删除（admin 也拒）→ 409", st == 409, f"got {st}")
+
+    # ---- F. 模板所有权（2026-10-14：与空间同一套所有者逻辑）----
+    print("== F. 模板所有权 ==")
+    tpl_a_code = f"tpl-a-{tag}"
+    st, tpl_a = _req("POST", "/templates", {
+        "category": "template", "key": tpl_a_code,
+        "value": {"doc_type": "通知", "name": "用户A的私有通知模板", "layout": {
+            "red_head": True, "font": "仿宋_GB2312", "paper": "A4",
+            "subtitle": "", "tone": "", "sections": [
+                {"key": "body", "label": "正文", "placeholder": "", "required": True},
+            ],
+        }},
+    }, token=tok_a)
+    check("用户A 创建模板 → 200", st == 200, f"{st} {tpl_a}")
+    check("新建模板归属用户A（owner_type=user, is_mine）",
+          tpl_a.get("value", {}).get("owner_type") == "user"
+          and tpl_a.get("value", {}).get("is_mine") is True)
+
+    # F1. 可见性：他人列表不可见；系统标准模板公共可见
+    st, lst_a = _req("GET", "/templates", token=tok_a)
+    keys_a = {t["key"] for t in lst_a}
+    check("用户A 列表含本人模板 + 系统标准模板（通知）",
+          tpl_a_code in keys_a and "通知" in keys_a)
+    st, lst_b = _req("GET", "/templates", token=tok_b)
+    check("用户B 列表不含用户A模板", tpl_a_code not in {t["key"] for t in lst_b})
+    check("用户B 列表含系统标准模板（公共）", "通知" in {t["key"] for t in lst_b})
+    st, lst_c2 = _req("GET", "/templates", api_key=key_c2)
+    check("客户端C2 列表不含用户A模板、含系统标准模板",
+          tpl_a_code not in {t["key"] for t in lst_c2} and "通知" in {t["key"] for t in lst_c2})
+
+    # F2. 维护隔离：他人不可改、不可删；系统模板仅 admin
+    st, d = _req("POST", "/templates", {
+        "category": "template", "key": tpl_a_code,
+        "value": {"doc_type": "通知", "name": "被篡改的模板名", "layout": {}},
+    }, token=tok_b)
+    check("用户B 改写用户A模板 → 403", st == 403, f"got {st} {d}")
+    st, _ = _req("DELETE", f"/templates/{tpl_a_code}", api_key=key_c2)
+    check("客户端C2 删除用户A模板 → 403", st == 403, f"got {st}")
+    st, d = _req("POST", "/templates", {
+        "category": "template", "key": "通知",
+        "value": {"doc_type": "通知", "name": "试图篡改系统模板", "layout": {}},
+    }, token=tok_b)
+    check("用户B 改写系统标准模板 → 403", st == 403, f"got {st} {d}")
+    st, d = _req("POST", "/templates", {
+        "category": "template", "key": "通知",
+        "value": {"doc_type": "通知", "name": "试图篡改系统模板", "layout": {}},
+    }, api_key=key_c1)
+    check("客户端C1 改写系统标准模板 → 403", st == 403, f"got {st} {d}")
+    # admin 原样回存系统模板（无损更新，仅验证权限放行）
+    st, sys_tpl = _req("GET", "/templates", token=admin_tok)
+    seed_row = next((t for t in sys_tpl if t["key"] == "通知"), None)
+    st, d = _req("POST", "/templates", {
+        "category": "template", "key": "通知",
+        "value": {"doc_type": seed_row["value"]["doc_type"],
+                  "name": seed_row["value"]["name"],
+                  "layout": seed_row["value"]["layout"]},
+    }, token=admin_tok)
+    check("admin 维护系统标准模板 → 200", st == 200, f"got {st} {d}")
+    st, _ = _req("POST", "/templates/seed", token=tok_b)
+    check("普通用户手动种子 → 403（公共模板库限 admin）", st == 403, f"got {st}")
+    st, d = _req("POST", "/templates/seed", token=admin_tok)
+    check("admin 手动种子 → 200（库非空时 no-op）", st == 200 and d.get("added") == 0, f"{st} {d}")
+
+    # F3. 上传归属 + 原件下载隔离
+    up_content = "一、模板正文\n\n各单位遵照执行。\n".encode()
+    st, tpl_c1 = _upload("/templates/upload", {"doc_type": "通知", "name": "C1上传的通知模板"},
+                         "file", "通知_template.txt", up_content, api_key=key_c1)
+    check("客户端C1 上传模板文件 → 200", st == 200, f"{st} {tpl_c1}")
+    c1_code = tpl_c1.get("key", "")
+    check("上传模板归属客户端C1", tpl_c1.get("value", {}).get("owner_type") == "client"
+          and tpl_c1.get("value", {}).get("is_mine") is True)
+    st, lst_a2 = _req("GET", "/templates", token=tok_a)
+    check("用户A 列表不含C1上传的模板", c1_code not in {t["key"] for t in lst_a2})
+    # code 可能含中文（如「通知_ab12cd」），URL 必须百分号编码
+    st, _ = _req("GET", f"/templates/{quote(c1_code)}/file", token=tok_b)
+    check("用户B 下载C1模板原件 → 404（不可见）", st == 404, f"got {st}")
+    st, _ = _req("GET", f"/templates/{quote(c1_code)}/file", api_key=key_c2)
+    check("客户端C2 下载C1模板原件 → 404（不可见）", st == 404, f"got {st}")
+
+    # F4. 起草引用隔离：他人模板 code 引用 → 403；系统/本人模板可引用
+    st, d = _req("POST", "/generate", {
+        "query": "起草一份关于安全生产检查的通知", "template_code": tpl_a_code,
+    }, token=tok_b)
+    check("用户B 引用用户A模板起草 → 403", st == 403, f"got {st} {d}")
+    st, d = _req("POST", "/generate", {
+        "query": "起草一份关于安全生产检查的通知", "template_code": tpl_a_code,
+    }, api_key=key_c2)
+    check("客户端C2 引用用户A模板起草 → 403", st == 403, f"got {st} {d}")
+    st, d = _req("POST", "/generate", {
+        "query": "起草一份关于安全生产检查的通知", "template_code": "通知",
+    }, token=tok_b)
+    check("用户B 引用系统标准模板起草 → 200（公共模板可用）", st == 200, f"got {st} {d}")
+    st, d = _req("POST", "/generate", {
+        "query": "起草一份关于安全生产检查的通知", "template_code": tpl_a_code,
+    }, token=tok_a)
+    check("用户A 引用本人模板起草 → 200", st == 200, f"got {st} {d}")
+
+    # F5. 清理（同时验证 owner 可删除本人模板）
+    st, _ = _req("DELETE", f"/templates/{tpl_a_code}", token=tok_a)
+    check("用户A 删除本人模板 → 200", st == 200, f"got {st}")
+    st, _ = _req("DELETE", f"/templates/{quote(c1_code)}", api_key=key_c1)
+    check("客户端C1 删除本人上传模板 → 200", st == 200, f"got {st}")
 
     # ---- 汇总 ----
     print()

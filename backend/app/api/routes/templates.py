@@ -5,6 +5,12 @@
 2. 结构化版式编辑：红头/字体/纸张/语气/章节（可视化表单，不接触原始 JSON）。
 
 首次启动自动种子 8 类标准公文模板，保证模板库"开箱即用、非空白"。
+
+所有权隔离（用户 2026-10-14 需求：模板管理与空间管理同一套所有者逻辑）：
+- 系统标准模板（种子，owner_type=system）：所有人可见、可引用起草，
+  仅 admin 可维护（编辑/删除）；
+- 第三方/用户上传或新建的模板：仅创建者本人可见（列表/下载）、
+  可编辑、可删除；他人在列表中不可见，引用其 code 起草时 403。
 """
 
 from __future__ import annotations
@@ -14,14 +20,15 @@ import re
 import uuid
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Template
 from app.db.session import AsyncSessionLocal, get_db
 from app.schemas.contracts import ConfigItem
+from app.services.auth import Caller, get_caller
 from app.services.parser import parse_bytes
 from app.services.storage import get_storage
 
@@ -199,11 +206,76 @@ def _extract_layout(text: str) -> dict:
     }
 
 
+def template_owner_of(caller: Caller) -> tuple[str, str, str]:
+    """调用方 → (owner_type, owner_id, owner_name)。
+
+    与空间所有权（spaces.owner_of）同一套语义：用户 JWT → user/<user.id>；
+    第三方 API Key → client/<client_id>。
+    """
+    kind = "user" if caller.kind == "user" else "client"
+    return kind, caller.id, caller.name or caller.id
+
+
+def is_template_owner(row: Template, caller: Caller) -> bool:
+    """当前调用方是否为该模板的创建者（系统标准模板不属于任何人）。"""
+    if row.owner_type == "system":
+        return False
+    kind, owner_id, _ = template_owner_of(caller)
+    return row.owner_type == kind and row.owner_id == owner_id
+
+
+def template_visible_cond(caller: Caller):
+    """模板可见性过滤条件：系统标准模板（公共）+ 本人创建的模板。
+
+    返回 SQLAlchemy 布尔表达式，供列表查询/模板解析复用；
+    他人模板对本调用方不可见（列表不返回，引用其 code 起草时 403）。
+    """
+    kind, owner_id, _ = template_owner_of(caller)
+    return or_(
+        Template.owner_type == "system",
+        (Template.owner_type == kind) & (Template.owner_id == owner_id),
+    )
+
+
+async def assert_template_manageable(row: Template, caller: Caller) -> None:
+    """模板维护权限（编辑/删除）：本人模板随时可管；系统模板仅 admin。
+
+    与"默认空间仅 admin 可改名"一致：系统标准模板是公共资产，
+    普通用户与其他客户端只读可用，防止越权篡改公共模板。
+    """
+    if is_template_owner(row, caller):
+        return
+    if row.owner_type == "system":
+        if caller.kind == "user" and caller.role == "admin":
+            return
+        raise HTTPException(status_code=403, detail="系统标准模板仅管理员可维护")
+    raise HTTPException(status_code=403, detail="仅模板创建者可维护该模板")
+
+
+def _template_value(row: Template, caller: Caller) -> dict:
+    """模板 → ConfigItem.value（含所有权视图字段，前端据此展示归属与管控按钮）。"""
+    return {
+        "doc_type": row.doc_type,
+        "name": row.name,
+        "layout": row.layout,
+        "content_ref": row.content_ref,
+        "owner_type": row.owner_type or "system",
+        "owner_id": row.owner_id,
+        "owner_name": row.owner_name,
+        # 是否本人创建（前端据此开放编辑/删除）
+        "is_mine": is_template_owner(row, caller),
+        # 是否可维护：本人模板 / admin 管系统模板
+        "can_edit": is_template_owner(row, caller)
+        or (row.owner_type == "system" and caller.kind == "user" and caller.role == "admin"),
+    }
+
+
 async def ensure_seed_templates() -> int:
     """启动种子：若模板库为空，写入 8 类标准公文模板。返回新增数量。
 
     种子模板的 code 与 doc_type 同名（如「通知」），作为该文种的默认模板；
     后续可在「模板库」页为同一文种增配多个模板（code 不同）。
+    种子模板 owner_type=system：公共可见、可引用起草，仅 admin 可维护。
     """
     async with AsyncSessionLocal() as db:
         existing = (await db.execute(select(Template))).scalars().all()
@@ -213,13 +285,21 @@ async def ensure_seed_templates() -> int:
             db.add(Template(
                 doc_type=t["doc_type"], code=t["doc_type"], name=t["name"],
                 layout=t["layout"], is_active=True,
+                owner_type="system", owner_id=None, owner_name="系统",
             ))
         await db.commit()
         return len(_SEED_TEMPLATES)
 
 
 @router.post("/seed", summary="手动初始化标准模板库")
-async def seed_templates() -> dict:
+async def seed_templates(caller: Caller = Depends(get_caller)) -> dict:
+    """手动种子：写入系统标准模板（owner_type=system，公共模板）。
+
+    限 admin：种子模板是公共资产，由管理员统一初始化，
+    避免普通用户/第三方触发公共模板库变更（与系统模板仅 admin 可维护一致）。
+    """
+    if caller.kind != "user" or caller.role != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可初始化标准模板库")
     added = await ensure_seed_templates()
     return {"added": added, "message": "模板库已就绪" if added else "模板库已存在，无需初始化"}
 
@@ -230,11 +310,15 @@ async def upload_template(
     doc_type: str = Form(""),
     name: str = Form(""),
     db: AsyncSession = Depends(get_db),
+    caller: Caller = Depends(get_caller),
 ) -> ConfigItem:
     """上传模板文件接入：解析正文 → 识别文种 → 提取章节结构 → 入库。
 
     原始文件存入对象存储（content_ref），前端可随时下载原件；
     解析出的结构化版式供可视化编辑与生成时按文种起草使用。
+
+    所有权：模板归属当前调用方（用户/第三方），仅本人可见、可维护，
+    他人不可见、不可引用（用户 2026-10-14 需求）。
     """
     raw = await file.read()
     filename = file.filename or "template"
@@ -253,6 +337,7 @@ async def upload_template(
     # 每次上传作为**独立模板**（支持同一文种配置多个模板）：以 code 唯一标识，
     # 缺省用「文种_随机」生成，避免与同文种其它模板冲突；同名文种已有模板不再被覆盖。
     code = f"{resolved_type}_{uuid.uuid4().hex[:6]}"
+    owner_type, owner_id, owner_name = template_owner_of(caller)
     row = Template(
         doc_type=resolved_type,
         code=code,
@@ -260,6 +345,9 @@ async def upload_template(
         layout=layout,
         content_ref=key,
         is_active=True,
+        owner_type=owner_type,
+        owner_id=owner_id,
+        owner_name=owner_name,
     )
     db.add(row)
     await db.commit()
@@ -267,44 +355,51 @@ async def upload_template(
     return ConfigItem(
         category="template",
         key=row.code,
-        value={
-            "doc_type": row.doc_type,
-            "name": row.name,
-            "layout": row.layout,
-            "content_ref": row.content_ref,
-        },
+        value=_template_value(row, caller),
     )
 
 
 @router.get("", summary="列出模板库")
-async def list_templates(db: AsyncSession = Depends(get_db)) -> list[ConfigItem]:
-    """列出全部启用模板（同一文种可有多条，以 code 区分）。"""
-    rows = (await db.execute(select(Template).where(Template.is_active.is_(True)).order_by(Template.doc_type, Template.created_at))).scalars().all()
-    return [
-        ConfigItem(
-            category="template",
-            key=t.code,
-            value={
-                "doc_type": t.doc_type,
-                "name": t.name,
-                "layout": t.layout,
-                "content_ref": t.content_ref,
-            },
+async def list_templates(
+    db: AsyncSession = Depends(get_db), caller: Caller = Depends(get_caller),
+) -> list[ConfigItem]:
+    """列出本人可见的启用模板：系统标准模板（公共）+ 本人创建的。
+
+    同一文种可有多条，以 code 区分；他人模板不可见（用户 2026-10-14 需求）。
+    """
+    rows = (
+        await db.execute(
+            select(Template)
+            .where(Template.is_active.is_(True), template_visible_cond(caller))
+            .order_by(Template.owner_type, Template.doc_type, Template.created_at)
         )
+    ).scalars().all()
+    return [
+        ConfigItem(category="template", key=t.code, value=_template_value(t, caller))
         for t in rows
     ]
 
 
 @router.get("/{code}/file", summary="下载模板原始文件")
-async def download_template(code: str, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
-    """按模板 code 下载上传的模板原件（无上传文件时返回 404）。"""
+async def download_template(
+    code: str, db: AsyncSession = Depends(get_db), caller: Caller = Depends(get_caller),
+) -> StreamingResponse:
+    """按模板 code 下载上传的模板原件（无上传文件时返回 404）。
+
+    所有权：他人模板不可见 → 404（不暴露存在性），与列表过滤语义一致。
+    """
     row = (
         await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if not row or not row.content_ref:
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=404, detail="该模板暂无上传的模板文件")
+    # 可见性校验：系统模板公共可见；他人模板等同不存在
+    kind, owner_id, _ = template_owner_of(caller)
+    visible = row.owner_type == "system" or (
+        row.owner_type == kind and row.owner_id == owner_id
+    )
+    if not visible:
+        raise HTTPException(status_code=404, detail="模板不存在或无权访问")
     data = get_storage().get(row.content_ref)
     ext = row.content_ref.rsplit(".", 1)[-1].lower()
     media = {
@@ -330,16 +425,20 @@ async def download_template(code: str, db: AsyncSession = Depends(get_db)) -> St
 
 
 @router.post("", summary="新增/更新模板（结构化版式）")
-async def create_template(item: ConfigItem, db: AsyncSession = Depends(get_db)) -> ConfigItem:
+async def create_template(
+    item: ConfigItem, db: AsyncSession = Depends(get_db),
+    caller: Caller = Depends(get_caller),
+) -> ConfigItem:
     """按 code 保存结构化版式（红头/字体/纸张/章节），来自前端可视化编辑器。
 
     code 为模板唯一标识（同一文种可有多条，code 不同）；已存在则更新，否则新建。
     value 内需携带 doc_type（文种分类）与 name（模板名称）。
+
+    所有权：新建模板归属当前调用方；更新他人/系统模板需相应权限
+    （本人模板随时可改；系统标准模板仅 admin）——用户 2026-10-14 需求。
     """
     code = item.key
     if not code or not code.strip():
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=400, detail="模板 code 不能为空")
     doc_type = (item.value.get("doc_type") or "").strip() or code
     name = item.value.get("name") or doc_type
@@ -348,32 +447,37 @@ async def create_template(item: ConfigItem, db: AsyncSession = Depends(get_db)) 
         await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if existing:
+        # 更新已存在模板：需维护权限（本人 / admin 管系统模板）
+        await assert_template_manageable(existing, caller)
         existing.doc_type = doc_type
         existing.name = name
         existing.layout = layout
     else:
-        existing = Template(doc_type=doc_type, code=code, name=name, layout=layout)
+        owner_type, owner_id, owner_name = template_owner_of(caller)
+        existing = Template(
+            doc_type=doc_type, code=code, name=name, layout=layout,
+            owner_type=owner_type, owner_id=owner_id, owner_name=owner_name,
+        )
         db.add(existing)
     await db.commit()
     await db.refresh(existing)
     return ConfigItem(
         category="template",
         key=existing.code,
-        value={
-            "doc_type": existing.doc_type,
-            "name": existing.name,
-            "layout": existing.layout,
-            "content_ref": existing.content_ref,
-        },
+        value=_template_value(existing, caller),
     )
 
 
 @router.delete("/{code}", summary="删除模板")
-async def delete_template(code: str, db: AsyncSession = Depends(get_db)) -> dict:
+async def delete_template(
+    code: str, db: AsyncSession = Depends(get_db), caller: Caller = Depends(get_caller),
+) -> dict:
+    """删除模板：仅创建者本人；系统标准模板仅 admin（用户 2026-10-14 需求）。"""
     existing = (
         await db.execute(select(Template).where(Template.code == code))
     ).scalar_one_or_none()
     if existing:
+        await assert_template_manageable(existing, caller)
         await db.delete(existing)
         await db.commit()
         return {"deleted": True}

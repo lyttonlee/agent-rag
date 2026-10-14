@@ -838,6 +838,16 @@ export interface TemplateItem {
     name: string
     layout: TemplateLayout
     content_ref?: string | null
+    /** 所有者类型：system=系统标准模板（公共）/ user=运维用户 / client=第三方 */
+    owner_type?: 'system' | 'user' | 'client'
+    /** 所有者 ID（user.id / client.client_id）；system 为 null */
+    owner_id?: string | null
+    /** 所有者展示名（冗余存储） */
+    owner_name?: string | null
+    /** 当前调用方是否为创建者（前端据此开放编辑/删除） */
+    is_mine?: boolean
+    /** 当前调用方是否可维护（本人模板 / admin 管系统模板） */
+    can_edit?: boolean
   }
 }
 

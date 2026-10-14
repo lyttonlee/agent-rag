@@ -49,7 +49,11 @@ async function loadTemplates() {
     const grouped: Record<string, { code: string; name: string }[]> = {}
     for (const it of items) {
       const t = it.value.doc_type
-      ;(grouped[t] ||= []).push({ code: it.key, name: it.value.name })
+      // 归属标注（2026-10-14 所有权）：系统标准模板为公共，本人/第三方模板私有
+      const own = it.value.owner_type === 'system'
+        ? '（公共）'
+        : it.value.is_mine ? '（我的）' : '（第三方）'
+      ;(grouped[t] ||= []).push({ code: it.key, name: `${it.value.name}${own}` })
     }
     templatesByType.value = grouped
     // 默认选中当前文种的首个模板

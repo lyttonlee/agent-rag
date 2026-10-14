@@ -9,9 +9,8 @@
 
 from __future__ import annotations
 
-import io
-import tempfile
 import os
+import tempfile
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -20,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.schemas.contracts import GenerateRequest
 from app.services.auth import Caller, get_caller
-from app.services.generation import generate_answer
+from app.services.generation import assert_template_usable, generate_answer
 
 router = APIRouter(prefix="/export", tags=["export"])
 
@@ -33,12 +32,14 @@ async def export_docx(
     """生成并下载 docx（含引用与敏感词校验）。
 
     权限管控与 /v1/generate 一致：第三方需具备 chat 能力域；
-    请求体 max_clearance 被调用方额度压低（防超额检索涉密内容后导出）。
+    请求体 max_clearance 被调用方额度压低（防超额检索涉密内容后导出）；
+    模板所有权校验（用户 2026-10-14）：他人模板不可引用导出。
     """
     if not caller.allows_scope("chat"):
         raise HTTPException(status_code=403, detail="该客户端无 chat 能力域权限")
     req.max_clearance = caller.cap_clearance(req.max_clearance)
-    resp = await generate_answer(db, req)
+    await assert_template_usable(db, req, caller)
+    resp = await generate_answer(db, req, caller=caller)
 
     from docx import Document
 

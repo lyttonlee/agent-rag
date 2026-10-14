@@ -21,7 +21,8 @@ from __future__ import annotations
 import json
 import logging
 
-from sqlalchemy import select
+from fastapi import HTTPException
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import redact_sensitive
@@ -36,6 +37,7 @@ from app.services.agent import (
     load_agent_config,
 )
 from app.services.audit import record_audit
+from app.services.auth import Caller
 from app.services.generation_prompt import build_generation_messages
 from app.services.model_provider import ModelProvider
 from app.services.retrieval import retrieve_enhanced
@@ -83,51 +85,103 @@ async def _ensure_draft_conversation(
     return row.id
 
 
-async def _resolve_template(db: AsyncSession, req: GenerateRequest) -> tuple[str | None, str | None]:
+async def _resolve_template(
+    db: AsyncSession, req: GenerateRequest, caller: Caller | None = None
+) -> tuple[str | None, str | None]:
     """解析起草模板：优先 template_code 精确定位，否则按 doc_type 取首个启用模板。
 
     返回 (doc_type, name)；均未命中时回退 (req.template_doc_type, None)。
     同文种可配置多模板（如多类「通知」），用户选定具体模板后 code 精确命中，
     使文种指令带出"模板：XXX"，生成更贴合所选模板。
+
+    所有权（用户 2026-10-14 需求）：caller 非空时仅能解析
+    「系统标准模板 + 本人模板」；显式指定的 template_code 属于他人时
+    直接 403（不静默回退——避免"选了模板却没生效"的困惑，也不暴露
+    模板内容，与列表过滤的"不可见"语义一致）。
     """
     if req.template_code:
         row = (
             await db.execute(
-                select(Template).where(
-                    Template.code == req.template_code, Template.is_active.is_(True)
-                )
+                select(Template).where(Template.code == req.template_code)
             )
         ).scalar_one_or_none()
-        if row:
+        if row and caller is not None and not (
+            row.owner_type == "system"
+            or (
+                row.owner_type == ("user" if caller.kind == "user" else "client")
+                and row.owner_id == caller.id
+            )
+        ):
+            raise HTTPException(
+                status_code=403, detail="无权使用该模板（仅创建者与系统标准模板可用）"
+            )
+        if row and row.is_active:
             return row.doc_type, row.name
     if req.template_doc_type:
-        row = (
-            await db.execute(
-                select(Template)
-                .where(Template.doc_type == req.template_doc_type, Template.is_active.is_(True))
-                .order_by(Template.created_at)
+        stmt = select(Template).where(
+            Template.doc_type == req.template_doc_type, Template.is_active.is_(True)
+        )
+        if caller is not None:
+            kind = "user" if caller.kind == "user" else "client"
+            stmt = stmt.where(
+                or_(
+                    Template.owner_type == "system",
+                    (Template.owner_type == kind) & (Template.owner_id == caller.id),
+                )
             )
-        ).scalars().first()
+        row = (await db.execute(stmt.order_by(Template.created_at))).scalars().first()
         if row:
             return row.doc_type, row.name
     return req.template_doc_type, None
 
 
-async def generate_answer(db: AsyncSession, req: GenerateRequest) -> dict:
+async def assert_template_usable(
+    db: AsyncSession, req: GenerateRequest, caller: Caller | None
+) -> None:
+    """路由入口的模板所有权校验（用户 2026-10-14 需求）。
+
+    在进入生成链路（尤其 SSE 流式，响应头已发出无法再改状态码）
+    之前拦截：显式指定的 template_code 若属于他人 → 403。
+    与 _resolve_template 内部过滤互为双保险（防御性编程）。
+    """
+    if caller is None or not req.template_code:
+        return
+    row = (
+        await db.execute(select(Template).where(Template.code == req.template_code))
+    ).scalar_one_or_none()
+    if row and not (
+        row.owner_type == "system"
+        or (
+            row.owner_type == ("user" if caller.kind == "user" else "client")
+            and row.owner_id == caller.id
+        )
+    ):
+        raise HTTPException(
+            status_code=403, detail="无权使用该模板（仅创建者与系统标准模板可用）"
+        )
+
+
+async def generate_answer(
+    db: AsyncSession, req: GenerateRequest, caller: Caller | None = None
+) -> dict:
     """非流式生成（保留原有接口）。返回结构化结果字典。
 
     与 stream_generate 保持一致的无材料兜底：未检索到参考材料时切换
     自身能力提示词，答案追加甄别声明。
+
+    caller：当前认证主体（用户/第三方），用于模板所有权解析——
+    仅能使用系统标准模板与本人模板（用户 2026-10-14 需求）；
+    脚本等无认证上下文场景传 None（不过滤，向后兼容）。
     """
     retrieve_resp = await retrieve_enhanced(db, req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
-    # 检索参数（向量距离阈值）与提示词模板均来自配置中心，缺项回退默认
+    # 检索参数（向量距离阈值）与提示词模板均来自配置中心，缺省回退默认
     cfg = await load_retrieval_config(db)
     templates = await load_prompt_templates(db)
     no_materials = is_no_useful_info(retrieve_resp, cfg.vec_distance_threshold)
 
     # 解析起草模板（code 优先 / doc_type 兜底），把文种与模板名注入提示词
-    resolved_doc_type, template_name = await _resolve_template(db, req)
+    resolved_doc_type, template_name = await _resolve_template(db, req, caller)
     req.template_doc_type = resolved_doc_type
 
     gen = ModelProvider(role="gen")
@@ -154,7 +208,10 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "anonymous"):
+async def stream_generate(
+    db: AsyncSession, req: GenerateRequest, actor: str = "anonymous",
+    caller: Caller | None = None,
+):
     """流式生成，产出 SSE 文本片段（字符串）。
 
     事件序列：
@@ -174,7 +231,8 @@ async def stream_generate(db: AsyncSession, req: GenerateRequest, actor: str = "
     """
     # 解析起草模板（code 优先 / doc_type 兜底）：拿到文种与模板名，供文种指令
     # 与（draft 会话）文种落库回显使用。需在建会话前完成，以便把 doc_type 写入会话。
-    resolved_doc_type, template_name = await _resolve_template(db, req)
+    # caller 传入以执行模板所有权过滤（他人模板 403）。
+    resolved_doc_type, template_name = await _resolve_template(db, req, caller)
     req.template_doc_type = resolved_doc_type
 
     # 会话收敛：无 conversation_id 时不建会话（保持旧行为兼容）

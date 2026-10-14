@@ -185,10 +185,19 @@ class Chunk(Base, TimestampMixin):
 
 
 class Template(Base, TimestampMixin):
-    """文种模板库（我方维护，第三方可导入样式）。
+    """文种模板库（系统标准模板 + 第三方/用户自有模板）。
 
     支持同一文种配置多个模板（如多类「通知」），通过 code 唯一标识；
     doc_type 退化为文种分类（非唯一），起草时用户先选文种、再选具体模板。
+
+    所有权（用户 2026-10-14 需求：模板管理同样按所有者隔离，与空间一致）：
+    - owner_type：system=系统标准模板（种子 8 类，所有人可见、可引用起草）；
+      user=运维台用户私有；client=第三方客户端私有；
+    - owner_id：user.id / client.client_id（system 为 NULL）；
+    - 隔离规则：非 system 模板仅 owner 本人可见（列表/下载）、
+      可编辑/删除；他人在列表中不可见，引用其 code 起草时 403。
+      系统标准模板仅 admin 可维护（与"默认空间仅 admin 可改名"一致），
+      普通用户与其他客户端只读可用。
     """
 
     __tablename__ = "templates"
@@ -203,6 +212,20 @@ class Template(Base, TimestampMixin):
     layout: Mapped[dict] = mapped_column(JSON, default=dict)
     content_ref: Mapped[str | None] = mapped_column(String(512))   # 模板样例文件
     is_active: Mapped[bool] = mapped_column(default=True)
+    # ---- 所有权（2026-10-14，与 DocumentSpace 同一套语义）----
+    # system=系统标准模板（公共可见）；user/client=创建者私有
+    owner_type: Mapped[str] = mapped_column(
+        String(16), default="system", server_default="system", index=True
+    )
+    # 所有者 ID：user.id 或 client.client_id；owner_type=system 时为 NULL
+    owner_id: Mapped[str | None] = mapped_column(String(48), index=True)
+    # 所有者展示名（冗余存储，避免列表场景反查 users/api_clients）
+    owner_name: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        # 所有权复合索引：列表/可见性过滤固定按 (owner_type, owner_id) 命中
+        Index("ix_templates_owner", "owner_type", "owner_id"),
+    )
 
 
 class ConfigKV(Base, TimestampMixin):
