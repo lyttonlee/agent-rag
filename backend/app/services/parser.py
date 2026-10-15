@@ -262,5 +262,9 @@ def parse_bytes(filename: str, data: bytes, *, noise_clean: bool = True) -> Pars
         return parse_ofd_bytes(data, noise_clean=noise_clean)
     if fmt == "text":
         return parse_text_bytes(data, noise_clean=noise_clean)
-    # 其它格式（wps 等）二期或经格式适配器预处理
-    raise ValueError(f"暂不支持的解析格式：{filename}")
+    # 其它格式（wps 等）二期或经格式适配器预处理。
+    # 报错列出全部支持格式：调用方（入库任务）会把该消息原样落库到
+    # job.error_message，是用户/运维判断"为何这个文件入不了库"的唯一线索，
+    # 因此宁可啰嗦也不能只说"不支持"。
+    supported = "PDF / DOCX(.doc) / OFD / TXT(.md)"
+    raise ValueError(f"暂不支持的解析格式：{filename}（支持：{supported}）")

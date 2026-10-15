@@ -29,9 +29,17 @@ _DEFAULT_PAGE_HEIGHT = 297.0
 def _page_runs(croot, page_index: int) -> list[TextRun]:
     """从单个 Content.xml 提取文本片段。
 
-    坐标取值优先级：TextCode 自身 X/Y → 父级 TextObject Boundary 左上角。
-    某些厂商文件 TextCode 不带坐标（相对绘制），必须回退 TextObject 边界，
-    否则全部落到 (0,0) 导致阅读顺序错乱。
+    **坐标语义（GB/T 33190-2016，2026-10-15 实测修正）**：
+    ``TextCode`` 的 ``X``/``Y`` 是**相对父级 TextObject Boundary 左上角**
+    的局部偏移（mm），不是页面绝对坐标。真实公文的 TextCode 普遍写作
+    ``X="0.0" Y="6.0"``（相对绘制原点），若把它当绝对坐标，所有片段都会
+    堆到页面顶部 → 阅读顺序重排失效（实测：细粒度片段文件正文完全乱序）。
+
+    因此：只要父级是 TextObject 且 Boundary 有效，就必须做
+    ``绝对坐标 = Boundary 左上角 + 局部偏移``；仅在无父级 Boundary 时
+    才单独使用 X/Y。
+
+    无 TextObject 包裹（畸形文件）时退化为 (0,0)——至少不崩。
     """
     # 一次性建父子索引（O(n)），避免逐元素回溯（旧实现 O(n²) 踩坑）
     parent_of: dict[int, object] = {}
@@ -52,20 +60,20 @@ def _page_runs(croot, page_index: int) -> list[TextRun]:
             except ValueError:
                 return None
 
-        x = _num(tc, "X")
-        y = _num(tc, "Y")
-        if x is None or y is None:
-            parent = parent_of.get(id(tc))
-            if parent is not None and _local(parent.tag) == "TextObject":
-                box = (parent.get("Boundary") or "").split()
-                if len(box) == 4:
-                    try:
-                        bx, by = float(box[0]), float(box[1])
-                        x = bx if x is None else x
-                        y = by if y is None else y
-                    except ValueError:
-                        pass
-        runs.append(TextRun(text=text, x=x or 0.0, y=y or 0.0, page=page_index))
+        # TextCode 自身 X/Y：局部偏移（可能缺失）
+        x = _num(tc, "X") or 0.0
+        y = _num(tc, "Y") or 0.0
+        # 父级 TextObject Boundary：页面绝对坐标基准
+        parent = parent_of.get(id(tc))
+        if parent is not None and _local(parent.tag) == "TextObject":
+            box = (parent.get("Boundary") or "").split()
+            if len(box) == 4:
+                try:
+                    x = float(box[0]) + x
+                    y = float(box[1]) + y
+                except ValueError:
+                    pass  # Boundary 畸形：保留局部偏移（降级但不丢文本）
+        runs.append(TextRun(text=text, x=x, y=y, page=page_index))
     return runs
 
 

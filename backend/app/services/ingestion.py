@@ -196,6 +196,27 @@ async def ingest_document(
 
     # 2) 写文档主表（content_ref 优先取外部托管键；后续若有 raw_bytes 则本地落盘覆盖）
     # space_id 收敛：缺省归默认空间，无效 ID 直接 404（避免写进幽灵空间导致按空间检索丢数据）
+    # 重复入库检测（与 upload 路径同口径）：external_id 已存在则直接返回既有文档，
+    # 不重复切分/向量化——否则落库会以 UniqueViolationError 失败，调用方拿到难懂报错。
+    dup = (
+        await db.execute(
+            select(DocumentModel).where(
+                DocumentModel.external_id == payload["external_id"]
+            )
+        )
+    ).scalar_one_or_none()
+    if dup is not None:
+        return {
+            "document_id": dup.id,
+            "external_id": dup.external_id,
+            "status": "duplicate",
+            "chunk_count": dup.chunk_count,
+            "message": (
+                f"文档已存在（external_id={payload['external_id']}，"
+                f"标题《{dup.title}》），已跳过重复入库；如需更新请先删除原文档"
+            ),
+        }
+
     from app.api.routes.spaces import resolve_space_id
 
     space_id = await resolve_space_id(db, payload.get("space_id"))
@@ -347,6 +368,34 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 )
 
             # 阶段：切片（双粒度 P1 + 段落优先 V2.0；配置关闭时回退单粒度 800 字符存量路径）
+            # 重复入库检测：external_id 唯一约束下，重复上传会以 UniqueViolationError
+            # 失败——错误信息对用户不可读（"duplicate key value violates unique
+            # constraint"）。此处提前查重：命中则跳过切分/向量化/落库，直接标记
+            # 任务完成并关联已有文档（省算力，且给出可读提示）。
+            dup = (
+                await db.execute(
+                    select(DocumentModel).where(
+                        DocumentModel.external_id == meta.get("external_id")
+                    )
+                )
+            ).scalar_one_or_none()
+            if dup is not None:
+                job.status = "INDEXED"
+                job.progress = 100
+                job.document_id = dup.id
+                job.total_chunks = dup.chunk_count
+                job.processed_chunks = dup.chunk_count
+                job.error_message = (
+                    f"文档已存在（external_id={meta.get('external_id')}，"
+                    f"标题《{dup.title}》），已跳过重复入库；"
+                    f"如需更新请先删除原文档"
+                )
+                await db.commit()
+                logger.info(
+                    "入库任务 %s 命中重复文档 %s（external_id=%s），跳过", job_id, dup.id, meta.get("external_id")
+                )
+                return
+
             job.status = "CHUNKING"
             job.progress = 20
             await db.commit()

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from ofdkit.normalize import FONT_GLYPH_FIXES, fix_font_glyphs, normalize_text
+from ofdkit.normalize import (
+    FONT_GLYPH_FIXES,
+    collapse_char_doubling,
+    fix_font_glyphs,
+    normalize_text,
+)
 
 from ofdkit import extract_pages, extract_text, make_ofd
 
@@ -57,6 +62,36 @@ class TestExtractBasic:
         page = [(50.0, 100.0, "人民政府"), (10.0, 100.0, "四川省")]
         result = extract_text(make_ofd([page]))
         assert result.text.strip() == "四川省人民政府"
+
+    def test_local_coords_are_relative_to_boundary(self):
+        """TextCode X/Y 是**相对** Boundary 的局部偏移，必须叠加后才参与排序。
+
+        回归背景（2026-10-15 实测）：真实公文的 TextCode 普遍写 X="0.0" Y="6.0"
+        （相对绘制原点），旧实现把它当页面绝对坐标，导致所有片段堆到页顶、
+        阅读顺序重排失效——细粒度片段文件正文完全乱序。
+        本用例固定 Boundary 的绝对位置，仅让局部偏移非零，验证排序仍由
+        Boundary 主导（偏移不改变行间相对次序）。
+        """
+        # 三个片段 Boundary 的绝对 Y 分别 30/60/90；局部偏移统一 (0, 6)
+        page = [
+            (10.0, 90.0, "第三行"),
+            (10.0, 30.0, "第一行"),
+            (10.0, 60.0, "第二行"),
+        ]
+        result = extract_text(make_ofd([page], local_offset=(0.0, 6.0)))
+        lines = [ln for ln in result.text.splitlines() if ln.strip()]
+        assert lines == ["第一行", "第二行", "第三行"], lines
+
+    def test_local_offset_does_not_reorder(self):
+        """同一局部偏移下， Boundary 绝对坐标决定次序（偏移只做平移）。"""
+        page = [(10.0, 30.0, "甲"), (10.0, 60.0, "乙"), (10.0, 90.0, "丙")]
+        base = [ln for ln in extract_text(make_ofd([page])).text.splitlines() if ln.strip()]
+        shifted = [
+            ln
+            for ln in extract_text(make_ofd([page], local_offset=(3.0, 5.0))).text.splitlines()
+            if ln.strip()
+        ]
+        assert base == shifted == ["甲", "乙", "丙"]
 
     def test_page_join(self):
         """多页用换行拼接，页序号连续。"""
@@ -153,6 +188,27 @@ class TestNormalize:
     def test_zero_width_removed(self):
         """零宽字符剔除。"""
         assert normalize_text("公\u200b文") == "公文"
+
+    def test_doubled_header_collapsed(self):
+        """逐字双写行（排版伪粗体页眉）压缩为单份。
+
+        实测：国家发改委 OFD 把「国家发展改革委」写成
+        「国国家家发发展展和和改改革革委委员员会会」——不压缩会伤害检索。
+        """
+        assert collapse_char_doubling("国国家家发发展展和和改改革革委委员员会会") == "国家发展和改革委员会"
+        assert collapse_char_doubling("国国家家发发展展和和改改革革委委员员会会发发布布") == "国家发展和改革委员会发布"
+
+    def test_doubling_keeps_normal_reduplication(self):
+        """正常叠词/局部重复不被误压缩（判据是整行 80% 成对）。"""
+        assert collapse_char_doubling("这个事情需要研究研究") == "这个事情需要研究研究"
+        assert collapse_char_doubling("哈哈哈真有意思") == "哈哈哈真有意思"
+        assert collapse_char_doubling("2026年") == "2026年"
+
+    def test_doubling_idempotent_in_normalize(self):
+        """normalize_text 链路内含双写压缩，且幂等。"""
+        once = normalize_text("国国家家发发展展和和改改革革委委员员会会行行政政规规范范性性文文件件")
+        assert once == "国家发展和改革委员会行政规范性文件"
+        assert normalize_text(once) == once
 
     def test_idempotent(self):
         """幂等：重复规范化结果不变。"""

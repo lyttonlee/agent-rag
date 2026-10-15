@@ -52,12 +52,27 @@ def _document_xml(n_pages: int, box: tuple[float, float, float, float], no_names
     )
 
 
-def _content_xml(runs: list[tuple[float, float, str]], *, with_coords: bool, no_namespace: bool) -> str:
-    """runs: [(x, y, text)]，按文档顺序写入（可用于模拟乱序来源）。"""
+def _content_xml(
+    runs: list[tuple[float, float, str]],
+    *,
+    with_coords: bool,
+    no_namespace: bool,
+    local_offset: tuple[float, float] = (0.0, 0.0),
+) -> str:
+    """runs: [(x, y, text)]，按文档顺序写入（可用于模拟乱序来源）。
+
+    **真实语义**（与 GB/T 33190 及实测公文一致）：
+    TextObject Boundary 的左上角 = 片段的页面**绝对**位置 (x, y)；
+    TextCode 的 X/Y = 相对 Boundary 的**局部**偏移（真实公文普遍写 0.0）。
+    ``local_offset`` 可注入非零局部偏移，用于验证"局部坐标叠加"逻辑。
+    """
     p, d = _decls(no_namespace)
     objs = []
     for i, (x, y, text) in enumerate(runs):
-        coord = f' X="{x}" Y="{y}"' if with_coords else ""
+        if with_coords:
+            coord = f' X="{local_offset[0]}" Y="{local_offset[1]}"'
+        else:
+            coord = ""
         objs.append(
             f'    <{p}TextObject ID="{i}" Boundary="{x} {y} 100 10">\n'
             f"      <{p}TextCode{coord}>{text}</{p}TextCode>\n"
@@ -81,15 +96,19 @@ def make_ofd(
     with_entry: bool = True,
     with_coords: bool = True,
     no_namespace: bool = False,
+    local_offset: tuple[float, float] = (0.0, 0.0),
 ) -> bytes:
     """构造最小 OFD ZIP 包字节流。
 
     Args:
-        pages: 每页的 [(x, y, text)] 运行序列。
+        pages: 每页的 [(x, y, text)] 运行序列——(x, y) 作为 TextObject
+            Boundary 左上角，即片段的**页面绝对位置**。
         box: 物理页尺寸 (x, y, 宽, 高)，默认 A4。
         with_entry: 是否写 OFD.xml 入口（False 测文件名兜底）。
         with_coords: TextCode 是否带 X/Y（False 测 Boundary 回退）。
         no_namespace: 是否去命名空间（测本地名匹配）。
+        local_offset: TextCode X/Y 写入的**局部偏移**（相对 Boundary），
+            默认 (0, 0) —— 与真实公文一致；传非零值可验证坐标叠加逻辑。
     """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -99,6 +118,11 @@ def make_ofd(
         for i, runs in enumerate(pages):
             zf.writestr(
                 f"Doc_0/Page_{i}/Content.xml",
-                _content_xml(runs, with_coords=with_coords, no_namespace=no_namespace),
+                _content_xml(
+                    runs,
+                    with_coords=with_coords,
+                    no_namespace=no_namespace,
+                    local_offset=local_offset,
+                ),
             )
     return buf.getvalue()

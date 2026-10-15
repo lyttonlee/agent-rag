@@ -237,9 +237,9 @@ async function download(row: TemplateItem) {
   <!-- 上传模板文件对话框 -->
   <el-dialog v-model="uploadDialog" title="上传模板文件" width="560px">
     <el-upload
-      drag :auto-upload="false" :show-file-list="true" accept=".docx,.doc,.pdf,.txt"
+      drag :auto-upload="false" :show-file-list="true" accept=".docx,.doc,.pdf,.ofd,.txt,.md"
       :on-change="onUploadChange" :limit="1">
-      <div class="up-tip">将模板文件（docx / pdf / txt）拖到此处，或点击选择</div>
+      <div class="up-tip">将模板文件（docx / pdf / ofd / txt）拖到此处，或点击选择</div>
     </el-upload>
     <el-form :model="uploadForm" label-width="92px" style="margin-top: 14px">
       <el-form-item label="文种">

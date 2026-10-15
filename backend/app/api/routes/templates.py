@@ -304,7 +304,7 @@ async def seed_templates(caller: Caller = Depends(get_caller)) -> dict:
     return {"added": added, "message": "模板库已就绪" if added else "模板库已存在，无需初始化"}
 
 
-@router.post("/upload", summary="上传模板文件（docx/pdf/txt）")
+@router.post("/upload", summary="上传模板文件（docx/pdf/ofd/txt）")
 async def upload_template(
     file: UploadFile = File(...),
     doc_type: str = Form(""),

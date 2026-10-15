@@ -77,7 +77,7 @@ async def upload(
     caller: Caller = Depends(get_caller),
     _: Settings = Depends(get_settings_dep),
 ) -> IngestionJobResp:
-    """文件上传接入（PDF/DOCX），异步入库并返回任务（含状态机进度）。
+    """文件上传接入（PDF/DOCX/OFD/TXT），异步入库并返回任务（含状态机进度）。
 
     支持选择切分策略（paragraph/fixed/sentence/section）与切片尺寸，
     支持指定目标文档空间（space_id，缺省默认空间）；

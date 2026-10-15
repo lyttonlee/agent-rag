@@ -84,7 +84,7 @@ def to_halfwidth_alnum(text: str) -> str:
 
 
 def normalize_text(text: str) -> str:
-    """完整规范化：错位修复 → 零宽剔除 → NFC → 全半角统一。
+    """完整规范化：错位修复 → 零宽剔除 → NFC → 全半角统一 → 逐字双写压缩。
 
     幂等：对已规范化文本重复执行结果不变（供测试断言与重复调用安全）。
     """
@@ -94,4 +94,48 @@ def normalize_text(text: str) -> str:
     text = _ZERO_WIDTH_RE.sub("", text)
     text = unicodedata.normalize("NFC", text)
     text = to_halfwidth_alnum(text)
+    text = collapse_char_doubling(text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# 逐字双写压缩（2026-10-15 实测：国家发改委 OFD 红头/页眉特性）
+# ---------------------------------------------------------------------------
+# 现象：公文排版系统为制造"加粗"观感，把整行文字的每个字写两遍——
+#   「国家发展改革委」→「国国家家发发展展和和改改革革委委员员会会」
+# 该文本进入正文会伤害检索（BM25 匹配不到"国家发展改革委"）与可读性。
+#
+# 判据（保守，防误伤正常叠词）：
+#   - 行内「相邻相同字符对」占比 ≥ 80%（逐字双写是 100%，叠词只局部重复）；
+#   - 压缩后长度 ≥ 4（"哈哈哈""看看"等短叠词不动）。
+# 跨页判重能剔多数页眉，但**单页文档**（函/公告）无从判重——本规则兜底。
+_DOUBLING_MIN_LEN = 4
+_DOUBLING_RATIO = 0.8
+
+
+def collapse_char_doubling(text: str) -> str:
+    """压缩「逐字双写」行（每字连续重复两遍的排版伪粗体）。
+
+    只处理**整行**满足双写特征的情况；行内局部叠词（"研究研究""来来来"）
+    不受影响——它们的相邻相同对占比远低于阈值。
+    """
+    if not text:
+        return text
+    out_lines: list[str] = []
+    for line in text.split("\n"):
+        out_lines.append(_collapse_line(line))
+    return "\n".join(out_lines)
+
+
+def _collapse_line(line: str) -> str:
+    """单行双写检测与压缩；非双写行原样返回。"""
+    n = len(line)
+    if n < _DOUBLING_MIN_LEN * 2 or n % 2 != 0:
+        return line  # 双写行长度必为偶数且成对出现
+    pairs = sum(1 for i in range(0, n, 2) if line[i] == line[i + 1])
+    if pairs / (n // 2) < _DOUBLING_RATIO:
+        return line
+    collapsed = "".join(line[i] for i in range(0, n, 2))
+    if len(collapsed) < _DOUBLING_MIN_LEN:
+        return line
+    return collapsed

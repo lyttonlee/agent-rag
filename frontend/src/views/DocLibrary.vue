@@ -579,9 +579,9 @@ async function quickIngest() {
     <!-- 接入文档对话框 -->
     <el-dialog v-model="dialog" title="接入文档（解析 → 切片 → 向量化 → 入库）" width="620px">
       <el-upload
-        drag :auto-upload="false" :show-file-list="true" accept=".pdf,.docx,.doc,.txt"
+        drag :auto-upload="false" :show-file-list="true" accept=".pdf,.docx,.doc,.ofd,.txt,.md"
         :on-change="onFileChange" :limit="1">
-        <div class="up-tip">将 PDF / DOCX 拖到此处，或点击选择</div>
+        <div class="up-tip">将 PDF / DOCX / OFD 拖到此处，或点击选择</div>
       </el-upload>
       <el-form :model="form" label-width="92px" style="margin-top: 14px">
         <el-form-item label="标题"><el-input v-model="form.title" placeholder="默认取文件名" /></el-form-item>
