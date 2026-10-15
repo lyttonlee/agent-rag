@@ -27,6 +27,7 @@ import {
   createSpace,
   currentUser,
   deleteSpace,
+  getConfigItems,
   getDocument,
   getJob,
   listDocuments,
@@ -197,6 +198,7 @@ function openUpload() {
     return
   }
   form.space_id = currentSpace.value || ''
+  loadDualGranularity()
   dialog.value = true
 }
 const strategyDesc: Record<ChunkStrategy, string> = {
@@ -214,9 +216,38 @@ const form = reactive({
   permission_tags: '',
   space_id: '',
   chunk_strategy: 'paragraph' as ChunkStrategy,
-  chunk_size: 800,
-  chunk_overlap: 80,
 })
+
+// ---- 双粒度切片参数（2026-10-15：chunk_size 改为「配置中心联动」，只读展示）----
+// 背景：双粒度（父子块）总开关默认开启，入库时若仍让用户填「分块大小」会与
+// 配置中心的 small/large token 打架且实际不生效；故移除该输入，改为拉取并
+// 只读展示配置中心当前值，引导用户到「配置中心 · 检索配置」调整。
+const dualGran = ref<{
+  enabled: boolean
+  small: number
+  small_overlap: number
+  large: number
+  large_overlap: number
+} | null>(null)
+
+/** 拉取配置中心的双粒度切片参数（只读展示；失败则置空，不影响上传） */
+async function loadDualGranularity() {
+  try {
+    const items = await getConfigItems('retrieval')
+    const raw = (k: string): unknown => items.find((i) => i.key === k)?.value?.value
+    const on = raw('dual_granularity_enabled')
+    dualGran.value = {
+      // 缺省视为开启（与后端代码默认 dual_granularity_enabled=True 一致）
+      enabled: on === undefined ? true : on === true || on === 'true',
+      small: Number(raw('small_max_tokens') ?? 300),
+      small_overlap: Number(raw('small_overlap_tokens') ?? 40),
+      large: Number(raw('large_max_tokens') ?? 2500),
+      large_overlap: Number(raw('large_overlap_tokens') ?? 200),
+    }
+  } catch {
+    dualGran.value = null
+  }
+}
 
 // ---- 空间新建 / 重命名对话框 ----
 const spaceDialog = ref(false)
@@ -244,6 +275,9 @@ function openCreateSpace(parentId?: string | null) {
   spaceForm.code = ''
   spaceForm.description = ''
   spaceForm.parent_id = parentId ?? currentSpace.value ?? ''
+  // 关键修复：之前仅重置表单却未打开对话框，导致「新建空间」按钮点击无反应。
+  // 必须在重置后显式置位，对话框 v-model="spaceDialog" 才会弹出。
+  spaceDialog.value = true
 }
 
 function editSpace(s: DocSpace) {
@@ -369,8 +403,6 @@ async function submit() {
       permission_tags: form.permission_tags,
       space_id: form.space_id || undefined,
       chunk_strategy: form.chunk_strategy,
-      chunk_size: form.chunk_size,
-      chunk_overlap: form.chunk_overlap,
     })
     dialog.value = false
     ElMessage.success('已提交，开始入库')
@@ -580,12 +612,13 @@ async function quickIngest() {
           <span class="hint">{{ strategyDesc[form.chunk_strategy] }}</span>
         </el-form-item>
         <el-form-item label="切片尺寸">
-          <el-input-number v-model="form.chunk_size" :min="64" :max="4000" :step="50" />
-          <span class="hint">单切片最大字符数</span>
-        </el-form-item>
-        <el-form-item label="重叠字符">
-          <el-input-number v-model="form.chunk_overlap" :min="0" :max="1000" :step="10" />
-          <span class="hint">相邻切片重叠</span>
+          <span v-if="dualGran" class="hint">
+            双粒度：小块 {{ dualGran.small }} token（重叠 {{ dualGran.small_overlap }}）·
+            大块 {{ dualGran.large }} token（重叠 {{ dualGran.large_overlap }}）
+            <template v-if="!dualGran.enabled">（双粒度已关，回退单粒度 800 字符）</template>
+            <br />由「配置中心 · 检索配置」统一管理，此处不再单独设置
+          </span>
+          <span v-else class="hint">由「配置中心 · 检索配置」统一管理</span>
         </el-form-item>
       </el-form>
       <template #footer>

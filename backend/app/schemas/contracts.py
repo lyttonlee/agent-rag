@@ -244,6 +244,22 @@ class GenerateResp(BaseModel):
     truncated_by_security: bool = False
 
 
+# ---- 导出（基于已生成内容，不重新生成）----
+class ExportDocxRequest(BaseModel):
+    """导出【已生成】内容：按会话 + 消息精确定位某一轮起草正文，直接渲染 docx。
+
+    与 GenerateRequest 解耦：导出不需要 query/rerank/space_ids 等生成参数，
+    也不调用模型——内容来自会话内已落库的 assistant 消息（天然版本管理）。
+    """
+
+    conversation_id: str = Field(..., description="起草会话 ID（必填，定位会话）")
+    message_id: str | None = Field(
+        None,
+        description="指定导出的 assistant 消息版本；缺省取会话内最新一条 assistant 消息",
+    )
+    template_code: str | None = Field(None, description="版式模板 code（可选，仅影响 docx 排版）")
+
+
 # ---- 配置中心 ----
 class ConfigItem(BaseModel):
     category: str

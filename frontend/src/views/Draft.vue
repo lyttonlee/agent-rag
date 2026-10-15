@@ -14,14 +14,16 @@ import ReasoningPanel from '@/components/ReasoningPanel.vue'
 import MarkdownText from '@/components/MarkdownText.vue'
 import {
   caller,
+  exportDocx,
   getConversation,
-  getToken,
   intentLabelOf,
   listTemplates,
   streamGenerate,
   type ConversationDetail,
   type ConversationMessage,
   type CitationPayload,
+  type ExportDocxRequest,
+  type PlanStep,
   type TemplateItem,
 } from '@/api/client'
 
@@ -94,6 +96,17 @@ const activeTitle = ref('新会话')
 const history = ref<ConversationMessage[]>([])
 const historyLoading = ref(false)
 const hasHistory = computed(() => history.value.length > 0)
+
+// ---- 导出（基于已生成内容，按版本导出；按钮后置到生成完成后）----
+/** 仅当存在会话且非生成中时可导出（activeId 在生成后才被后端回传填充） */
+const canExport = computed(() => !!activeId.value && !loading.value)
+const exportDialog = ref(false)
+const exportLoading = ref(false)
+const exportVersions = ref<{ id: string; label: string; preview: string }[]>([])
+const selectedVersionId = ref<string>('')
+
+// ---- Agent 步骤时间线（检索 → 生成 → 脱敏，过程可见）----
+const steps = ref<PlanStep[]>([])
 
 function startTimer() {
   startedAt = Date.now()
@@ -177,6 +190,7 @@ async function generate() {
   intentKey.value = ''
   noResult.value = false
   disclaimer.value = false
+  steps.value = []
   startTimer()
 
   controller = streamGenerate(
@@ -190,6 +204,25 @@ async function generate() {
       rerank: false,
     },
     {
+      // 步骤计划：渲染 检索/生成/脱敏 时间线（过程可见）
+      onPlan: (plan) => {
+        steps.value = plan.map((s) => ({ ...s, status: s.status || 'pending' }))
+      },
+      onStepStart: (step) => {
+        const target = steps.value.find((s) => s.id === step.id)
+        if (target) {
+          target.status = 'running'
+        } else {
+          steps.value.push({ ...step, status: 'running' })
+        }
+      },
+      onStepEnd: (stepId, ok, summary) => {
+        const target = steps.value.find((s) => s.id === stepId)
+        if (target) {
+          target.status = ok ? 'done' : 'failed'
+          target.summary = summary
+        }
+      },
       onMeta: (model, cits, _truncated, conversationId, meta) => {
         modelName.value = model
         citations.value = cits
@@ -261,44 +294,60 @@ onMounted(loadTemplates)
 // 文种切换时，默认选中该文种首个模板（如从「通知」切到「报告」）
 watch(docType, syncDefaultTemplate)
 
-async function exportDocx() {
-  // 直接触发文件下载（后端 /v1/export/docx 返回 FileResponse，需 JWT 鉴权）。
-  // 注意：必须用同源 fetch 并显式附加 Authorization 头——浏览器对 fetch
-  // 不会自动带上 localStorage 的 JWT，漏带会触发 401「没有权限需要 JWT」。
-  const token = getToken()
-  const r = await fetch('/v1/export/docx', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify({
-      query: topic.value,
-      template_doc_type: docType.value,
-      caller_scope: caller.caller_scope,
-      max_clearance: caller.max_clearance,
-    }),
-  })
-  if (!r.ok) {
-    // 非 200：后端返回的是 JSON 错误信息（而非 docx），不能当作文件下载
-    let msg = `导出失败（HTTP ${r.status}）`
-    try {
-      const err = await r.json()
-      msg = err.detail || msg
-    } catch {
-      /* 忽略解析失败，沿用状态码提示 */
+/** 打开导出弹窗：拉取会话消息，筛出 assistant 起草稿作为可导出版本。 */
+async function openExport() {
+  if (!activeId.value) return
+  exportLoading.value = false
+  try {
+    const detail: ConversationDetail = await getConversation(activeId.value)
+    // 按时间升序筛出所有 assistant 起草稿，编号为 V1、V2 …（天然版本管理）
+    const assistants = detail.messages
+      .filter((m) => m.role === 'assistant' && (m.content || '').trim())
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+    if (!assistants.length) {
+      ElMessage.warning('当前会话尚无可导出的起草内容')
+      return
     }
-    ElMessage.error('导出失败：' + msg)
-    return
+    exportVersions.value = assistants.map((m, i) => ({
+      id: m.id,
+      label: `第 ${i + 1} 稿 · ${formatTs(m.created_at)}`,
+      preview: (m.content || '').replace(/\s+/g, ' ').slice(0, 60),
+    }))
+    selectedVersionId.value = exportVersions.value[exportVersions.value.length - 1].id
+    exportDialog.value = true
+  } catch (e: any) {
+    ElMessage.error('加载导出版本失败：' + (e?.response?.data?.detail || e.message))
   }
-  const blob = await r.blob()
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `${topic.value.slice(0, 20)}.docx`
-  a.click()
-  URL.revokeObjectURL(url)
-  ElMessage.success('已导出 docx')
+}
+
+function formatTs(ts?: string | null): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return String(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 确认导出：调用后端按 conversation_id + message_id 导出已生成内容（不重新生成）。 */
+async function confirmExport() {
+  if (!activeId.value || !selectedVersionId.value) return
+  exportLoading.value = true
+  try {
+    const payload: ExportDocxRequest = {
+      conversation_id: activeId.value,
+      message_id: selectedVersionId.value,
+      template_code: selectedTemplate.value || null,
+    }
+    await exportDocx(payload)
+    exportDialog.value = false
+    ElMessage.success('已导出 docx（基于已生成内容）')
+  } catch (e: any) {
+    // 后端非 200 时 axios 走 catch，错误体为 JSON {detail}
+    const detail = e?.response?.data?.detail || e.message
+    ElMessage.error('导出失败：' + detail)
+  } finally {
+    exportLoading.value = false
+  }
 }
 </script>
 
@@ -337,7 +386,7 @@ async function exportDocx() {
         <el-input v-model="topic" placeholder="起草主题 / 修改意见（如：语气更严厉）" style="flex: 1" @keyup.enter="generate" />
         <el-button type="primary" :loading="loading" @click="generate">{{ loading ? '生成中…' : '起草' }}</el-button>
         <el-button v-if="loading" @click="stop">停止</el-button>
-        <el-button :disabled="!answer" @click="exportDocx">导出 docx</el-button>
+        <el-button v-if="canExport" :loading="exportLoading" @click="openExport">导出 docx</el-button>
       </div>
 
       <!-- 流式状态条：模型 / 耗时 -->
@@ -353,12 +402,12 @@ async function exportDocx() {
         :streaming="loading && !answer"
       />
 
-      <!-- Agent 执行过程（意图 + 无材料兜底提示；单步起草无拆解步骤） -->
+      <!-- Agent 执行过程（意图 + 步骤时间线 + 无材料兜底提示） -->
       <AgentStepPanel
         v-if="showAgentPanel"
         :intent="intentKey"
         :intent-label="intentLabel"
-        :steps="[]"
+        :steps="steps"
         :loading="loading"
         :no-result="noResult"
         :disclaimer="disclaimer"
@@ -388,6 +437,28 @@ async function exportDocx() {
           <div class="hist-content">{{ m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content }}</div>
         </div>
       </div>
+
+      <!-- 导出弹窗：选择某一轮已生成的起草稿（多轮版本管理） -->
+      <el-dialog v-model="exportDialog" title="导出 docx（选择版本）" width="560px">
+        <div class="text-muted" style="font-size: 12px; margin-bottom: 10px">
+          导出基于会话中已生成并存库的内容，不会重新生成。请选择要导出的某一稿：
+        </div>
+        <el-radio-group v-model="selectedVersionId" class="export-versions">
+          <el-radio
+            v-for="v in exportVersions"
+            :key="v.id"
+            :value="v.id"
+            class="export-version"
+          >
+            <div class="ev-label">{{ v.label }}</div>
+            <div class="ev-preview text-muted">{{ v.preview || '（空）' }}</div>
+          </el-radio>
+        </el-radio-group>
+        <template #footer>
+          <el-button @click="exportDialog = false">取消</el-button>
+          <el-button type="primary" :loading="exportLoading" @click="confirmExport">导出</el-button>
+        </template>
+      </el-dialog>
     </div>
   </div>
 </template>
@@ -444,4 +515,10 @@ async function exportDocx() {
   border: 1px solid var(--brand-line);
 }
 .hist-content { color: var(--text-muted); line-height: 1.6; }
+/* 导出版本选择：纵向堆叠、可点击整块 */
+.export-versions { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.export-version { width: 100%; height: auto; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.export-version:deep(.el-radio__label) { white-space: normal; }
+.ev-label { font-weight: 600; color: var(--text-strong); }
+.ev-preview { font-size: 12px; margin-top: 2px; }
 </style>

@@ -409,6 +409,70 @@ def _token_windows(u: _Unit, max_tokens: int, overlap_tokens: int) -> list[tuple
     return out
 
 
+def _sentence_spans(text: str) -> list[tuple[int, int, str]]:
+    """按句末标点（。！？；及换行）切句并定位 (start, end, seg)，保留标点不断句。
+
+    用于超大单元的「软切分」：优先在句边界成块，避免把一句话从中间切断
+    （token 窗口硬切会切碎语义）。标点归属前句；空段跳过。
+    """
+    spans: list[tuple[int, int, str]] = []
+    for m in re.finditer(r"[^。！？；\n]*(?:[。！？；\n]|$)", text):
+        s, e = m.start(), m.end()
+        seg = text[s:e]
+        if seg and seg.strip():
+            spans.append((s, e, seg))
+    return spans
+
+
+def _soft_windows(u: _Unit, max_tokens: int, overlap_tokens: int) -> list[tuple[str, int, int]]:
+    """超大单元软切分：在句边界打包成 <= max_tokens 的块；单句仍超预算才硬切。
+
+    与 ``_token_windows``（任意 token 处硬切）的差异：
+    1. 整句归整，显著降低「半句话被腰斩」的完整性损失（切分完整性二期核心）；
+    2. 块间不重复（无滑动重叠），避免同句跨块冗余；仅单句超预算的兜底硬切
+       仍保留 token 窗口重叠；
+    3. 偏移取句子精确 span（非比例估算），父子挂载更准。
+
+    Returns:
+        [(piece_text, abs_start, abs_end), ...]，偏移为正文内绝对位置。
+    """
+    sent_spans = _sentence_spans(u.text)
+    if not sent_spans:
+        # 无句边界（如纯数字串）：退化为 token 窗口硬切
+        return _token_windows(u, max_tokens, overlap_tokens)
+    counts = _count_tokens([seg for _, _, seg in sent_spans])
+    out: list[tuple[str, int, int]] = []
+    buf = ""
+    buf_s = buf_e = 0
+    buf_tok = 0
+
+    def _flush() -> None:
+        nonlocal buf, buf_s, buf_e, buf_tok
+        if buf:
+            out.append((buf, buf_s, buf_e))
+        buf, buf_tok = "", 0
+
+    for (rs, re_, seg), c in zip(sent_spans, counts, strict=True):
+        if c > max_tokens:
+            # 单句本身超预算：只能对该句按 token 窗口硬切（兜底，罕见）
+            _flush()
+            sub = _Unit(text=seg, start=u.start + rs, end=u.start + re_)
+            for piece, ps, pe in _token_windows(sub, max_tokens, overlap_tokens):
+                out.append((piece, ps, pe))
+            continue
+        if buf_tok + c <= max_tokens:
+            if not buf:
+                buf_s = u.start + rs
+            buf += seg
+            buf_e = u.start + re_
+            buf_tok += c
+        else:
+            _flush()
+            buf, buf_s, buf_e, buf_tok = seg, u.start + rs, u.start + re_, c
+    _flush()
+    return out
+
+
 def _merge_budgeted(
     units: list[_Unit],
     prefix: str,
@@ -455,9 +519,10 @@ def _merge_budgeted(
 
     for u in units:
         if u.tokens > unit_budget:
-            # 单元本身超预算：先落库已有缓冲，再对该单元做 token 窗口硬切
+            # 单元本身超预算：先落库已有缓冲，再对该单元做【句边界软切分】
+            # （优先整句归整，单句超预算才 token 窗口硬切——保句子完整性）
             _flush()
-            for piece, p_start, p_end in _token_windows(u, unit_budget, overlap_tokens):
+            for piece, p_start, p_end in _soft_windows(u, unit_budget, overlap_tokens):
                 chunks.append(
                     DualChunk(
                         content=f"{prefix}\n{piece}",

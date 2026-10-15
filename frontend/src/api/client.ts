@@ -332,6 +332,27 @@ export async function deleteConversation(id: string): Promise<void> {
   await client.delete(`/conversations/${id}`)
 }
 
+/** 导出请求：按会话 + 消息精确定位已生成内容（不重新生成） */
+export interface ExportDocxRequest {
+  conversation_id: string
+  message_id?: string | null
+  template_code?: string | null
+}
+
+/** 导出某一轮已生成的起草内容为 docx（按 conversation_id + message_id 定位）。 */
+export async function exportDocx(req: ExportDocxRequest): Promise<void> {
+  const r = await client.post('/export/docx', req, { responseType: 'blob' })
+  const url = URL.createObjectURL(r.data as Blob)
+  const a = document.createElement('a')
+  a.href = url
+  // 后端 Content-Disposition 的 filename 已含中文名；前端兜底用会话导出名
+  const disposition = (r.headers['content-disposition'] as string) || ''
+  const m = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)/i)
+  a.download = m ? decodeURIComponent(m[1]) : '公文导出.docx'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export async function appendMessage(
   id: string,
   payload: {
@@ -385,7 +406,10 @@ export interface UploadMeta {
   permission_tags?: string
   space_id?: string
   chunk_strategy?: ChunkStrategy
+  /** @deprecated 双粒度模式下无效；切片尺寸改由配置中心 small/large token 管理。
+   *  仅当配置中心关闭 dual_granularity 回退单粒度时才生效（字符单位）。 */
   chunk_size?: number
+  /** @deprecated 同上，仅单粒度回退路径生效。 */
   chunk_overlap?: number
 }
 
@@ -466,10 +490,10 @@ export interface CitationPayload {
   score: number
 }
 
-/** Agent 计划步骤（complex_task 拆步，过程对用户可见） */
+/** Agent 计划步骤（complex_task 拆步 / 起草阶段透出，过程对用户可见） */
 export interface PlanStep {
   id: string
-  action: 'retrieve' | 'generate'
+  action: 'retrieve' | 'generate' | 'redact'
   query: string
   status?: 'pending' | 'running' | 'done' | 'failed'
   /** 步骤结论摘要（step_end 事件带回，done/failed 时展示） */
@@ -499,6 +523,12 @@ export interface DoneExtra {
 export interface StreamHandlers {
   /** 检索元数据（引用列表）到达；conversationId 为起草会话 ID；meta 携带 Agent 意图信息 */
   onMeta?: (model: string, citations: CitationPayload[], truncated: boolean, conversationId?: string, meta?: AgentMeta) => void
+  /** 步骤计划到达（起草链路透出 检索/生成/脱敏 时间线，过程可见） */
+  onPlan?: (steps: PlanStep[]) => void
+  /** 某步骤开始执行 */
+  onStepStart?: (step: PlanStep) => void
+  /** 某步骤执行结束（ok=false 时 summary 为失败原因） */
+  onStepEnd?: (stepId: string, ok: boolean, summary: string) => void
   /** 正文 token 逐片到达 */
   onToken?: (text: string) => void
   /** 思考链片段到达（推理模型） */
@@ -602,6 +632,15 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
                   citations: evt.citations ?? [],
                 },
               )
+              break
+            case 'plan':
+              handlers.onPlan?.((evt.steps ?? []).map((s: any) => ({ ...s, status: s.status || 'pending' })))
+              break
+            case 'step_start':
+              handlers.onStepStart?.({ id: evt.id, action: evt.action, query: evt.query, status: 'running' })
+              break
+            case 'step_end':
+              handlers.onStepEnd?.(evt.id ?? '', !!evt.ok, evt.summary ?? '')
               break
             case 'token':
               handlers.onToken?.(evt.text ?? '')

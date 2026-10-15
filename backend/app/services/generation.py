@@ -69,19 +69,38 @@ async def _resolve_sensitive_words(db: AsyncSession, req: GenerateRequest) -> li
 async def _ensure_draft_conversation(
     db: AsyncSession, req: GenerateRequest, doc_type: str | None = None
 ) -> str | None:
-    """确保起草会话存在（缺省创建）；返回会话 ID（无会话诉求时 None）。
+    """确保起草会话存在（缺省自动创建）；返回会话 ID。
 
-    doc_type 仅 draft 会话有意义，随会话落库，供历史还原时回显文种。
+    与 chat 链路 _ensure_conversation 对齐（用户 2026-10-15 需求：智能起草
+    历史会话缺失的根因修复）：此前 conversation_id 为空时直接返回 None，
+    导致 stream_generate 的 meta/done 事件 conversation_id 恒为 null，
+    前端 onMeta 永远不落会话、历史侧栏看不到起草记录、多轮修改无法延续。
+
+    修复策略：
+    - conversation_id 缺省（首次起草）→ 自动创建 draft 会话；
+    - 指定 ID 但会话不存在（前端误传）→ 静默新建，保证起草不中断；
+    - 指定 ID 且存在 → 沿用（多轮修改落到同一会话）。
+
+    绑定 doc_type（文种，供历史还原回显）与 space_ids（检索范围），
+    与 chat 会话的空间绑定语义保持一致。
     """
-    if not req.conversation_id:
-        return None
-    conv = (
-        await db.execute(select(Conversation).where(Conversation.id == req.conversation_id))
-    ).scalar_one_or_none()
-    if conv:
-        return conv.id
-    logger.warning("起草会话 %s 不存在，自动创建", req.conversation_id)
-    row = await conv_service.create_conversation(db, conv_type="draft", doc_type=doc_type)
+    if req.conversation_id:
+        conv = (
+            await db.execute(
+                select(Conversation).where(Conversation.id == req.conversation_id)
+            )
+        ).scalar_one_or_none()
+        if conv:
+            return conv.id
+        # 前端误传了不存在的会话 ID：静默新建，保证起草不中断（与 chat 一致）
+        logger.warning("起草会话 %s 不存在，自动创建新会话", req.conversation_id)
+    # 缺省（首次起草）或指定会话不存在 → 自动创建 draft 会话并落库文种/检索范围
+    row = await conv_service.create_conversation(
+        db,
+        conv_type="draft",
+        doc_type=doc_type,
+        space_ids=req.space_ids or [],
+    )
     return row.id
 
 
@@ -215,16 +234,25 @@ async def stream_generate(
     """流式生成，产出 SSE 文本片段（字符串）。
 
     事件序列：
+      {"type":"plan","steps":[...],"channel":"draft"}   步骤计划（过程可见）
+      {"type":"step_start","id":...,"action":...}       某步骤开始（检索/生成/脱敏）
       {"type":"meta","model":...,"conversation_id":...,"intent":...,
-       "citations":[...],"no_result":...}      检索完成，先给上下文
-      {"type":"token","text":"..."}             正文逐片
-      {"type":"reasoning","text":"..."}         思考链（可选）
+       "citations":[...],"no_result":...}              检索完成，先给上下文
+      {"type":"token","text":"..."}                     正文逐片
+      {"type":"reasoning","text":"..."}                 思考链（可选）
+      {"type":"step_end","id":...,"ok":...,"summary":...}  某步骤结束（含结论摘要）
       {"type":"done","answer":...,"sensitive_hits":[...],
-       "disclaimer":...}                       收尾（含敏感词脱敏）
-      {"type":"error","message":"..."}          异常
+       "disclaimer":...}                               收尾（含敏感词脱敏）
+      {"type":"error","message":"..."}                  异常
 
-    会话持久化：req.conversation_id 存在时，user/assistant 消息落库
-    （公文起草多轮修改）；用户点「停止」时已生成部分自动保存。
+    步骤时间线（用户 2026-10-15 需求 #5：页面需看到"当前到哪一步"）：
+    单趟起草不做 complex_task 拆步，但把关键阶段（检索参考材料 → 起草生成
+    → 敏感词脱敏）作为步骤透出，与 chat 链路的 plan/step 事件对齐，前端
+    AgentStepPanel 据此渲染实时推进的时间线。
+
+    会话持久化：req.conversation_id 缺省时自动创建 draft 会话（见
+    _ensure_draft_conversation），user/assistant 消息落库（公文起草多轮修改）；
+    用户点「停止」时已生成部分自动保存。
 
     Agent（P1）：意图识别结果进 meta/审计；未检索到材料时切换自身能力
     起草并追加甄别声明（disclaimer）。
@@ -305,8 +333,22 @@ async def stream_generate(
         )
         saved = True
 
+    # 步骤计划（过程可见）：检索参考材料 → 起草生成 → 敏感词脱敏。
+    # 单趟起草不做 complex_task 拆解，但把关键阶段作为步骤时间线透出，
+    # 满足"页面能看到当前到哪一步"的需求（与 chat 链路 plan/step 事件对齐）。
+    yield _sse({
+        "type": "plan",
+        "steps": [
+            {"id": "retrieve", "action": "retrieve", "query": req.query, "status": "pending"},
+            {"id": "generate", "action": "generate", "query": req.query, "status": "pending"},
+            {"id": "redact", "action": "redact", "query": req.query, "status": "pending"},
+        ],
+        "channel": "draft",
+    })
+
     try:
         # 1) 检索上下文（含 rerank 优雅降级）
+        yield _sse({"type": "step_start", "id": "retrieve", "action": "retrieve", "query": req.query})
         retrieve_resp = await retrieve_enhanced(db, req)  # type: ignore[arg-type]
         citations: list[Citation] = retrieve_resp.citations
         citations_holder[:] = citations
@@ -316,6 +358,16 @@ async def stream_generate(
         templates = await load_prompt_templates(db)
         no_materials = is_no_useful_info(retrieve_resp, cfg.vec_distance_threshold)
         disclaimer = no_materials  # 无材料兜底：答案需追加甄别声明
+        yield _sse({
+            "type": "step_end",
+            "id": "retrieve",
+            "ok": True,
+            "summary": (
+                "未检索到参考材料，将基于通用能力起草"
+                if no_materials
+                else f"检索到 {len(citations)} 条参考材料"
+            ),
+        })
         gen = ModelProvider(role="gen")
         messages = build_generation_messages(
             req, citations, no_materials=no_materials, templates=templates,
@@ -346,6 +398,7 @@ async def stream_generate(
         })
 
         # 3) 流式生成（思考链 + 正文）
+        yield _sse({"type": "step_start", "id": "generate", "action": "generate", "query": req.query})
         async for kind, text in gen.generate_stream(messages):
             if kind == "content":
                 parts.append(text)
@@ -354,14 +407,31 @@ async def stream_generate(
                 reasoning_parts.append(text)
                 yield _sse({"type": "reasoning", "text": text})
 
+        # 生成阶段结束：回填步骤结论（字数），供前端时间线展示
+        yield _sse({
+            "type": "step_end",
+            "id": "generate",
+            "ok": True,
+            "summary": f"已生成草稿（约 {len(''.join(parts))} 字）",
+        })
+
         # 4) 收尾：敏感词脱敏后回传完整答案 + 落库助手消息
         raw = "".join(parts)
         if disclaimer and raw.strip():
             # 无材料兜底：追加"需自行甄别"声明（流式视图与最终答案一致）
             raw += TASK_DISCLAIMER
             yield _sse({"type": "token", "text": TASK_DISCLAIMER})
+        yield _sse({"type": "step_start", "id": "redact", "action": "redact", "query": req.query})
         sensitive_words = await _resolve_sensitive_words(db, req)
         answer, hits = redact_sensitive(raw, sensitive_words)
+        yield _sse({
+            "type": "step_end",
+            "id": "redact",
+            "ok": True,
+            "summary": (
+                f"命中 {len(hits)} 处敏感词，已脱敏" if hits else "未发现敏感词"
+            ),
+        })
         await _save_assistant(answer, citations, hits, gen.model_name)
         yield _sse({
             "type": "done",

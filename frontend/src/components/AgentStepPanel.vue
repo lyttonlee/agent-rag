@@ -32,7 +32,7 @@ const props = defineProps<{
 }>()
 
 /** 步骤动作的中文标签 */
-const ACTION_LABEL: Record<string, string> = { retrieve: '检索', generate: '生成' }
+const ACTION_LABEL: Record<string, string> = { retrieve: '检索', generate: '生成', redact: '脱敏' }
 
 const doneCount = computed(() => props.steps.filter((s) => s.status === 'done').length)
 const failedCount = computed(() => props.steps.filter((s) => s.status === 'failed').length)

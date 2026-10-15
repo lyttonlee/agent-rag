@@ -50,14 +50,22 @@ class RetrievalConfig:
     rerank_min_score: float = 0.15
     # ---- 长短切分（父子块，P1；单位一律 token，chonkie 计量）----
     dual_granularity_enabled: bool = True   # 总开关：false 回退单粒度 800 字符存量路径
-    small_max_tokens: int = 150             # 小块 token 上限（用户需求区间 100–200）
-    small_overlap_tokens: int = 20          # 小块尾重叠 token 预算
-    large_max_tokens: int = 1200            # 大块 token 上限（用户需求区间 800–2000）
-    large_overlap_tokens: int = 100         # 大块尾重叠 token 预算
+    # 小块 token 上限（2026-10-15 由 150 上调至 300）：原 150 过小，公文常见
+    # 自然段（200–500 字）会被 token 窗口硬切成多截，检索单元语义残缺；上调后
+    # 多数段落可整体落入小块，兼顾精召与段落完整性。合法区间 50–400。
+    small_max_tokens: int = 300
+    # 小块尾重叠 token 预算（20→40）：块间接缝多回填一个短单元，缓解边界词腰斩。
+    small_overlap_tokens: int = 40
+    # 大块 token 上限（1200→2500）：公文一节/一章常 2000–5000 字，1200 覆盖不全，
+    # 生成注入上下文不完整；上调至 2500 更接近完整一节。合法区间 400–4000。
+    large_max_tokens: int = 2500
+    # 大块尾重叠 token 预算（100→200）：大块间接缝衔接增强。
+    large_overlap_tokens: int = 200
     # ---- 条件父块注入（P1）----
     parent_inject_enabled: bool = True      # 上下文不足时回表注入大块
-    parent_inject_max_count: int = 2        # 单次最多注入父块数（去重后）
-    parent_inject_max_tokens: int = 3000    # 注入父块总 token 预算（硬顶防上下文膨胀）
+    # 单次最多注入父块数（2→3）：命中小块散落多个大块时，多注入一块提升上下文覆盖。
+    parent_inject_max_count: int = 3
+    parent_inject_max_tokens: int = 6000    # 注入父块总 token 预算（3000→6000：大块调至 2500 后，需容纳约 2 个大块，硬顶仍防上下文无限膨胀）
     # 注入触发线与 rerank_min_score 同源（同为 rerank top1 弱相关信号）；
     # 标定依据见 rerank_min_score 注释（实测 0.15：强命中 0.34 跳过、
     # 词汇鸿沟 0.03 触发）。调大更难注入、调小更易注入。
