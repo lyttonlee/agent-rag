@@ -11,7 +11,7 @@
  */
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { registerApiClient, type ApiClientItem } from '@/api/client'
+import { registerApiClient, SECURITY_LEVEL_OPTIONS, type ApiClientItem } from '@/api/client'
 
 const form = ref({
   name: '',
@@ -97,10 +97,12 @@ function reset() {
         </el-form-item>
         <el-form-item label="最高可检索密级（max_clearance）">
           <el-select v-model="form.max_clearance" style="width: 100%">
-            <el-option label="PUBLIC（公开）" value="PUBLIC" />
-            <el-option label="INTERNAL（内部）" value="INTERNAL" />
-            <el-option label="RESTRICTED（受限）" value="RESTRICTED" />
-            <el-option label="SECRET（秘密）" value="SECRET" />
+            <el-option
+              v-for="lv in SECURITY_LEVEL_OPTIONS"
+              :key="lv.value"
+              :label="`${lv.value}（${lv.label}）`"
+              :value="lv.value"
+            />
           </el-select>
         </el-form-item>
         <el-button type="primary" round :loading="submitting" @click="submit">注册并生成 Key</el-button>

@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import io
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,7 +16,7 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import SECURITY_WEIGHT
+from app.core.config import security_weight
 from app.core.security import redact_sensitive
 from app.db.models import ConfigKV, Conversation, ConversationMessage, Document, Template
 from app.db.session import get_db
@@ -40,10 +39,16 @@ async def _active_sensitive_words(db: AsyncSession) -> list[str]:
     return [w for w in rows if w]
 
 
-async def _assert_template_usable(db: AsyncSession, template_code: str | None, caller: Caller) -> None:
-    """导出版式模板所有权校验（他人模板不可用）。"""
+async def _load_usable_template(
+    db: AsyncSession, template_code: str | None, caller: Caller
+) -> Template | None:
+    """加载导出版式模板并做所有权校验（他人模板不可用）。
+
+    返回模板行（供读取 layout 版式：字体/红头等）；未指定模板返回 None
+    （走公文标准默认版式）。校验失败直接 403。
+    """
     if not template_code:
-        return
+        return None
     row = (
         await db.execute(select(Template).where(Template.code == template_code))
     ).scalar_one_or_none()
@@ -55,11 +60,12 @@ async def _assert_template_usable(db: AsyncSession, template_code: str | None, c
         )
     ):
         raise HTTPException(status_code=403, detail="无权使用该模板（仅创建者与系统标准模板可用）")
+    return row
 
 
 def _clearance_allowed(clearance: str, caller_max: str) -> bool:
-    """引用文档密级是否不超过调用方额度。"""
-    return SECURITY_WEIGHT.get(clearance, 1) <= SECURITY_WEIGHT.get(caller_max, 1)
+    """引用文档密级是否不超过调用方额度（兼容历史代码/中文名）。"""
+    return security_weight(clearance) <= security_weight(caller_max)
 
 
 @router.post("/docx")
@@ -74,12 +80,12 @@ async def export_docx(
     """
     if not caller.allows_scope("chat"):
         raise HTTPException(status_code=403, detail="该客户端无 chat 能力域权限")
-    await _assert_template_usable(db, req.template_code, caller)
-    return await _run_export(req, caller, db)
+    template = await _load_usable_template(db, req.template_code, caller)
+    return await _run_export(req, caller, db, template)
 
 
 async def _run_export(
-    req: ExportDocxRequest, caller: Caller, db: AsyncSession
+    req: ExportDocxRequest, caller: Caller, db: AsyncSession, template: Template | None = None
 ) -> Response:
     # 1) 定位会话
     conv = (
@@ -131,29 +137,21 @@ async def _run_export(
                     status_code=403, detail="导出内容含超出您密级额度的引用，已拒绝导出"
                 )
 
-    # 4) 渲染 docx（docx 的 Document 改名以避免遮蔽 ORM 模型 Document）
-    from docx import Document as DocxDocument
+    # 4) 渲染 docx（公文版式：标题层级/字体/缩进行距/表格/落款/页码）
+    #    模板 layout 可覆盖正文字体与红头样式；缺省走 GB/T 9704 标准版式
+    from app.services.docx_render import render_docx
 
-    doc = DocxDocument()
-    title = conv.title or "公文起草"
-    doc.add_heading(title, level=1)
-    for para in (content or "").split("\n"):
-        if para.strip():
-            doc.add_paragraph(para)
-    if target.citations:
-        doc.add_heading("参考资料", level=2)
-        for i, c in enumerate(target.citations, 1):
-            if not isinstance(c, dict):
-                continue
-            doc.add_paragraph(f"[{i}] 《{c.get('title') or '未知'}》{c.get('doc_no') or ''}")
-    if hits:
-        doc.add_paragraph(f"【敏感词命中】{', '.join(hits)}（已脱敏）")
+    doc_blob = render_docx(
+        title=conv.title or "公文起草",
+        content=content,
+        citations=[c for c in (target.citations or []) if isinstance(c, dict)],
+        sensitive_hits=hits,
+        layout=(template.layout if template else None),
+    )
 
-    # 直接渲染到内存字节流（避免临时文件落盘与并发句柄问题）
-    safe_name = (title[:20] or "公文") + ".docx"
-    buf = io.BytesIO()
-    doc.save(buf)
-    blob = buf.getvalue()
+    # 直接返回内存字节流（避免临时文件落盘与并发句柄问题）
+    safe_name = (conv.title or "公文")[:20] + ".docx"
+    blob = doc_blob
     # RFC 6266：filename 仅允许 ASCII，中文名放到 filename*（UTF-8 编码），
     # 避免 Starlette 头编码（Latin-1）失败导致 500
     disp = f"attachment; filename=\"document.docx\"; filename*=UTF-8''{quote(safe_name)}"

@@ -142,12 +142,17 @@ class Caller:
         """把请求方声明的密级压低到主体额度之内（权限管控入口）。
 
         密级权重见 app.core.config.SECURITY_WEIGHT：取值越大密级越高。
+        入参兼容历史代码/中文名（归一后比较）；压低时返回主体额度本身
+        （已是规范枚举，由登录/注册链路写入）。
         """
-        from app.core.config import SECURITY_WEIGHT
+        from app.core.config import normalize_security_level, security_weight
 
-        req_w = SECURITY_WEIGHT.get(requested, 1)
-        cap_w = SECURITY_WEIGHT.get(self.max_clearance, 1)
-        return requested if req_w <= cap_w else self.max_clearance
+        req_w = security_weight(requested)
+        cap_w = security_weight(self.max_clearance)
+        if req_w <= cap_w:
+            # 声明合法：仍归一化后回传，保证下游拿到的都是规范枚举
+            return normalize_security_level(requested, default="INTERNAL")
+        return self.max_clearance
 
 
 # =========================================================================
@@ -216,8 +221,9 @@ async def get_caller(
             id=user.id,
             name=user.display_name or user.username,
             role=user.role,
-            # 用户密级额度按角色映射：admin 全量，其余默认内部
-            max_clearance="SECRET" if user.role == "admin" else "INTERNAL",
+            # 用户密级额度按角色映射：admin 全量（机密），其余默认内部
+            # （六级密级体系 2026-10-15：admin 额度取最高级 TOP_SECRET）
+            max_clearance="TOP_SECRET" if user.role == "admin" else "INTERNAL",
         )
     if x_api_key:
         client = await get_api_client(x_api_key=x_api_key, db=db)

@@ -2,12 +2,19 @@
 /**
  * 会话历史侧栏（智能问答 / 公文起草共用）。
  *
- * 职责：会话列表加载、新建、切换、重命名、删除。
+ * 职责：会话列表加载、新建、切换、重命名、删除，以及**历史搜索**
+ * （2026-10-15 用户需求）——支持两种定位形态：
+ *   1. 关键字模糊搜索：匹配标题与消息内容，命中消息时展示高亮片段；
+ *   2. 明确 ID 精确查找：输入形如会话 ID 的整串（≥8 位字母数字），
+ *      直达某条历史；不存在时给出友好空态（后端 404）。
+ * 搜索态下 load() 仍保持搜索结果（新消息到达不把用户踢出搜索态）。
+ *
  * 不关心消息内容本身（由各页面自行渲染），只做"会话级"管理，
  * 保证问答与起草两侧的历史交互完全一致（样式与行为同源）。
  */
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import {
   deleteConversation,
   listConversations,
@@ -32,7 +39,23 @@ const loading = ref(false)
 const renaming = ref<Conversation | null>(null)
 const renameText = ref('')
 
+// ---- 历史搜索 ----
+const searchText = ref('')
+const searching = ref(false)   // 是否处于搜索态（有查询词）
+const idNotFound = ref('')     // 明确 ID 未命中时记录，供空态提示
+let searchTimer: number | undefined
+
+/** 整串疑似会话 ID（≥8 位字母/数字/短横）时按"明确 ID"查找，否则按关键字 */
+function looksLikeId(text: string): boolean {
+  return /^[A-Za-z0-9-]{8,}$/.test(text)
+}
+
 async function load() {
+  // 搜索激活时刷新保持搜索结果（避免新消息到达把用户踢出搜索态）
+  if (searching.value && searchText.value.trim()) {
+    await runSearch()
+    return
+  }
   loading.value = true
   try {
     rows.value = await listConversations(props.convType)
@@ -41,6 +64,73 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+/** 执行一次搜索（ID 形态走精确查找，其余走关键字模糊搜索） */
+async function runSearch() {
+  const text = searchText.value.trim()
+  if (!text) {
+    clearSearch()
+    return
+  }
+  searching.value = true
+  idNotFound.value = ''
+  loading.value = true
+  try {
+    rows.value = looksLikeId(text)
+      ? await listConversations(props.convType, { id: text })
+      : await listConversations(props.convType, { keyword: text })
+  } catch {
+    // 明确 ID 不存在 → 后端 404：转友好空态，不弹 toast 打断输入
+    rows.value = []
+    if (looksLikeId(text)) idNotFound.value = text
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 输入防抖 350ms 自动搜索（避免每击一键都打接口） */
+function onSearchInput() {
+  if (searchTimer) window.clearTimeout(searchTimer)
+  const text = searchText.value.trim()
+  if (!text) {
+    clearSearch()
+    return
+  }
+  searchTimer = window.setTimeout(runSearch, 350)
+}
+
+/** 回车立即搜索（不等防抖） */
+function onSearchEnter() {
+  if (searchTimer) window.clearTimeout(searchTimer)
+  runSearch()
+}
+
+/** 清空搜索：恢复常规列表 */
+function clearSearch() {
+  if (searchTimer) window.clearTimeout(searchTimer)
+  searchText.value = ''
+  searching.value = false
+  idNotFound.value = ''
+  load()
+}
+
+/** HTML 转义（v-html 高亮前的安全底线——片段来自本库内容，仍先转义） */
+function escHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string
+  ))
+}
+
+/** 命中关键字高亮（大小写不敏感；正则特殊字符先转义） */
+function highlight(text: string): string {
+  const kw = searchText.value.trim()
+  if (!kw || !text) return escHtml(text || '')
+  const pattern = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return escHtml(text).replace(
+    new RegExp(pattern, 'gi'),
+    (m) => `<mark>${m}</mark>`,
+  )
 }
 
 onMounted(load)
@@ -99,13 +189,36 @@ async function remove(row: Conversation) {
     ElMessage.error('删除失败：' + (e?.response?.data?.detail || e.message))
   }
 }
+
+/** 新建会话：先退出搜索态，保证新会话出现在常规列表里 */
+function startNew() {
+  clearSearch()
+  emit('new')
+}
 </script>
 
 <template>
   <aside class="conv-side">
     <div class="conv-head">
       <span class="conv-ttl">历史会话</span>
-      <el-button size="small" type="primary" @click="emit('new')">新建</el-button>
+      <el-button size="small" type="primary" @click="startNew">新建</el-button>
+    </div>
+    <div class="conv-search">
+      <el-input
+        v-model="searchText"
+        placeholder="搜索标题 / 内容 / 会话 ID"
+        clearable
+        size="small"
+        :prefix-icon="Search"
+        @input="onSearchInput"
+        @keyup.enter="onSearchEnter"
+        @clear="clearSearch"
+      />
+    </div>
+    <div v-if="searching" class="conv-search-info text-muted">
+      <span v-if="rows.length">“{{ searchText }}” 命中 {{ rows.length }} 条</span>
+      <span v-else-if="idNotFound">未找到 ID 为 {{ idNotFound }} 的会话</span>
+      <span v-else>未找到与 “{{ searchText }}” 相关的会话</span>
     </div>
     <div class="conv-list" v-loading="loading">
       <div
@@ -130,6 +243,12 @@ async function remove(row: Conversation) {
         </template>
         <template v-else>
           <div class="conv-title" :title="c.title">{{ c.title }}</div>
+          <!-- 搜索命中片段（关键字高亮；仅 keyword 命中消息内容时存在） -->
+          <div
+            v-if="searching && c.match_snippet"
+            class="conv-snippet"
+            v-html="highlight(c.match_snippet)"
+          />
           <div class="conv-meta">
             <span>{{ c.message_count }} 条</span>
             <span>{{ relTime(c.last_message_at || c.created_at) }}</span>
@@ -140,7 +259,7 @@ async function remove(row: Conversation) {
           </div>
         </template>
       </div>
-      <div v-if="!loading && !rows.length" class="conv-empty text-muted">
+      <div v-if="!loading && !rows.length && !searching" class="conv-empty text-muted">
         暂无历史会话，点击「新建」开始
       </div>
     </div>
@@ -157,6 +276,8 @@ async function remove(row: Conversation) {
   padding: 12px 14px; border-bottom: 1px solid var(--line);
 }
 .conv-ttl { font-size: 14px; color: var(--text-strong); font-weight: 600; }
+.conv-search { padding: 8px 8px 0; }
+.conv-search-info { padding: 6px 12px 2px; font-size: 11px; line-height: 1.4; }
 .conv-list { flex: 1; overflow: auto; padding: 8px; }
 .conv-item {
   padding: 10px 12px; border-radius: var(--radius-sm); cursor: pointer;
@@ -167,6 +288,15 @@ async function remove(row: Conversation) {
 .conv-title {
   color: var(--text); font-size: 13px; line-height: 1.4;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.conv-snippet {
+  margin-top: 3px; font-size: 11px; line-height: 1.45; color: var(--text-muted);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; word-break: break-all;
+}
+.conv-snippet :deep(mark) {
+  background: var(--brand-soft); color: var(--brand);
+  padding: 0 1px; border-radius: 2px;
 }
 .conv-meta {
   display: flex; justify-content: space-between; margin-top: 4px;

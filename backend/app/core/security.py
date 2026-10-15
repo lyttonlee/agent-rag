@@ -18,15 +18,19 @@ from typing import Any
 
 from sqlalchemy import ColumnElement, and_, func, or_
 
-from app.core.config import SECURITY_WEIGHT, get_settings
+from app.core.config import SECURITY_WEIGHT, security_weight
 
 # 权限标签前缀
 SCOPE_PREFIX = "scope:"
 
 
 def _allowed_levels(max_clearance: str) -> list[str]:
-    """返回调用方可见的密级集合（权重 ≤ 上限）。"""
-    caller_weight = SECURITY_WEIGHT.get(max_clearance, 0)
+    """返回调用方可见的密级集合（权重 ≤ 上限）。
+
+    经 normalize_security_level 归一：历史四级代码（RESTRICTED/SECRET）
+    与中文名都能正确判定，旧客户端不会因枚举扩容而突然看不到存量文档。
+    """
+    caller_weight = security_weight(max_clearance)
     return [lvl for lvl, w in SECURITY_WEIGHT.items() if w <= caller_weight]
 
 

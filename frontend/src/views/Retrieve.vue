@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { generate, retrieve, type SecurityLevel } from '@/api/client'
+import { generate, retrieve, SECURITY_LEVEL_OPTIONS, type SecurityLevel } from '@/api/client'
 
 const query = ref('请拟一份关于安全生产的通知，需包含隐患排查与应急值守要求')
 const loading = ref(false)
@@ -11,7 +11,7 @@ const degraded = ref(false)
 
 // 调用方上下文控制（演示密级 / 权限下推）
 const ctx = reactive({
-  max_clearance: 'SECRET' as SecurityLevel,
+  max_clearance: 'TOP_SECRET' as SecurityLevel,
   caller_scope: 'scope:dept:office',
   rerank: false,
 })
@@ -59,8 +59,7 @@ doRetrieve()
       <div class="ctx-row">
         <label>最大密级</label>
         <el-select v-model="ctx.max_clearance" style="width: 130px">
-          <el-option label="公开" value="PUBLIC" /><el-option label="内部" value="INTERNAL" />
-          <el-option label="受限" value="RESTRICTED" /><el-option label="秘密" value="SECRET" />
+          <el-option v-for="lv in SECURITY_LEVEL_OPTIONS" :key="lv.value" :label="lv.label" :value="lv.value" />
         </el-select>
         <label>权限标签</label>
         <el-input v-model="ctx.caller_scope" placeholder="scope:dept:office" style="width: 220px" />

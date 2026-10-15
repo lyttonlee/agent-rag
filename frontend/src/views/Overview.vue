@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
-import { getStats, type DocStats } from '@/api/client'
+import { getStats, SECURITY_LEVEL_LABELS, SECURITY_LEVEL_OPTIONS, type DocStats } from '@/api/client'
 
 const stats = ref<DocStats | null>(null)
 const healthOk = ref(false)
@@ -34,17 +34,15 @@ onMounted(async () => {
     chart = echarts.init(trendEl.value)
     chart.setOption({
       grid: { left: 36, right: 16, top: 20, bottom: 24 },
-      xAxis: { type: 'category', data: ['公开', '内部', '受限', '秘密'],
+      // 六级密级（2026-10-15）：横轴与数据都从选项表派生，枚举再扩不再改这里
+      xAxis: { type: 'category', data: SECURITY_LEVEL_OPTIONS.map((lv) => lv.label),
         axisLine: { lineStyle: { color: '#3a4a66' } }, axisLabel: { color: '#8a99b3' } },
       yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,.06)' } },
         axisLabel: { color: '#8a99b3' } },
       series: [{
-        type: 'bar', data: [
-          stats.value?.by_security?.PUBLIC || 0,
-          stats.value?.by_security?.INTERNAL || 0,
-          stats.value?.by_security?.RESTRICTED || 0,
-          stats.value?.by_security?.SECRET || 0,
-        ],
+        type: 'bar', data: SECURITY_LEVEL_OPTIONS.map(
+          (lv) => stats.value?.by_security?.[lv.value] || 0,
+        ),
         itemStyle: { color: '#3d7eff', borderRadius: [4, 4, 0, 0] },
       }],
     })

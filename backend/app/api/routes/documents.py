@@ -23,7 +23,7 @@ from app.api.routes.spaces import (
     owner_of,
     visible_space_ids,
 )
-from app.core.config import Settings
+from app.core.config import Settings, normalize_security_level
 from app.db.models import Chunk, Document, DocumentSpace, IngestionJob
 from app.db.session import get_db
 from app.schemas.contracts import (
@@ -89,6 +89,9 @@ async def upload(
     # 入口管控：先校验空间可写（默认公共/本人空间），再落任务，
     # 避免后台任务跑到一半才在 resolve_space_id 处失败
     resolved_space = await assert_space_writable(db, space_id or None, caller)
+    # 密级归一：Form 是自由文本，历史代码（RESTRICTED/SECRET）与中文名
+    # （机密/商密…）都在此统一为规范枚举，脏值回落 INTERNAL
+    security_level = normalize_security_level(security_level, default="INTERNAL")
     raw = await file.read()
     meta = {
         "external_id": external_id or file.filename or f"upload-{uuid.uuid4().hex[:8]}",

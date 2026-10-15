@@ -24,14 +24,78 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 # 我方制定的标准密级枚举（第三方映射自身分级到此枚举）
-SecurityLevel = Literal["PUBLIC", "INTERNAL", "RESTRICTED", "SECRET"]
-# 密级权重：数值越大密级越高
-SECURITY_WEIGHT: dict[str, int] = {
-    "PUBLIC": 0,
-    "INTERNAL": 1,
-    "RESTRICTED": 2,
-    "SECRET": 3,
+# 2026-10-15 起由四级扩为六级（用户需求）：非密 < 内部 < 普通商密 < 核心商密 < 密级 < 机密。
+# 设计要点：商密两级采用非整数权重（2.3/2.7），落在"内部"与"密级"之间，
+# 体现"商业秘密密级高于内部资料、低于国家秘密"的分层定位；
+# 权重只用于服务端可见性比较（<=），不对外暴露为业务字段。
+SecurityLevel = Literal[
+    "PUBLIC", "INTERNAL", "COMMERCIAL", "CORE_COMMERCIAL", "CLASSIFIED", "TOP_SECRET"
+]
+# 密级权重：数值越大密级越高（不可随意调值——存量数据的可见性关系依赖此全序）
+SECURITY_WEIGHT: dict[str, float] = {
+    "PUBLIC": 1.0,            # 非密
+    "INTERNAL": 2.0,          # 内部
+    "COMMERCIAL": 2.3,        # 普通商密
+    "CORE_COMMERCIAL": 2.7,   # 核心商密
+    "CLASSIFIED": 3.0,        # 密级
+    "TOP_SECRET": 4.0,        # 机密
 }
+# 中文展示名（前端下拉 / 统计图表 / 文档回显共用，单一事实源）
+SECURITY_LEVEL_LABELS: dict[str, str] = {
+    "PUBLIC": "非密",
+    "INTERNAL": "内部",
+    "COMMERCIAL": "普通商密",
+    "CORE_COMMERCIAL": "核心商密",
+    "CLASSIFIED": "密级",
+    "TOP_SECRET": "机密",
+}
+# 兼容别名 → 规范枚举值（两类来源）：
+#   1) 历史四级代码（2026-10-15 前的存量数据与旧客户端仍在用）：
+#      RESTRICTED（受限，权重2）→ COMMERCIAL（2.3）；SECRET（秘密，权重3）→ TOP_SECRET（4）。
+#      序位一致 ⇒ 迁移前后可见性关系完全不变（见迁移 0015）。
+#   2) 第三方按中文习惯直传（"机密"/"商密"…）：归一后落库，避免 422 拒收。
+_LEGACY_LEVEL_ALIASES: dict[str, str] = {
+    "RESTRICTED": "COMMERCIAL",
+    "SECRET": "TOP_SECRET",
+    "非密": "PUBLIC",
+    "公开": "PUBLIC",
+    "内部": "INTERNAL",
+    "普通商密": "COMMERCIAL",
+    "商密": "COMMERCIAL",
+    "核心商密": "CORE_COMMERCIAL",
+    "密级": "CLASSIFIED",
+    "机密": "TOP_SECRET",
+    "秘密": "TOP_SECRET",
+}
+
+
+def normalize_security_level(value: str | None, default: str = "INTERNAL") -> str:
+    """把任意密级输入归一为规范枚举值。
+
+    接受：规范代码（PUBLIC/…）、历史代码（RESTRICTED/SECRET）、中文名
+    （机密/商密/…）、大小写变体。无法识别时回落 default——调用方负责
+    传入安全缺省（文档密级缺省 INTERNAL，额度缺省 PUBLIC 由 security_weight 保证）。
+    """
+    if not value:
+        return default
+    v = str(value).strip()
+    if v in SECURITY_WEIGHT:
+        return v
+    upper = v.upper()
+    if upper in SECURITY_WEIGHT:
+        return upper
+    return _LEGACY_LEVEL_ALIASES.get(v, _LEGACY_LEVEL_ALIASES.get(upper, default))
+
+
+def security_weight(level: str | None) -> float:
+    """密级权重（统一入口，兼容历史代码/中文名）。
+
+    无法识别时按最低权重（PUBLIC）处理——fail-closed：认不出的密级
+    一律当作最公开处理只会让结果更少，绝不会越权放行。
+    """
+    return SECURITY_WEIGHT.get(
+        normalize_security_level(level, default="PUBLIC"), SECURITY_WEIGHT["PUBLIC"]
+    )
 
 
 class Settings(BaseSettings):

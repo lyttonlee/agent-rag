@@ -11,6 +11,7 @@ import {
   listApiClients,
   registerApiClient,
   setClientEnabled,
+  SECURITY_LEVEL_OPTIONS,
   type ApiClientItem,
 } from '@/api/client'
 
@@ -166,10 +167,12 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="最高可检索密级（max_clearance）">
           <el-select v-model="form.max_clearance" style="width: 100%">
-            <el-option label="PUBLIC（公开）" value="PUBLIC" />
-            <el-option label="INTERNAL（内部）" value="INTERNAL" />
-            <el-option label="RESTRICTED（受限）" value="RESTRICTED" />
-            <el-option label="SECRET（秘密）" value="SECRET" />
+            <el-option
+              v-for="lv in SECURITY_LEVEL_OPTIONS"
+              :key="lv.value"
+              :label="`${lv.value}（${lv.label}）`"
+              :value="lv.value"
+            />
           </el-select>
         </el-form-item>
       </el-form>

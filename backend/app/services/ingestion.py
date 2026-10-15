@@ -16,7 +16,7 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import get_settings, normalize_security_level
 from app.db.models import Chunk as ChunkModel
 from app.db.models import Document as DocumentModel
 from app.db.models import IngestionJob, _uuid
@@ -227,7 +227,8 @@ async def ingest_document(
         issuer=payload.get("issuer"),
         doc_no=payload.get("doc_no"),
         publish_date=_parse_date(payload.get("publish_date")),
-        security_level=payload.get("security_level", "INTERNAL"),
+        # 密级归一（防御纵深）：API 层已归一，内部调用/历史 payload 再兜底一次
+        security_level=normalize_security_level(payload.get("security_level")),
         permission_tags=payload.get("permission_tags", []),
         owner_org=payload.get("owner_org"),
         source_system=payload.get("source_system"),
@@ -455,7 +456,8 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                 issuer=meta.get("issuer"),
                 doc_no=meta.get("doc_no"),
                 publish_date=_parse_date(meta.get("publish_date")),
-                security_level=meta.get("security_level", "INTERNAL"),
+                # 密级归一（防御纵深，同 ingest_document）
+                security_level=normalize_security_level(meta.get("security_level")),
                 permission_tags=meta.get("permission_tags", []),
                 owner_org=meta.get("owner_org"),
                 source_system=meta.get("source_system"),

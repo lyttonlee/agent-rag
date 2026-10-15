@@ -7,12 +7,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
+
+from app.core.config import normalize_security_level
 
 # ---- 通用 ----
-SecurityLevel = Literal["PUBLIC", "INTERNAL", "RESTRICTED", "SECRET"]
+# 我方标准密级枚举（六级，2026-10-15 起）：权重见 app.core.config.SECURITY_WEIGHT
+SecurityLevel = Literal[
+    "PUBLIC", "INTERNAL", "COMMERCIAL", "CORE_COMMERCIAL", "CLASSIFIED", "TOP_SECRET"
+]
+# 密级入参类型：接受规范代码 / 历史四级代码（RESTRICTED/SECRET）/ 中文名
+# （机密/商密…），统一归一为规范枚举——枚举扩容不破坏存量接入方（不会 422）
+SecurityLevelInput = Annotated[str, AfterValidator(normalize_security_level)]
 # 切分策略（与 chunker.ChunkStrategy 对应）
 ChunkStrategy = Literal["paragraph", "fixed", "sentence", "section"]
 
@@ -33,7 +41,9 @@ class DocumentIngest(BaseModel):
     issuer: str | None = None
     doc_no: str | None = None
     publish_date: str | None = None            # ISO 日期
-    security_level: SecurityLevel = "INTERNAL"
+    security_level: SecurityLevelInput = Field(
+        "INTERNAL", description="密级：非密/内部/普通商密/核心商密/密级/机密（见接口文档 2.2）"
+    )
     permission_tags: list[str] = Field(default_factory=list, description="scope:type:value")
     owner_org: str | None = None
     source_system: str | None = None
@@ -187,7 +197,7 @@ class RetrieveRequest(BaseModel):
     top_n: int | None = 8
     # 调用方上下文（上游网关下发，我方强制执行过滤）
     caller_scope: list[str] = Field(default_factory=list)
-    max_clearance: SecurityLevel = "INTERNAL"
+    max_clearance: SecurityLevelInput = "INTERNAL"
     rerank: bool = True
 
 
@@ -220,7 +230,7 @@ class GenerateRequest(BaseModel):
     doc_types: list[str] | None = None
     space_ids: list[str] | None = Field(None, description="限定检索的文档空间（多选）；缺省不限空间")
     caller_scope: list[str] = Field(default_factory=list)
-    max_clearance: SecurityLevel = "INTERNAL"
+    max_clearance: SecurityLevelInput = "INTERNAL"
     template_doc_type: str | None = None  # 按文种模板起草（文种分类）
     template_code: str | None = None  # 具体模板编码（同一文种可配置多模板，精确选择某一类）
     conversation_id: str | None = Field(None, description="所属会话（公文起草多轮修改）；缺省自动创建")
@@ -316,6 +326,9 @@ class ConversationResp(BaseModel):
     last_message_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    # 搜索命中片段（仅 keyword 搜索且命中消息内容时返回，供前端历史栏
+    # 高亮展示"为什么这条会话被搜到"；普通列表与标题命中为 null）
+    match_snippet: str | None = None
 
 
 class ConversationDetail(ConversationResp):
@@ -331,7 +344,7 @@ class ChatRequest(BaseModel):
     space_ids: list[str] | None = Field(None, description="本次问答限定的知识空间；缺省沿用会话绑定空间")
     doc_types: list[str] | None = None
     caller_scope: list[str] = Field(default_factory=list)
-    max_clearance: SecurityLevel = "INTERNAL"
+    max_clearance: SecurityLevelInput = "INTERNAL"
     top_n: int | None = 8
     rerank: bool = Field(True, description="问答链路默认启用重排（提升引用质量）")
     agent_mode: bool | None = Field(
@@ -417,8 +430,9 @@ class ClientRegisterReq(BaseModel):
         default_factory=lambda: ["chat", "retrieve"],
         description='允许的能力域：chat/retrieve/documents/spaces/conversations/templates/config/audit/ops，或 ["*"] 全开',
     )
-    max_clearance: SecurityLevel = Field(
-        "INTERNAL", description="可检索最高密级：PUBLIC/INTERNAL/RESTRICTED/SECRET"
+    max_clearance: SecurityLevelInput = Field(
+        "INTERNAL",
+        description="可检索最高密级额度：非密/内部/普通商密/核心商密/密级/机密（见接口文档 2.2）",
     )
 
 

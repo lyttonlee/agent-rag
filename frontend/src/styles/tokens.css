@@ -138,7 +138,7 @@ body {
 .serif { font-family: var(--font-serif); }
 .mono { font-family: var(--font-mono); }
 
-/* 密级徽标 */
+/* 密级徽标（六级体系 2026-10-15：非密/内部/普通商密/核心商密/密级/机密） */
 .badge {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 8px; border-radius: 999px; font-size: 12px;
@@ -146,5 +146,11 @@ body {
 }
 .badge.PUBLIC { color: var(--c-public); border-color: rgba(46,204,113,.4); }
 .badge.INTERNAL { color: var(--c-internal); border-color: rgba(61,126,255,.4); }
+/* 商密两级用橙系递进；国家秘密两级用红系递进——一眼可辨密级家族 */
+.badge.COMMERCIAL { color: #f1a33c; border-color: rgba(241,163,60,.4); }
+.badge.CORE_COMMERCIAL { color: #e8722c; border-color: rgba(232,114,44,.45); }
+.badge.CLASSIFIED { color: #e04848; border-color: rgba(224,72,72,.4); }
+.badge.TOP_SECRET { color: var(--c-secret); border-color: rgba(229,72,77,.45); }
+/* 历史四级代码（存量数据/旧链接）保留配色，迁移后自然消失 */
 .badge.RESTRICTED { color: var(--c-restricted); border-color: rgba(241,163,60,.4); }
 .badge.SECRET { color: var(--c-secret); border-color: rgba(229,72,77,.4); }

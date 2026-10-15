@@ -34,6 +34,8 @@ import {
   listSpaces,
   updateSpace,
   uploadDocument,
+  SECURITY_LEVEL_LABELS,
+  SECURITY_LEVEL_OPTIONS,
   type DocSpace,
   type DocSummary,
   type DocDetail,
@@ -161,6 +163,11 @@ const filters = reactive({
   doc_type: '' as string,
   security_level: '' as string,
 })
+
+/** 密级中文名（存量历史代码 RESTRICTED/SECRET 也能显示，回落原值） */
+function secLabel(v: string): string {
+  return (SECURITY_LEVEL_LABELS as Record<string, string>)[v] || v
+}
 
 async function load() {
   // 根级视图只列空间（文件夹导航），不拉文档列表
@@ -545,8 +552,7 @@ async function quickIngest() {
             <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
           </el-select>
           <el-select v-model="filters.security_level" placeholder="密级" clearable style="width: 120px" @change="load">
-            <el-option label="公开" value="PUBLIC" /><el-option label="内部" value="INTERNAL" />
-            <el-option label="受限" value="RESTRICTED" /><el-option label="秘密" value="SECRET" />
+            <el-option v-for="lv in SECURITY_LEVEL_OPTIONS" :key="lv.value" :label="lv.label" :value="lv.value" />
           </el-select>
           <el-button @click="load">查询</el-button>
         </div>
@@ -558,7 +564,7 @@ async function quickIngest() {
           </el-table-column>
           <el-table-column prop="doc_type" label="文种" width="90" />
           <el-table-column label="密级" width="100">
-            <template #default="{ row }"><span class="badge" :class="row.security_level">{{ row.security_level }}</span></template>
+            <template #default="{ row }"><span class="badge" :class="row.security_level">{{ secLabel(row.security_level) }}</span></template>
           </el-table-column>
           <el-table-column label="状态" width="100">
             <template #default="{ row }">
@@ -605,8 +611,7 @@ async function quickIngest() {
         <el-form-item label="文号"><el-input v-model="form.doc_no" /></el-form-item>
         <el-form-item label="密级">
           <el-select v-model="form.security_level">
-            <el-option label="公开" value="PUBLIC" /><el-option label="内部" value="INTERNAL" />
-            <el-option label="受限" value="RESTRICTED" /><el-option label="秘密" value="SECRET" />
+            <el-option v-for="lv in SECURITY_LEVEL_OPTIONS" :key="lv.value" :label="lv.label" :value="lv.value" />
           </el-select>
         </el-form-item>
         <el-form-item label="权限标签"><el-input v-model="form.permission_tags" placeholder="scope:dept:xxx,scope:role:yyy" /></el-form-item>
@@ -695,7 +700,7 @@ async function quickIngest() {
           <div class="d-head">
             <div class="d-title serif">{{ detail.title }}</div>
             <div class="text-muted">
-              <span class="badge" :class="detail.security_level">{{ detail.security_level }}</span>
+              <span class="badge" :class="detail.security_level">{{ secLabel(detail.security_level) }}</span>
               文种 {{ detail.doc_type }} · 切片 {{ detail.chunk_count }} 片
             </div>
           </div>

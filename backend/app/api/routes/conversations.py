@@ -4,12 +4,16 @@
 - 创建 / 列表 / 详情 / 重命名 / 删除；
 - 手动追加消息（用户停止生成后保存部分答案等场景）；
 - 多轮上下文由后端在生成时自动拼接（见 services/chat.py）。
+
+历史搜索（2026-10-15 用户需求）：列表端点支持两种定位方式——
+`keyword` 模糊搜索（标题 + 消息内容，命中消息时返回 match_snippet
+片段）与 `id` 精确查找（明确 ID 直达，不存在返回 404）。
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes.spaces import check_space_ids_visible
@@ -29,16 +33,18 @@ from app.services.auth import Caller, get_caller
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 
-def _conv_resp(c: Conversation) -> ConversationResp:
+def _conv_resp(c: Conversation, match_snippet: str | None = None) -> ConversationResp:
     return ConversationResp(
         id=c.id,
         title=c.title,
         conv_type=c.conv_type,
+        doc_type=c.doc_type,
         space_ids=c.space_ids or [],
         message_count=c.message_count or 0,
         last_message_at=c.last_message_at,
         created_at=c.created_at,
         updated_at=c.updated_at,
+        match_snippet=match_snippet,
     )
 
 
@@ -54,6 +60,70 @@ def _msg_resp(m: ConversationMessage) -> MessageResp:
         reasoning=m.reasoning,
         created_at=m.created_at,
     )
+
+
+def _escape_like(text: str) -> str:
+    """转义 ILIKE 通配符（% _ \\）——用户搜索词含这些字符时按字面匹配。"""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_conversation_stmt(*, conv_type: str | None, keyword: str, limit: int):
+    """构造会话列表/搜索语句（纯函数，便于无库单测：编译级断言）。
+
+    Args:
+        conv_type: 会话类型过滤（chat/draft），空串不过滤。
+        keyword: 搜索关键字（已 strip）；匹配标题 ILIKE、消息内容
+            EXISTS 子查询、或整串恰好等于会话 ID。
+        limit: 返回条数上限。
+
+    Returns:
+        SQLAlchemy Select（按最后活跃时间倒序）。
+    """
+    stmt = select(Conversation)
+    if conv_type:
+        stmt = stmt.where(Conversation.conv_type == conv_type)
+    if keyword:
+        pattern = f"%{_escape_like(keyword)}%"
+        # 消息内容命中用 EXISTS 相关子查询（PG 下走消息表 conversation_id 索引）
+        msg_match = (
+            select(ConversationMessage.id)
+            .where(
+                ConversationMessage.conversation_id == Conversation.id,
+                ConversationMessage.content.ilike(pattern, escape="\\"),
+            )
+            .exists()
+        )
+        # 直接粘完整 ID 到关键字框也能命中（id 精确匹配并入 OR）
+        stmt = stmt.where(
+            or_(
+                Conversation.title.ilike(pattern, escape="\\"),
+                Conversation.id == keyword,
+                msg_match,
+            )
+        )
+    return stmt.order_by(
+        Conversation.last_message_at.desc().nullslast(),
+        Conversation.created_at.desc(),
+    ).limit(limit)
+
+
+def _make_snippet(content: str, keyword: str, width: int = 60) -> str:
+    """从命中消息截取关键字周边片段（前端历史栏高亮用）。
+
+    前 20 字 + 关键字 + 后 40 字的窗口；越界处用 … 标记；
+    换行替换为空格（片段是单行展示的）。
+    """
+    pos = content.lower().find(keyword.lower())
+    if pos < 0:
+        return content[:width].replace("\n", " ")
+    start = max(0, pos - 20)
+    end = min(len(content), pos + len(keyword) + 40)
+    snippet = content[start:end].replace("\n", " ")
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(content):
+        snippet += "…"
+    return snippet
 
 
 @router.post("", response_model=ConversationResp, status_code=201)
@@ -81,18 +151,61 @@ async def create_conversation(
 async def list_conversations(
     db: AsyncSession = Depends(get_db),
     conv_type: str | None = Query(None, description="按会话类型过滤：chat / draft"),
+    keyword: str | None = Query(
+        None, description="关键字模糊搜索：匹配会话标题或消息内容（命中消息时返回 match_snippet）"
+    ),
+    # 参数名 id 是产品要求的调用形态（第三方按"明确 ID"语义传参），
+    # 刻意遮蔽内置 id——函数体内不使用内置 id，无副作用
+    id: str | None = Query(
+        None, description="按会话 ID 精确查找；不存在返回 404"
+    ),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[ConversationResp]:
-    """会话列表（按最后活跃时间倒序，供前端历史栏展示）。"""
-    stmt = select(Conversation)
-    if conv_type:
-        stmt = stmt.where(Conversation.conv_type == conv_type)
-    stmt = stmt.order_by(
-        Conversation.last_message_at.desc().nullslast(),
-        Conversation.created_at.desc(),
-    ).limit(limit)
+    """会话列表（按最后活跃时间倒序，供前端历史栏展示）。
+
+    两种搜索形态（2026-10-15 用户需求）：
+    - `id`：明确 ID 精确查找，直达某条历史（找不到 → 404）；
+    - `keyword`：模糊搜索标题与消息内容（ILIKE，通配符已转义），
+      命中消息内容的会话附返 match_snippet 片段。
+    两者可组合（如 id + conv_type 校验类型）；都不传即常规列表。
+    """
+    # 明确 ID：精确查找，不存在时 404（与"关键字无匹配"返回空列表区分）
+    if id:
+        stmt = select(Conversation).where(Conversation.id == id)
+        if conv_type:
+            stmt = stmt.where(Conversation.conv_type == conv_type)
+        row = (await db.execute(stmt)).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"会话不存在：{id}")
+        return [_conv_resp(row)]
+
+    keyword = (keyword or "").strip()
+    stmt = _build_conversation_stmt(conv_type=conv_type, keyword=keyword, limit=limit)
     rows = (await db.execute(stmt)).scalars().all()
-    return [_conv_resp(c) for c in rows]
+
+    # 命中消息的会话：取每条最早一条命中消息截取片段（一次查询拿全量）
+    snippet_map: dict[str, str] = {}
+    if keyword and rows:
+        msg_rows = (
+            await db.execute(
+                select(
+                    ConversationMessage.conversation_id,
+                    ConversationMessage.content,
+                )
+                .where(
+                    ConversationMessage.conversation_id.in_([c.id for c in rows]),
+                    ConversationMessage.content.ilike(
+                        f"%{_escape_like(keyword)}%", escape="\\"
+                    ),
+                )
+                .order_by(ConversationMessage.created_at.asc())
+            )
+        ).all()
+        for cid, content in msg_rows:
+            if cid not in snippet_map:
+                snippet_map[cid] = _make_snippet(content or "", keyword)
+
+    return [_conv_resp(c, snippet_map.get(c.id)) for c in rows]
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetail)

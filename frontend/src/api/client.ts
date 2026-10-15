@@ -10,7 +10,7 @@ const client = axios.create({
 // 调用方上下文：上游网关下发的密级 / 权限，我方在检索/生成阶段强制执行过滤。
 export interface CallerContext {
   caller_scope: string[]
-  max_clearance: 'PUBLIC' | 'INTERNAL' | 'RESTRICTED' | 'SECRET'
+  max_clearance: SecurityLevel
 }
 
 export const caller: CallerContext = {
@@ -138,7 +138,34 @@ export async function setClientEnabled(clientId: string, enabled: boolean): Prom
 export default client
 
 // ============================ 类型定义 ============================
-export type SecurityLevel = 'PUBLIC' | 'INTERNAL' | 'RESTRICTED' | 'SECRET'
+/** 我方标准密级枚举（六级，2026-10-15 起，与后端 SECURITY_WEIGHT 对应） */
+export type SecurityLevel =
+  | 'PUBLIC'
+  | 'INTERNAL'
+  | 'COMMERCIAL'
+  | 'CORE_COMMERCIAL'
+  | 'CLASSIFIED'
+  | 'TOP_SECRET'
+
+/** 密级下拉选项（中文标签与后端 SECURITY_LEVEL_LABELS 一致，单一事实源） */
+export const SECURITY_LEVEL_OPTIONS: { label: string; value: SecurityLevel }[] = [
+  { label: '非密', value: 'PUBLIC' },
+  { label: '内部', value: 'INTERNAL' },
+  { label: '普通商密', value: 'COMMERCIAL' },
+  { label: '核心商密', value: 'CORE_COMMERCIAL' },
+  { label: '密级', value: 'CLASSIFIED' },
+  { label: '机密', value: 'TOP_SECRET' },
+]
+
+/** 密级中文名映射（统计图表 / 徽章展示用） */
+export const SECURITY_LEVEL_LABELS: Record<SecurityLevel, string> = {
+  PUBLIC: '非密',
+  INTERNAL: '内部',
+  COMMERCIAL: '普通商密',
+  CORE_COMMERCIAL: '核心商密',
+  CLASSIFIED: '密级',
+  TOP_SECRET: '机密',
+}
 export type ChunkStrategy = 'paragraph' | 'fixed' | 'sentence' | 'section'
 export type JobStatus = 'PENDING' | 'PARSING' | 'CHUNKING' | 'EMBEDDING' | 'INDEXED' | 'FAILED'
 
@@ -278,6 +305,8 @@ export interface Conversation {
   last_message_at: string | null
   created_at: string | null
   updated_at: string | null
+  /** 搜索命中片段（keyword 命中消息内容时后端返回，供历史栏高亮） */
+  match_snippet?: string | null
 }
 
 export interface ConversationMessage {
@@ -299,10 +328,20 @@ export interface ConversationDetail extends Conversation {
   messages: ConversationMessage[]
 }
 
-export async function listConversations(convType?: ConvType): Promise<Conversation[]> {
-  const r = await client.get<Conversation[]>('/conversations', {
-    params: convType ? { conv_type: convType } : {},
-  })
+/**
+ * 会话列表（历史栏）。
+ * opts.keyword：模糊搜索（标题 + 消息内容，命中消息返回 match_snippet）；
+ * opts.id：按明确 ID 精确查找（不存在时后端 404）。
+ */
+export async function listConversations(
+  convType?: ConvType,
+  opts?: { keyword?: string; id?: string },
+): Promise<Conversation[]> {
+  const params: Record<string, string> = {}
+  if (convType) params.conv_type = convType
+  if (opts?.keyword) params.keyword = opts.keyword
+  if (opts?.id) params.id = opts.id
+  const r = await client.get<Conversation[]>('/conversations', { params })
   return r.data
 }
 
