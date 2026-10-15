@@ -62,7 +62,7 @@
 
 ---
 
-## 4. OFD 重大发现与待决策（阻塞项）
+## 4. OFD 落地（方案 A+D，已实现）
 
 用户原选「方案 B = 第三方 OFD 库」。调研发现 **Python 侧没有可用于中国 GB/T 33190 公文 OFD 的第三方库**，证据确凿：
 
@@ -75,13 +75,20 @@
 
 **结论**：方案 B 前提不成立。OFD 是开放国标（ZIP+XML，结构公开），文本提取用 Python 标准库 `zipfile`+`ElementTree` 即可无损完成（即分析文档的方案 A）。自研零依赖、内网最稳、与现有公文结构识别能力对齐，且不存在"可用轮子"故不构成重复造轮子。
 
-→ **需你就 OFD 落地方式拍板**（选项见交互提问）：A+D（推荐）/ 坚持 Java ofdrw / 暂缓。
+→ 用户确认按**方案 A+D** 落地，已实现并测试通过（见 §3 OFD 行）。
+
+**实现**（`backend/app/services/parser.py`，零三方依赖）：
+- `parse_ofd_bytes`：zipfile 解包 → OFD.xml/DocRoot → Document.xml → Page BaseLoc → Content.xml，提取 `<TextCode>` 文字，按 Y/X 坐标重排为阅读顺序；多层兜底（无 DocRoot/Page 时全局扫 Content.xml）。
+- `_sniff_format`：见 PK 魔数时**解包探测 ofdspec 命名空间**区分 OFD/DOCX（不能只看魔数）；`_looks_like_ofd` 辅助。
+- `parse_bytes`：扩展名分发加 `.ofd`；无扩展名走嗅探。
+- 方案 D：无文字层页计入 `scanned_pages`/`is_scanned`（与 PDF 扫描件策略一致，OCR 引擎复用二期预留，当前仅标记）。
+- 入库路由无扩展名白名单，OFD 开箱即用；模板上传（templates.py 同用 parse_bytes）一并受益。
 
 ---
 
 ## 5. 遗留与后续
 
-1. **OFD（#108）**：待 §4 决策后实施（拟 A+D：`parse_ofd_bytes` + `_sniff_format` 解包命名空间区分 OFD/DOCX + 无文字层标记 scanned）。
+1. **OFD（#108）**：✅ 已按 A+D 实现并测试通过。后续可选增强：电子签章/印章图片识别（当前只取文字层，印章作图片资源忽略）。
 2. **存量文档**：若希望已入库文档也按新参数重切，需重跑入库（可选，非必须）。
 3. **检索准确率观测**：小块由 150→300，建议在评测台观察精召变化（small-to-large 固有权衡）。
 
@@ -90,6 +97,7 @@
 ## 6. 变更文件清单（本次提交）
 
 **后端**
+- `app/services/parser.py`（OFD 解析：parse_ofd_bytes / _sniff_format 区分 OFD·DOCX / parse_bytes 分发 .ofd）
 - `app/services/runtime_config.py`（切分默认值 + parent_inject 预算）
 - `app/services/chunker.py`（句边界软切分 `_soft_windows`/`_sentence_spans`）
 - `app/api/routes/export.py`、`app/schemas/contracts.py`、`app/services/generation.py`（上轮导出/步骤/会话修复）
@@ -106,5 +114,5 @@
 - `docs/企业公文知识库_导出功能重设计方案_V1.0.md`（上轮）
 
 **工具**
-- `tools/update_retrieval_config.py`、`tools/verify_chunk_completeness.py`（本轮）
+- `tools/update_retrieval_config.py`、`tools/verify_chunk_completeness.py`、`tools/verify_ofd.py`（本轮）
 - `tools/verify_export.py`、`tools/verify_steps.py`、`tools/verify_draft_conv.py`（上轮）
