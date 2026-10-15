@@ -43,6 +43,8 @@ dependencies = [
     "tenacity>=8.4.0",                  # 模型调用重试
     "pyjwt>=2.8.0",
     "chonkie>=1.7.0",
+    # ---- 文档解析 ----
+    "ofdkit>=1.0.0",                     # OFD 独立解析库（本仓库 workspace 成员，见 [tool.uv.sources]）
 ]
 
 # -----------------------------------------------------------------------------
@@ -55,6 +57,7 @@ dev = [
     "ruff>=0.6.0",                      # 静态检查 / 格式化
     "moto[s3]>=5.0.0",                  # S3 存储后端单测 mock（AWS 生态标准库）
     "aiosqlite>=0.20.0",                # 配置中心等单测用 SQLite 内存库
+    "markdown>=3.5.0",                  # scripts/gen_doc_html.py 渲染流程说明文档用
 ]
 
 # -----------------------------------------------------------------------------
@@ -62,7 +65,7 @@ dev = [
 # -----------------------------------------------------------------------------
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
+testpaths = ["tests", "ofdkit/tests"]
 asyncio_mode = "auto"          # 异步测试/夹具自动识别（pytest-asyncio）
 
 # -----------------------------------------------------------------------------
@@ -70,6 +73,14 @@ asyncio_mode = "auto"          # 异步测试/夹具自动识别（pytest-asynci
 # -----------------------------------------------------------------------------
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# ofdkit 为本仓库内的独立库（backend/ofdkit/），以 workspace 成员方式接入：
+# 主服务不内嵌 OFD 实现，库可独立发版、可被部署方单独复用。
+[tool.uv.workspace]
+members = ["ofdkit"]
+
+[tool.uv.sources]
+ofdkit = { workspace = true }
 
 # 构建后端分发包时包含的模块
 [tool.setuptools.packages.find]

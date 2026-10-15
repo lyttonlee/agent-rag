@@ -44,28 +44,35 @@ async def _prepare_dual_chunks(
     content: str,
     prefix: str,
     strategy: str,
+    rcfg: RetrievalConfig | None = None,
 ) -> tuple[list, list, RetrievalConfig | None]:
-    """按配置中心做双粒度切分（长短切分 P1）。
+    """按配置中心做双粒度切分（长短切分 P1 + 段落优先 V2.0）。
 
     Returns:
         (smalls, larges, cfg)；cfg.dual_granularity_enabled=False 时返回
         ([], [], cfg)——调用方据此回退存量单粒度路径（chunk_document）。
         切分本身不依赖 DB，此处仅读取配置；任何异常由调用方按失败任务处理。
+
+    Args:
+        rcfg: 调用方已读取的检索配置（解析阶段已读，此处复用避免两次查库）；
+            None 时自行读取。
     """
-    cfg = await load_retrieval_config(db)
-    if not cfg.dual_granularity_enabled:
-        return [], [], cfg
+    if rcfg is None:
+        rcfg = await load_retrieval_config(db)
+    if not rcfg.dual_granularity_enabled:
+        return [], [], rcfg
     smalls, larges = chunk_document_dual(
         content or "",
         prefix,
         strategy=strategy,  # type: ignore[arg-type]
-        small_max_tokens=cfg.small_max_tokens,
-        small_overlap_tokens=cfg.small_overlap_tokens,
-        large_max_tokens=cfg.large_max_tokens,
-        large_overlap_tokens=cfg.large_overlap_tokens,
+        small_max_tokens=rcfg.small_max_tokens,
+        small_overlap_tokens=rcfg.small_overlap_tokens,
+        large_max_tokens=rcfg.large_max_tokens,
+        large_overlap_tokens=rcfg.large_overlap_tokens,
+        rebuild_paragraphs_flag=rcfg.chunk_paragraph_rebuild,
     )
     mount_parents(smalls, larges)
-    return smalls, larges, cfg
+    return smalls, larges, rcfg
 
 
 def _insert_dual_chunks(
@@ -94,13 +101,13 @@ def _insert_dual_chunks(
                 seq=seq,
                 content=lg.content,
                 content_prefix=prefix,
-                embedding=None,                       # 大块不做向量检索
-                security_level=doc.security_level,     # 冗余密级/权限：父块注入时
-                permission_tags=doc.permission_tags,   # 与小块同款过滤（双保险）
+                embedding=None,  # 大块不做向量检索
+                security_level=doc.security_level,  # 冗余密级/权限：父块注入时
+                permission_tags=doc.permission_tags,  # 与小块同款过滤（双保险）
                 space_id=doc.space_id,
                 tokens=len(lg.content),
                 granularity="large",
-                search_vec=None,                       # 大块不进 BM25 索引
+                search_vec=None,  # 大块不进 BM25 索引
             )
         )
     for seq, (sm, vec) in enumerate(zip(smalls, embeddings, strict=True), start=1):
@@ -176,12 +183,15 @@ async def ingest_document(
         入库结果摘要
     """
     # 1) 取正文：优先内联 content，其次解析 raw_bytes
+    # 配置先于解析读取：parse_noise_clean（页码/页眉清洗 + 乱码规范化）
+    # 需要作用于解析阶段；chunk_paragraph_rebuild 作用于切分阶段。
+    rcfg = await load_retrieval_config(db)
     content = payload.get("content")
     if not content and raw_bytes:
         # 优先用带扩展名的 filename 解析；无 filename 时回退 title（解析器内含 magic
         # bytes 嗅探，可兼容「无扩展名」的第三方导出文件）。
         parse_name = payload.get("filename") or payload.get("title") or "doc"
-        parsed = parse_bytes(parse_name, raw_bytes)
+        parsed = parse_bytes(parse_name, raw_bytes, noise_clean=rcfg.parse_noise_clean)
         content = parsed.text
 
     # 2) 写文档主表（content_ref 优先取外部托管键；后续若有 raw_bytes 则本地落盘覆盖）
@@ -217,7 +227,7 @@ async def ingest_document(
     # 3) 切片：双粒度（长短切分 P1，配置中心可关）；关闭时回退单粒度 800 字符
     prefix = build_prefix(doc.title, doc.issuer, payload.get("publish_date"))
     strategy = payload.get("chunk_strategy", "paragraph")
-    smalls, larges, rcfg = await _prepare_dual_chunks(db, content or "", prefix, strategy)
+    smalls, larges, rcfg = await _prepare_dual_chunks(db, content or "", prefix, strategy, rcfg)
 
     if rcfg is not None and rcfg.dual_granularity_enabled:
         # 4) 向量化：仅小块（大块纯文本不 embed，small-to-large 核心性能设计）
@@ -229,12 +239,14 @@ async def ingest_document(
         chunk_count = len(smalls)
     else:
         # 单粒度存量路径（dual_granularity_enabled=false 时行为与迁移前一致）
+        rebuild = rcfg.chunk_paragraph_rebuild if rcfg else True
         pieces = chunk_document(
             content or "",
             prefix,
             strategy=strategy,
             max_chars=payload.get("chunk_size", 800),
             overlap=payload.get("chunk_overlap", 80),
+            rebuild_paragraphs_flag=rebuild,
         )
         emb_provider = ModelProvider(role="emb")
         texts = [p.content for p in pieces]
@@ -310,7 +322,13 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
             return
 
         try:
-            logger.info("入库任务 %s 开始：filename=%s strategy=%s", job_id, job.filename, meta.get("chunk_strategy"))
+            logger.info(
+                "入库任务 %s 开始：filename=%s strategy=%s", job_id, job.filename, meta.get("chunk_strategy")
+            )
+
+            # 配置先于解析读取：parse_noise_clean 作用于解析（页码/页眉清洗 +
+            # 乱码规范化），chunk_paragraph_rebuild 作用于切分（物理行→自然段）
+            rcfg = await load_retrieval_config(db)
 
             # 阶段：解析（线程池，避免阻塞事件循环）
             job.status = "PARSING"
@@ -320,22 +338,23 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
             if not content and raw_bytes:
                 parse_name = meta.get("filename") or meta.get("title") or "doc"
                 logger.info("入库任务 %s 解析中：%s (%d bytes)", job_id, parse_name, len(raw_bytes))
-                parsed = await asyncio.to_thread(parse_bytes, parse_name, raw_bytes)
+                parsed = await asyncio.to_thread(
+                    parse_bytes, parse_name, raw_bytes, noise_clean=rcfg.parse_noise_clean
+                )
                 content = parsed.text
-                logger.info("入库任务 %s 解析完成：%d 字符，扫描件=%s", job_id, len(content or ""), parsed.is_scanned)
+                logger.info(
+                    "入库任务 %s 解析完成：%d 字符，扫描件=%s", job_id, len(content or ""), parsed.is_scanned
+                )
 
-            # 阶段：切片（双粒度 P1；配置关闭时回退单粒度 800 字符存量路径）
+            # 阶段：切片（双粒度 P1 + 段落优先 V2.0；配置关闭时回退单粒度 800 字符存量路径）
             job.status = "CHUNKING"
             job.progress = 20
             await db.commit()
-            prefix = build_prefix(
-                meta.get("title", ""), meta.get("issuer"), meta.get("publish_date")
-            )
+            prefix = build_prefix(meta.get("title", ""), meta.get("issuer"), meta.get("publish_date"))
             strategy = meta.get("chunk_strategy", "paragraph")
-            smalls, larges, rcfg = await _prepare_dual_chunks(
-                db, content or "", prefix, strategy
-            )
+            smalls, larges, rcfg = await _prepare_dual_chunks(db, content or "", prefix, strategy, rcfg)
             dual = rcfg is not None and rcfg.dual_granularity_enabled
+            rebuild = rcfg.chunk_paragraph_rebuild if rcfg else True
             pieces = (
                 []
                 if dual
@@ -345,6 +364,7 @@ async def process_ingestion_job(job_id: str, raw_bytes: bytes | None, meta: dict
                     strategy=strategy,
                     max_chars=meta.get("chunk_size", 800),
                     overlap=meta.get("chunk_overlap", 80),
+                    rebuild_paragraphs_flag=rebuild,
                 )
             )
             job.total_chunks = len(smalls) if dual else len(pieces)
@@ -447,8 +467,10 @@ async def reconcile_stuck_jobs() -> int:
     """
     async with AsyncSessionLocal() as db:
         stuck = (
-            await db.execute(select(IngestionJob).where(IngestionJob.status.in_(_NON_TERMINAL)))
-        ).scalars().all()
+            (await db.execute(select(IngestionJob).where(IngestionJob.status.in_(_NON_TERMINAL))))
+            .scalars()
+            .all()
+        )
         for j in stuck:
             j.status = "FAILED"
             j.progress = 0

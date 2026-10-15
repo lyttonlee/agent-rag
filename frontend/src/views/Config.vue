@@ -57,14 +57,17 @@ const RETRIEVAL_DEFAULTS = {
   rerank_min_score: 0.15,
   // ---- 长短切分（父子块 P1；单位 token，chonkie 计量）----
   dual_granularity_enabled: true,
-  small_max_tokens: 150,
-  small_overlap_tokens: 20,
-  large_max_tokens: 1200,
-  large_overlap_tokens: 100,
+  small_max_tokens: 300,
+  small_overlap_tokens: 40,
+  large_max_tokens: 2500,
+  large_overlap_tokens: 200,
+  // ---- 解析清洗与段落重建（2026-10-15 V2.0）----
+  parse_noise_clean: true,
+  chunk_paragraph_rebuild: true,
   // ---- 条件父块注入（P1）----
   parent_inject_enabled: true,
-  parent_inject_max_count: 2,
-  parent_inject_max_tokens: 3000,
+  parent_inject_max_count: 3,
+  parent_inject_max_tokens: 6000,
   parent_inject_min_rerank: 0.15,
   // ---- 查询改写（P2）----
   rewrite_enabled: true,
@@ -505,7 +508,7 @@ function currentDesc() {
       <div class="agent-row">
         <div class="agent-info">
           <div class="agent-name">小块 token 上限</div>
-          <div class="agent-sub">检索单元尺寸（用户需求区间 100–200）。小块进向量/BM25 索引，越小匹配越精准、索引越大</div>
+          <div class="agent-sub">检索单元尺寸（含上下文前缀的完整切片预算，合法区间 50–400）。段落优先策略下 200–500 字段落可整段成块；小块进向量/BM25 索引，越小匹配越精准、索引越大</div>
         </div>
         <el-input-number v-model="retrievalForm.small_max_tokens" :min="50" :max="400" />
       </div>
@@ -529,6 +532,21 @@ function currentDesc() {
           <div class="agent-sub">相邻大块尾部重叠预算</div>
         </div>
         <el-input-number v-model="retrievalForm.large_overlap_tokens" :min="0" :max="400" />
+      </div>
+      <!-- ============ 解析清洗与段落重建（V2.0）============ -->
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">版式噪音清洗</div>
+          <div class="agent-sub">解析时剔除页码/页眉页脚，并修复方正书版系 PDF 的标点映射乱码（句号变乱码会破坏句子边界识别）。关闭后原文直出，供对照审计</div>
+        </div>
+        <el-switch v-model="retrievalForm.parse_noise_clean" active-text="开" inactive-text="关" />
+      </div>
+      <div class="agent-row">
+        <div class="agent-info">
+          <div class="agent-name">段落重建</div>
+          <div class="agent-sub">把 PDF/OFD 的物理行重组为自然段（软换行合并、标题分段），保证「段落优先」切分不断段。关闭后仅按空行分段，供已天然分段的 DOCX/TXT 减少推断干预</div>
+        </div>
+        <el-switch v-model="retrievalForm.chunk_paragraph_rebuild" active-text="开" inactive-text="关" />
       </div>
       <!-- ============ 条件父块注入（P1）============ -->
       <div class="agent-row">

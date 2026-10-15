@@ -7,8 +7,9 @@
 两类配置：
 1. ``category=retrieval``：top_k、双路召回宽度、重排开关、向量距离阈值、
    rerank 分数阈值（改写/父块注入触发线）、**长短切分参数**（小块/大块
-   token 预算、总开关）、**条件父块注入参数**（开关/数量/token 预算）、
-   **查询改写参数**（开关/策略/轮次/超时）。
+   token 预算、总开关）、**解析清洗与段落重建开关**（页码/页眉清洗、
+   物理行→自然段重组，2026-10-15 V2.0）、**条件父块注入参数**（开关/
+   数量/token 预算）、**查询改写参数**（开关/策略/轮次/超时）。
 2. ``category=prompt``：生成提示词模板（公文起草 / 智能问答 / 无材料兜底），
    值与 ``generation_prompt.py`` 中的默认文案一致，可编辑。
 
@@ -35,10 +36,10 @@ PROMPT_CONFIG_CATEGORY = "prompt"
 class RetrievalConfig:
     """检索运行时配置（全部有安全默认值，与 settings/env 默认一致）。"""
 
-    final_top_n: int = 8                 # 最终返回条数（原 settings.retrieve_final_top_n）
-    vector_top_n: int = 50               # 向量路召回宽度（原 settings.retrieve_vector_top_n）
-    keyword_top_n: int = 50              # 关键词路召回宽度（原 settings.retrieve_keyword_top_n）
-    rerank_enabled: bool = True          # 重排总开关（原为请求级参数，此处为全局默认）
+    final_top_n: int = 8  # 最终返回条数（原 settings.retrieve_final_top_n）
+    vector_top_n: int = 50  # 向量路召回宽度（原 settings.retrieve_vector_top_n）
+    keyword_top_n: int = 50  # 关键词路召回宽度（原 settings.retrieve_keyword_top_n）
+    rerank_enabled: bool = True  # 重排总开关（原为请求级参数，此处为全局默认）
     # 「无有用信息」判定的向量距离阈值（原硬编码于 agent/policies.py 的 0.60，
     # 标定依据：主题相关 ≈0.28 / 无关 ≈0.64~0.70，取保守值防误杀）
     vec_distance_threshold: float = 0.60
@@ -49,7 +50,7 @@ class RetrievalConfig:
     # 词汇鸿沟型弱命中触发改写救回。换模型/语料需重新标定（评测台）。
     rerank_min_score: float = 0.15
     # ---- 长短切分（父子块，P1；单位一律 token，chonkie 计量）----
-    dual_granularity_enabled: bool = True   # 总开关：false 回退单粒度 800 字符存量路径
+    dual_granularity_enabled: bool = True  # 总开关：false 回退单粒度 800 字符存量路径
     # 小块 token 上限（2026-10-15 由 150 上调至 300）：原 150 过小，公文常见
     # 自然段（200–500 字）会被 token 窗口硬切成多截，检索单元语义残缺；上调后
     # 多数段落可整体落入小块，兼顾精召与段落完整性。合法区间 50–400。
@@ -61,11 +62,18 @@ class RetrievalConfig:
     large_max_tokens: int = 2500
     # 大块尾重叠 token 预算（100→200）：大块间接缝衔接增强。
     large_overlap_tokens: int = 200
+    # ---- 解析清洗与段落重建（2026-10-15 V2.0 解析切分重构）----
+    # 页码/页眉页脚剔除 + 乱码码点规范化（方正书版系 PDF 标点错位修复）。
+    # 关后回归"原文直出"，供对照审计与特殊场景兼容。
+    parse_noise_clean: bool = True
+    # 物理行 → 自然段重组（软换行合并/标题分段）。关后退化为仅按空行分段，
+    # 供极端版式（已天然分段的 DOCX/TXT）减少推断干预。
+    chunk_paragraph_rebuild: bool = True
     # ---- 条件父块注入（P1）----
-    parent_inject_enabled: bool = True      # 上下文不足时回表注入大块
+    parent_inject_enabled: bool = True  # 上下文不足时回表注入大块
     # 单次最多注入父块数（2→3）：命中小块散落多个大块时，多注入一块提升上下文覆盖。
     parent_inject_max_count: int = 3
-    parent_inject_max_tokens: int = 6000    # 注入父块总 token 预算（3000→6000：大块调至 2500 后，需容纳约 2 个大块，硬顶仍防上下文无限膨胀）
+    parent_inject_max_tokens: int = 6000  # 注入父块总 token 预算（3000→6000：大块调至 2500 后，需容纳约 2 个大块，硬顶仍防上下文无限膨胀）
     # 注入触发线与 rerank_min_score 同源（同为 rerank top1 弱相关信号）；
     # 标定依据见 rerank_min_score 注释（实测 0.15：强命中 0.34 跳过、
     # 词汇鸿沟 0.03 触发）。调大更难注入、调小更易注入。
@@ -74,9 +82,9 @@ class RetrievalConfig:
     # 策略默认 synonym（单次 LLM ≈11s，实测 Qwen3-27B）：多数词汇鸿沟
     # 用同义扩展即可救回；hyde 多一次 LLM（+11s），auto 双路 ≈22s，
     # 追求召回时可切 auto 并调大 rewrite_timeout_ms。
-    rewrite_enabled: bool = True            # 弱信号触发 query 改写重检
-    rewrite_strategy: str = "synonym"       # auto|synonym|hyde|decompose
-    rewrite_max_rounds: int = 2             # 改写轮次上限
+    rewrite_enabled: bool = True  # 弱信号触发 query 改写重检
+    rewrite_strategy: str = "synonym"  # auto|synonym|hyde|decompose
+    rewrite_max_rounds: int = 2  # 改写轮次上限
     # 改写总超时（含变体生成 + 重检轮次）。实测单次 gen 调用 ≈11s：
     # synonym 默认 25s 覆盖 1 次生成 + 2 轮重检；auto 双路生成 ≈22s，
     # 需调大至 35000+。超时降级保留原结果，不阻断检索。
@@ -134,13 +142,17 @@ async def _load_category_values(db: AsyncSession, category: str) -> dict[str, ob
     """
     try:
         rows = (
-            await db.execute(
-                select(ConfigKV).where(
-                    ConfigKV.category == category,
-                    ConfigKV.is_active.is_(True),
+            (
+                await db.execute(
+                    select(ConfigKV).where(
+                        ConfigKV.category == category,
+                        ConfigKV.is_active.is_(True),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     except Exception as exc:  # 配置读取失败不影响主链路
         logger.warning("配置中心读取失败（%s），使用默认值：%s", category, exc)
         return {}
@@ -165,27 +177,23 @@ async def load_retrieval_config(db: AsyncSession) -> RetrievalConfig:
         vec_distance_threshold=_coerce_float(
             values.get("vec_distance_threshold"), cfg.vec_distance_threshold, 0.0, 2.0
         ),
-        rerank_min_score=_coerce_float(
-            values.get("rerank_min_score"), cfg.rerank_min_score, 0.0, 1.0
-        ),
+        rerank_min_score=_coerce_float(values.get("rerank_min_score"), cfg.rerank_min_score, 0.0, 1.0),
         dual_granularity_enabled=_coerce_bool(
             values.get("dual_granularity_enabled"), cfg.dual_granularity_enabled
         ),
-        small_max_tokens=_coerce_int(
-            values.get("small_max_tokens"), cfg.small_max_tokens, 50, 400
-        ),
+        small_max_tokens=_coerce_int(values.get("small_max_tokens"), cfg.small_max_tokens, 50, 400),
         small_overlap_tokens=_coerce_int(
             values.get("small_overlap_tokens"), cfg.small_overlap_tokens, 0, 100
         ),
-        large_max_tokens=_coerce_int(
-            values.get("large_max_tokens"), cfg.large_max_tokens, 400, 4000
-        ),
+        large_max_tokens=_coerce_int(values.get("large_max_tokens"), cfg.large_max_tokens, 400, 4000),
         large_overlap_tokens=_coerce_int(
             values.get("large_overlap_tokens"), cfg.large_overlap_tokens, 0, 400
         ),
-        parent_inject_enabled=_coerce_bool(
-            values.get("parent_inject_enabled"), cfg.parent_inject_enabled
+        parse_noise_clean=_coerce_bool(values.get("parse_noise_clean"), cfg.parse_noise_clean),
+        chunk_paragraph_rebuild=_coerce_bool(
+            values.get("chunk_paragraph_rebuild"), cfg.chunk_paragraph_rebuild
         ),
+        parent_inject_enabled=_coerce_bool(values.get("parent_inject_enabled"), cfg.parent_inject_enabled),
         parent_inject_max_count=_coerce_int(
             values.get("parent_inject_max_count"), cfg.parent_inject_max_count, 1, 8
         ),
@@ -197,12 +205,8 @@ async def load_retrieval_config(db: AsyncSession) -> RetrievalConfig:
         ),
         rewrite_enabled=_coerce_bool(values.get("rewrite_enabled"), cfg.rewrite_enabled),
         rewrite_strategy=_coerce_strategy(values.get("rewrite_strategy"), cfg.rewrite_strategy),
-        rewrite_max_rounds=_coerce_int(
-            values.get("rewrite_max_rounds"), cfg.rewrite_max_rounds, 1, 4
-        ),
-        rewrite_timeout_ms=_coerce_int(
-            values.get("rewrite_timeout_ms"), cfg.rewrite_timeout_ms, 1000, 30000
-        ),
+        rewrite_max_rounds=_coerce_int(values.get("rewrite_max_rounds"), cfg.rewrite_max_rounds, 1, 4),
+        rewrite_timeout_ms=_coerce_int(values.get("rewrite_timeout_ms"), cfg.rewrite_timeout_ms, 1000, 30000),
     )
 
 
@@ -233,20 +237,23 @@ RETRIEVAL_SEED: dict[str, object] = {
     "rerank_min_score": 0.15,
     # 长短切分（P1）
     "dual_granularity_enabled": True,
-    "small_max_tokens": 150,
-    "small_overlap_tokens": 20,
-    "large_max_tokens": 1200,
-    "large_overlap_tokens": 100,
+    "small_max_tokens": 300,
+    "small_overlap_tokens": 40,
+    "large_max_tokens": 2500,
+    "large_overlap_tokens": 200,
     # 条件父块注入（P1）
     "parent_inject_enabled": True,
-    "parent_inject_max_count": 2,
-    "parent_inject_max_tokens": 3000,
+    "parent_inject_max_count": 3,
+    "parent_inject_max_tokens": 6000,
     "parent_inject_min_rerank": 0.15,
     # 查询改写（P2）
     "rewrite_enabled": True,
     "rewrite_strategy": "synonym",
     "rewrite_max_rounds": 2,
     "rewrite_timeout_ms": 25000,
+    # 解析清洗与段落重建（V2.0）
+    "parse_noise_clean": True,
+    "chunk_paragraph_rebuild": True,
 }
 
 

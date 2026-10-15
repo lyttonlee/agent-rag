@@ -1,0 +1,17 @@
+[project]
+name = "ofdkit"
+version = "1.0.0"
+description = "OFD (GB/T 33190 开放版式文档) 文本内容提取库：ZIP 包导航 + 坐标阅读顺序重排 + 页码页眉剔除 + 字体映射错位修复。零三方依赖（纯标准库），可独立分发复用。"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []                       # 严格零三方依赖：部署方可整体拷贝，不拖入任何依赖树
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+# -----------------------------------------------------------------------------
+# pytest：库自有测试（不依赖主服务；主服务通过 uv workspace 安装本库后亦可执行）
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]

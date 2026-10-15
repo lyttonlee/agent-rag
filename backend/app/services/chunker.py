@@ -1,24 +1,30 @@
-"""切片：带"上下文前缀"的中文公文切片。
+"""切片：带"上下文前缀"的中文公文切片（段落优先，2026-10-15 V2.0 重构）。
 
 设计要点：
 - 上下文前缀 = 标题｜发文机关｜日期，拼接在每个切片前，是提升中文公文
   检索质量性价比最高的一招（让每个切片都携带文档级归属信息）。
-- RAG 的精髓在于"怎么切"。不同文种/场景适用的切分策略不同，本模块提供
-  四种可切换策略，由接入方在元数据中标明 ``chunk_strategy``：
-    * ``paragraph`` 按段落边界切分（默认，最稳妥，尽量不切断语义）
+- **段落优先（V2.0 核心变化）**：默认 ``paragraph`` 策略的切分单元是
+  **自然段**（经 ``services/paragraphing.py`` 从物理行重组），段内不
+  切断；仅当单个段落超出 token 预算时才逐级降级切分（见下）。旧实现
+  的"段落策略"实际在句末标点后切分（单元是句子），一个 300 token 的
+  小块可跨 2-3 个自然段，段落边界被无视——本次重构修正该问题。
+- 逐级降级（单段超预算时）：
+    1. 句边界软切（。！？；整句归整）
+    2. 单句超预算 → 子句边界（，、：整子句归整）
+    3. 单子句超预算 → token 窗口硬切（与 embedding token 边界对齐）
+  每一级都保证"不断的不切，必须切时切在最接近的语义边界"。
+- 四种策略由接入方在元数据标明 ``chunk_strategy``：
+    * ``paragraph`` 按自然段切分（默认；段内不切，跨段合并至预算）
     * ``fixed``     定长滑动窗口（无视边界，适合结构稀疏、追求均匀召回）
     * ``sentence``  按句切分后合并（保证单句完整，适合问答型检索）
-    * ``section``   按章节/条款结构切分（公文条款级，保留"第X条/一、"结构）
+    * ``section``   按章节/条款结构切分（条款标题 + 其下正文为整体）
 
-所有策略都保证：任意切片字符数 <= max_chars，从而不超出 embedding 模型
-的上下文上限（Qwen3-Embedding 系列约 4096 token ≈ 数千汉字）。
-
-长短切分（父子块，2026-10-13 P1）
+长短切分（父子块）
 --------------------------------
 ``chunk_document_dual`` 在**同一套单元提取与重叠机制**上按两个 token 预算
 独立切分：
-- 小块（small，默认 100–200 token）：检索单元，入库即 embed + tsvector；
-- 大块（large，默认 800–2000 token）：生成单元，纯文本不 embed，
+- 小块（small，默认 300 token）：检索单元，入库即 embed + tsvector；
+- 大块（large，默认 2500 token）：生成单元，纯文本不 embed，
   检索命中小块后按需回表注入（见 services/retrieval.py 条件注入）。
 
 token 计量复用成熟库 **chonkie**（MIT，Rust 内核，离线可用，中文密度
@@ -34,25 +40,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from app.services.paragraphing import (
+    is_standalone_line,
+    rebuild_paragraphs,
+)
+
 # 支持的切分策略枚举（接入契约的一部分，与前端下拉一致）
 ChunkStrategy = Literal["paragraph", "fixed", "sentence", "section"]
 
-# 段落分隔（中文换行 / 空行 / 全角空格）
-_SPLIT_RE = re.compile(r"\n\s*\n|\u3000{2,}|(?<=[。！？；])\s*")
 # 句子分隔（句末标点或换行）
 _SENTENCE_RE = re.compile(r"[。！？；\n]+")
-# 章节/条款标题识别（公文常见结构标记）
-_SECTION_RE = re.compile(
-    r"^\s*(?:"
-    r"第[一二三四五六七八九十百千零\d]+[章条节篇卷]|"  # 第一章 / 第一条 / 第二节
-    r"[一二三四五六七八九十]+、|"                       # 一、 二、
-    r"（[一二三四五六七八九十]+）|"                     # （一）（二）
-    r"\d+[.、]|"                                       # 1. 2、
-    r"[A-Za-z]、|"                                      # A、B、
-    r"[0-9]{1,2}、|"                                    # 01、02、
-    r"第[一二三四五六七八九十\d]+部分"                  # 第一部分
-    r")"
-)
+# 子句分隔（逗号/顿号/冒号——句子内部的一级语义边界）
+_CLAUSE_RE = re.compile(r"[，、：]+")
 
 
 @dataclass
@@ -72,7 +71,7 @@ def build_prefix(title: str, issuer: str | None, publish_date: str | None) -> st
 def _hard_split(block: str, max_chars: int, overlap: int) -> list[str]:
     """对超长文本块做硬切分，保证每块 <= max_chars，块间重叠 overlap 字符。
 
-    用于无法在语义边界切分的"无边界超长段落"——必须按字数兜底，否则单块
+    用于无法在语义边界切分的"无边界超长文本"——必须按字数兜底，否则单块
     会超出 embedding 模型的上下文上限。
     """
     pieces: list[str] = []
@@ -92,12 +91,12 @@ def _merge_units(units: list[str], prefix: str, max_chars: int, overlap: int) ->
     chunks: list[Chunk] = []
     buf = ""
     for unit in units:
-        # 单个单元本身已超长：先落库已有 buf，再对该单元硬切为多块
+        # 单个单元本身已超长：先落库已有 buf，再对该单元逐级降级切分
         if len(unit) > max_chars:
             if buf:
                 chunks.append(Chunk(content=f"{prefix}\n{buf}", prefix=prefix))
                 buf = ""
-            for piece in _hard_split(unit, max_chars, overlap):
+            for piece in _split_over_long_chars(unit, max_chars, overlap):
                 chunks.append(Chunk(content=f"{prefix}\n{piece}", prefix=prefix))
             continue
         if len(buf) + len(unit) <= max_chars:
@@ -116,50 +115,68 @@ def _merge_units(units: list[str], prefix: str, max_chars: int, overlap: int) ->
 # 各策略的"最小切分单元"提取
 # ---------------------------------------------------------------------------
 
-def _paragraph_units(text: str) -> list[str]:
-    """段落策略：以段落/句末边界粗分。"""
-    return [p.strip() for p in _SPLIT_RE.split(text) if p and p.strip()]
-
 
 def _sentence_units(text: str) -> list[str]:
-    """句子策略：以句末标点切分为句子，保留标点以维持语义完整。"""
-    raw = _SENTENCE_RE.split(text)
-    units: list[str] = []
-    for seg in raw:
-        seg = seg.strip()
-        if seg:
-            units.append(seg)
-    return units
+    """句子策略：以句末标点切分为句子，**保留标点**以维持语义完整。
 
-
-def _section_units(text: str) -> list[str]:
-    """章节策略：识别条款标题，将"标题 + 其下正文"作为整体单元。
-
-    若正文过长，后续由 _merge_units 内部的硬切兜底，且前缀会追加章节标题，
-    使每个切片都携带所属条款信息。
+    旧实现用 split 丢掉了句末标点（单元以正文结尾），既损失语义又让
+    「断点在句边界」的校验失效；改用带捕获的 scan，标点归属前句。
     """
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    units: list[str] = []
-    cur_heading = ""
-    cur_body: list[str] = []
-    for ln in lines:
-        stripped = ln.strip()
-        if not stripped:
-            continue
-        if _SECTION_RE.match(stripped):
-            # 遇到新标题：先把上一节提交
-            if cur_heading or cur_body:
-                body = "\n".join(cur_body).strip()
-                units.append(f"{cur_heading}\n{body}".strip() if body else cur_heading)
-            cur_heading = stripped
-            cur_body = []
-        else:
-            cur_body.append(stripped)
-    if cur_heading or cur_body:
-        body = "\n".join(cur_body).strip()
-        units.append(f"{cur_heading}\n{body}".strip() if body else cur_heading)
-    # 若全文未识别出任何章节结构（纯段落），回退为段落单元，避免切成一篇
-    return units if units else _paragraph_units(text)
+    return [seg for _s, _e, seg in _sentence_spans(text)]
+
+
+def _split_over_long_chars(text: str, max_chars: int, overlap: int) -> list[str]:
+    """超长单元的字符口径逐级降级切分（单粒度存量路径用）。
+
+    与 token 口径的 ``_soft_windows`` 同款思想：句边界 → 子句边界 →
+    硬切，保证不断的不切。
+    """
+    # 1) 句边界打包
+    sent_spans = _sentence_spans(text)
+    if sent_spans:
+        pieces: list[str] = []
+        buf, buf_len = "", 0
+        for _s, _e, seg in sent_spans:
+            if len(seg) > max_chars:
+                if buf:
+                    pieces.append(buf)
+                buf, buf_len = "", 0
+                pieces.extend(_split_over_long_chars(seg, max_chars, 0))  # 递归降级
+                continue
+            if buf_len + len(seg) <= max_chars:
+                buf += seg
+                buf_len += len(seg)
+            else:
+                if buf:
+                    pieces.append(buf)
+                buf, buf_len = seg, len(seg)
+        if buf:
+            pieces.append(buf)
+        return pieces
+    # 2) 子句边界打包
+    clause_spans = _clause_spans(text)
+    if clause_spans:
+        pieces = []
+        buf, buf_len = "", 0
+        for _s, _e, seg in clause_spans:
+            if len(seg) > max_chars:
+                if buf:
+                    pieces.append(buf)
+                buf, buf_len = "", 0
+                pieces.extend(_hard_split(seg, max_chars, overlap))
+                continue
+            if buf_len + len(seg) <= max_chars:
+                buf += seg
+                buf_len += len(seg)
+            else:
+                if buf:
+                    pieces.append(buf)
+                buf, buf_len = seg, len(seg)
+        if buf:
+            pieces.append(buf)
+        return pieces
+    # 3) 无语义边界：硬切兜底
+    return _hard_split(text, max_chars, overlap)
 
 
 def chunk_document(
@@ -168,8 +185,10 @@ def chunk_document(
     strategy: ChunkStrategy = "paragraph",
     max_chars: int = 800,
     overlap: int = 80,
+    *,
+    rebuild_paragraphs_flag: bool = True,
 ) -> list[Chunk]:
-    """按指定策略将正文切分为带前缀的片段。
+    """按指定策略将正文切分为带前缀的片段（单粒度存量路径）。
 
     Args:
         text: 文档正文（已去除版式噪音）。
@@ -177,6 +196,8 @@ def chunk_document(
         strategy: 切分策略，见模块顶部说明。
         max_chars: 单切片最大字符数（默认 800）。
         overlap: 相邻切片重叠字符数（默认 80），用于缓解边界信息丢失。
+        rebuild_paragraphs_flag: 是否把物理行重组为自然段（默认开；
+            配置中心 ``chunk_paragraph_rebuild`` 可关）。
 
     Returns:
         切片列表（每个切片 content 已含前缀）。
@@ -192,11 +213,38 @@ def chunk_document(
     if strategy == "sentence":
         units = _sentence_units(text)
     elif strategy == "section":
-        units = _section_units(text)
+        units = _section_units(text, rebuild=rebuild_paragraphs_flag)
     else:  # paragraph（默认）
-        units = _paragraph_units(text)
+        units = _paragraph_units(text, rebuild=rebuild_paragraphs_flag)
 
     return _merge_units(units, prefix, max_chars, overlap)
+
+
+def _paragraph_units(text: str, *, rebuild: bool = True) -> list[str]:
+    """段落策略单元：自然段（物理行重组）；rebuild 关时仅按空行分段。"""
+    return [p.text for p in rebuild_paragraphs(text, enabled=rebuild)]
+
+
+def _section_units(text: str, *, rebuild: bool = True) -> list[str]:
+    """章节策略单元：'条款标题段 + 其下正文段'作为整体。
+
+    V2.0 起基于自然段（而非物理行）判定：标题模式命中的段落开启新单元，
+    后续正文段并入该单元，直至下一标题段——条款标题与其正文不分离，
+    检索时"第X条 + 内容"整体命中。未识别出章节结构时回退段落单元。
+    """
+    paras = rebuild_paragraphs(text, enabled=rebuild)
+    units: list[str] = []
+    for p in paras:
+        if not units or is_standalone_line(p.text):
+            units.append(p.text)  # 标题/日期/文号段开启新单元（条款级召回）
+        else:
+            units[-1] = f"{units[-1]}\n{p.text}"  # 正文并入当前条款单元
+    return units if units else [p.text for p in paras]
+
+
+def _is_head_text(t: str) -> bool:
+    """单元文本是否为条款标题/日期行（章节策略的成组判断）。"""
+    return is_standalone_line(t)
 
 
 # ===========================================================================
@@ -215,23 +263,23 @@ class DualChunk:
 
     content: str
     prefix: str
-    start: int                       # 正文内起始字符偏移（不含 prefix）
-    end: int                         # 正文内结束字符偏移（不含 prefix）
-    granularity: str                 # 'small' | 'large'
+    start: int  # 正文内起始字符偏移（不含 prefix）
+    end: int  # 正文内结束字符偏移（不含 prefix）
+    granularity: str  # 'small' | 'large'
     parent_index: int | None = None  # 挂载后：所属大块在 large 列表中的下标
 
 
 @dataclass
 class _Unit:
-    """带偏移的最小切分单元（段落/句子/条款）。"""
+    """带偏移的最小切分单元（自然段/句子/条款）。"""
 
     text: str
     start: int
     end: int
-    tokens: int = 0                  # 由批量计数回填
+    tokens: int = 0  # 由批量计数回填
 
 
-_TOKENIZER: object | None = None
+_TO_TOKENIZER: object | None = None
 _TOKENIZER_TRIED = False
 
 
@@ -291,80 +339,49 @@ def _spans_by_find(text: str, parts: list[str]) -> list[tuple[int, int, str]]:
     return spans
 
 
-def _paragraph_units_off(text: str) -> list[_Unit]:
-    """段落策略单元（带偏移）：以段落/句末边界粗分。"""
-    raw = [p.strip() for p in _SPLIT_RE.split(text) if p and p.strip()]
-    # strip 后可能与前文不连续：用未 strip 的定位 + strip 量修正
-    spans = _spans_by_find(text, [p for p in _SPLIT_RE.split(text) if p and p.strip()])
-    out: list[_Unit] = []
-    for (start, end, part), stripped in zip(spans, raw, strict=True):
-        lead = len(part) - len(part.lstrip())
-        tail = len(part) - len(part.rstrip())
-        out.append(_Unit(text=stripped, start=start + lead, end=end - tail))
-    return out
+def _paragraph_units_off(text: str, *, rebuild: bool = True) -> list[_Unit]:
+    """段落策略单元（带偏移）：自然段（物理行重组，V2.0 起）。"""
+    return [_Unit(text=p.text, start=p.start, end=p.end) for p in rebuild_paragraphs(text, enabled=rebuild)]
 
 
 def _sentence_units_off(text: str) -> list[_Unit]:
-    """句子策略单元（带偏移）：按句末标点切分，保留标点以维持语义完整。"""
-    raw = [seg for seg in _SENTENCE_RE.split(text)]
-    spans = _spans_by_find(text, raw)
+    """句子策略单元（带偏移）：按句末标点切分，**保留标点**归属前句。"""
     out: list[_Unit] = []
-    for start, _end, part in spans:
-        s = part.strip()
+    for start, end, seg in _sentence_spans(text):
+        s = seg.strip()
         if not s:
             continue
-        lead = len(part) - len(part.lstrip())
-        out.append(_Unit(text=s, start=start + lead, end=start + lead + len(s)))
+        lead = len(seg) - len(seg.lstrip())
+        out.append(_Unit(text=s, start=start + lead, end=end))
     return out
 
 
-def _section_units_off(text: str) -> list[_Unit]:
-    """章节策略单元（带偏移）：'标题 + 其下正文'作为整体。
+def _section_units_off(text: str, *, rebuild: bool = True) -> list[_Unit]:
+    """章节策略单元（带偏移）：基于自然段的'标题段 + 正文段'整体。
 
-    逐行扫描并记录行偏移；新标题行开启新单元，单元 span 覆盖从标题行
-    起点到本节最后一行终点。未识别出章节结构时回退段落单元。
+    与旧行扫描版的差异：正文段保持多行完整（不会被行边界切碎），
+    条款标题段开启新单元，后续正文段并入，偏移跨整个条款。
     """
     units: list[_Unit] = []
-    line_spans: list[tuple[int, int, str]] = []
-    pos = 0
-    for ln in text.splitlines(keepends=True):
-        stripped = ln.strip()
-        line_spans.append((pos, pos + len(ln), stripped))
-        pos += len(ln)
-    cur_start: int | None = None
-    cur_end = 0
-    cur_lines: list[str] = []
-    for start, end, stripped in line_spans:
-        if not stripped:
-            if cur_start is not None:
-                cur_end = end
-            continue
-        if _SECTION_RE.match(stripped):
-            if cur_lines:
-                units.append(
-                    _Unit(text="\n".join(cur_lines), start=cur_start or 0, end=cur_end)
-                )
-            cur_start, cur_end, cur_lines = start, end, [stripped]
+    for p in rebuild_paragraphs(text, enabled=rebuild):
+        if not units or is_standalone_line(p.text):
+            units.append(_Unit(text=p.text, start=p.start, end=p.end))
         else:
-            if cur_start is None:
-                cur_start = start
-            cur_lines.append(stripped)
-            cur_end = end
-    if cur_lines:
-        units.append(_Unit(text="\n".join(cur_lines), start=cur_start or 0, end=cur_end))
-    return units if units else _paragraph_units_off(text)
+            prev = units[-1]
+            units[-1] = _Unit(text=f"{prev.text}\n{p.text}", start=prev.start, end=p.end)
+    return units if units else _paragraph_units_off(text, rebuild=rebuild)
 
 
-def _units_with_offsets(text: str, strategy: ChunkStrategy) -> list[_Unit]:
+def _units_with_offsets(text: str, strategy: ChunkStrategy, *, rebuild: bool = True) -> list[_Unit]:
     """按策略提取带偏移的单元列表（四种策略与 chunk_document 一致）。"""
     if strategy == "sentence":
         return _sentence_units_off(text)
     if strategy == "section":
-        return _section_units_off(text)
+        return _section_units_off(text, rebuild=rebuild)
     if strategy == "fixed":
         # fixed 策略无语义单元：以全文为单一单元，交给 _merge 的硬切窗口处理
         return [_Unit(text=text, start=0, end=len(text))] if text.strip() else []
-    return _paragraph_units_off(text)
+    return _paragraph_units_off(text, rebuild=rebuild)
 
 
 def _token_windows(u: _Unit, max_tokens: int, overlap_tokens: int) -> list[tuple[str, int, int]]:
@@ -424,53 +441,145 @@ def _sentence_spans(text: str) -> list[tuple[int, int, str]]:
     return spans
 
 
+def _clause_spans(text: str) -> list[tuple[int, int, str]]:
+    """按子句标点（，、：）切分并定位 (start, end, seg)，保留标点归属前句。
+
+    二级语义边界：单句本身超预算时，在子句边界成块，仍不切断子句。
+    """
+    spans: list[tuple[int, int, str]] = []
+    for m in re.finditer(r"[^，、：]*(?:[，、：]|$)", text):
+        s, e = m.start(), m.end()
+        seg = text[s:e]
+        if seg and seg.strip():
+            spans.append((s, e, seg))
+    return spans
+
+
+def _pack_spans(
+    spans: list[tuple[int, int, str]],
+    counts: list[int],
+    base: int,
+    max_tokens: int,
+) -> list[tuple[str, int, int]]:
+    """把带计数的片段序列贪心打包为 <= max_tokens 的块（保留原顺序）。
+
+    单片段超预算时由调用方先行处理（降级或硬切），此处只做整段归整。
+    返回 [(piece_text, abs_start, abs_end)]。
+    """
+    out: list[tuple[str, int, int]] = []
+    buf, buf_s, buf_e, buf_tok = "", 0, 0, 0
+    for (rs, re_, seg), c in zip(spans, counts, strict=True):
+        if buf and buf_tok + c > max_tokens:
+            out.append((buf, buf_s, buf_e))
+            buf, buf_tok = "", 0
+        if not buf:
+            buf_s = base + rs
+        buf += seg
+        buf_e = base + re_
+        buf_tok += c
+    if buf:
+        out.append((buf, buf_s, buf_e))
+    return out
+
+
 def _soft_windows(u: _Unit, max_tokens: int, overlap_tokens: int) -> list[tuple[str, int, int]]:
-    """超大单元软切分：在句边界打包成 <= max_tokens 的块；单句仍超预算才硬切。
+    """超大单元软切分（四级降级的第 1 级）：句边界整句归整打包。
 
     与 ``_token_windows``（任意 token 处硬切）的差异：
     1. 整句归整，显著降低「半句话被腰斩」的完整性损失（切分完整性二期核心）；
-    2. 块间不重复（无滑动重叠），避免同句跨块冗余；仅单句超预算的兜底硬切
-       仍保留 token 窗口重叠；
+    2. 块间不重复（无滑动重叠），避免同句跨块冗余；仅最终兜底硬切仍保留
+       token 窗口重叠；
     3. 偏移取句子精确 span（非比例估算），父子挂载更准。
+
+    单句本身超预算时，该句交给 ``_split_unit_graceful(_seen_sentence=True)``
+    走子句边界/硬切降级——即降级链：句边界 → 子句边界 → token 硬切。
 
     Returns:
         [(piece_text, abs_start, abs_end), ...]，偏移为正文内绝对位置。
     """
     sent_spans = _sentence_spans(u.text)
     if not sent_spans:
-        # 无句边界（如纯数字串）：退化为 token 窗口硬切
-        return _token_windows(u, max_tokens, overlap_tokens)
+        # 无句边界（如纯数字串）：直接走子句/硬切降级
+        return _clause_or_token_windows(u, max_tokens, overlap_tokens)
     counts = _count_tokens([seg for _, _, seg in sent_spans])
+    if all(c <= max_tokens for c in counts):
+        # 全部句子放得下：按句边界贪心打包（最常见路径）
+        return _pack_spans(sent_spans, counts, u.start, max_tokens)
+    # 存在超预算句：逐句分发——放得下的按句打包，超预算的递归降级
+    return _distribute_spans(sent_spans, counts, u, max_tokens, overlap_tokens)
+
+
+def _distribute_spans(
+    sent_spans: list[tuple[int, int, str]],
+    counts: list[int],
+    u: _Unit,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[tuple[str, int, int]]:
+    """句级分发：放得下的句子按句边界打包；超预算的句子递归降级。"""
     out: list[tuple[str, int, int]] = []
-    buf = ""
-    buf_s = buf_e = 0
-    buf_tok = 0
-
-    def _flush() -> None:
-        nonlocal buf, buf_s, buf_e, buf_tok
-        if buf:
-            out.append((buf, buf_s, buf_e))
-        buf, buf_tok = "", 0
-
+    normal: list[tuple[int, int, str]] = []
+    normal_counts: list[int] = []
     for (rs, re_, seg), c in zip(sent_spans, counts, strict=True):
         if c > max_tokens:
-            # 单句本身超预算：只能对该句按 token 窗口硬切（兜底，罕见）
-            _flush()
+            if normal:
+                out.extend(_pack_spans(normal, normal_counts, u.start, max_tokens))
+                normal, normal_counts = [], []
             sub = _Unit(text=seg, start=u.start + rs, end=u.start + re_)
-            for piece, ps, pe in _token_windows(sub, max_tokens, overlap_tokens):
-                out.append((piece, ps, pe))
-            continue
-        if buf_tok + c <= max_tokens:
-            if not buf:
-                buf_s = u.start + rs
-            buf += seg
-            buf_e = u.start + re_
-            buf_tok += c
+            out.extend(_split_unit_graceful(sub, max_tokens, overlap_tokens, _seen_sentence=True))
         else:
-            _flush()
-            buf, buf_s, buf_e, buf_tok = seg, u.start + rs, u.start + re_, c
-    _flush()
+            normal.append((rs, re_, seg))
+            normal_counts.append(c)
+    if normal:
+        out.extend(_pack_spans(normal, normal_counts, u.start, max_tokens))
     return out
+
+
+def _clause_or_token_windows(u: _Unit, max_tokens: int, overlap_tokens: int) -> list[tuple[str, int, int]]:
+    """无句边界单元的子句/硬切降级。"""
+    clause_spans = _clause_spans(u.text)
+    if not clause_spans:
+        return _token_windows(u, max_tokens, overlap_tokens)
+    counts = _count_tokens([seg for _, _, seg in clause_spans])
+    if all(c <= max_tokens for c in counts):
+        return _pack_spans(clause_spans, counts, u.start, max_tokens)
+    out: list[tuple[str, int, int]] = []
+    normal: list[tuple[int, int, str]] = []
+    normal_counts: list[int] = []
+    for (rs, re_, seg), c in zip(clause_spans, counts, strict=True):
+        if c > max_tokens:
+            if normal:
+                out.extend(_pack_spans(normal, normal_counts, u.start, max_tokens))
+                normal, normal_counts = [], []
+            sub = _Unit(text=seg, start=u.start + rs, end=u.start + re_)
+            out.extend(_token_windows(sub, max_tokens, overlap_tokens))
+        else:
+            normal.append((rs, re_, seg))
+            normal_counts.append(c)
+    if normal:
+        out.extend(_pack_spans(normal, normal_counts, u.start, max_tokens))
+    return out
+
+
+def _split_unit_graceful(
+    u: _Unit,
+    max_tokens: int,
+    overlap_tokens: int,
+    *,
+    _seen_sentence: bool = False,
+) -> list[tuple[str, int, int]]:
+    """单段超预算的逐级降级切分（V2.0 核心）。
+
+    降级链：
+        1. 句边界软切（_soft_windows：整句归整打包）；
+        2. 单句超预算 → 子句边界软切（_clause_or_token_windows 前半）；
+        3. 单子句超预算 → token 窗口硬切（_token_windows）。
+
+    ``_seen_sentence`` 防递归死循环：已从句级降下来的片段不再尝试句级。
+    """
+    if not _seen_sentence:
+        return _soft_windows(u, max_tokens, overlap_tokens)
+    return _clause_or_token_windows(u, max_tokens, overlap_tokens)
 
 
 def _merge_budgeted(
@@ -486,9 +595,10 @@ def _merge_budgeted(
     与旧 ``_merge_units`` 同款缓冲逻辑，差异在：
     1. 计量单位为 token（配置中心驱动），且**预算覆盖完整切片**
        （正文 + 上下文前缀 + 换行分隔）——前缀是切片的一部分（要 embed、
-       要注入生成上下文），“切片 token 上限”必须是用户看到的那个数；
+       要注入生成上下文），"切片 token 上限"必须是用户看到的那个数；
     2. 重叠按单元尾部回填（保持段落/条款完整，不切断）；
-    3. 输出携带字符偏移（供父子挂载）。
+    3. 输出携带字符偏移（供父子挂载）；
+    4. 单元超预算走四级降级（句→子句→token 硬切），段内尽量不切断。
 
     Args:
         overhead_tokens: 前缀 + 换行的 token 开销（每切片固定成本）。
@@ -519,10 +629,11 @@ def _merge_budgeted(
 
     for u in units:
         if u.tokens > unit_budget:
-            # 单元本身超预算：先落库已有缓冲，再对该单元做【句边界软切分】
-            # （优先整句归整，单句超预算才 token 窗口硬切——保句子完整性）
+            # 单元（自然段）本身超预算：先落库已有缓冲，再对该单元做
+            # 【四级降级切分】——优先整句归整，单句超预算才子句，再不行
+            # 才 token 窗口硬切（保句子/子句完整性，段落优先的代价控制）
             _flush()
-            for piece, p_start, p_end in _soft_windows(u, unit_budget, overlap_tokens):
+            for piece, p_start, p_end in _split_unit_graceful(u, unit_budget, overlap_tokens):
                 chunks.append(
                     DualChunk(
                         content=f"{prefix}\n{piece}",
@@ -564,23 +675,27 @@ def chunk_document_dual(
     text: str,
     prefix: str,
     strategy: ChunkStrategy = "paragraph",
-    small_max_tokens: int = 150,
-    small_overlap_tokens: int = 20,
-    large_max_tokens: int = 1200,
-    large_overlap_tokens: int = 100,
+    small_max_tokens: int = 300,
+    small_overlap_tokens: int = 40,
+    large_max_tokens: int = 2500,
+    large_overlap_tokens: int = 200,
+    *,
+    rebuild_paragraphs_flag: bool = True,
 ) -> tuple[list[DualChunk], list[DualChunk]]:
     """双粒度切分：返回 (小块列表, 大块列表)，均带正文偏移。
 
     Args:
         text: 文档正文（已去除版式噪音）。
         prefix: 文档级上下文前缀（标题｜发文机关｜日期）。
-        strategy: 切分策略（与 chunk_document 四种一致，公文章节/段落识别保留）。
+        strategy: 切分策略（默认 paragraph=自然段优先，段内不切断）。
         small_max_tokens: 小块 token 上限（配置中心 retrieval.small_max_tokens，
-            用户需求区间 100–200；**含前缀的完整切片预算**）。
+            用户需求区间 100–400；**含前缀的完整切片预算**）。
         small_overlap_tokens: 小块尾重叠 token 预算。
         large_max_tokens: 大块 token 上限（配置中心 retrieval.large_max_tokens，
-            用户需求区间 800–2000；同样含前缀）。
+            用户需求区间 400–4000；同样含前缀）。
         large_overlap_tokens: 大块尾重叠 token 预算。
+        rebuild_paragraphs_flag: 是否把物理行重组为自然段（配置中心
+            ``chunk_paragraph_rebuild``，默认开）。
 
     Returns:
         (small, large)：两级粒度**独立切分**（边界天然错位，各自保留
@@ -594,7 +709,7 @@ def chunk_document_dual(
     if not text or not text.strip():
         return [], []
 
-    units = _units_with_offsets(text, strategy)
+    units = _units_with_offsets(text, strategy, rebuild=rebuild_paragraphs_flag)
     if not units:
         return [], []
 
@@ -606,12 +721,8 @@ def chunk_document_dual(
     # 前缀开销（前缀 + 换行分隔）：每切片的固定 token 成本，计入预算
     overhead = max(_count_tokens([f"{prefix}\n"])[0], 1)
 
-    small = _merge_budgeted(
-        units, prefix, small_max_tokens, overhead, small_overlap_tokens, "small"
-    )
-    large = _merge_budgeted(
-        units, prefix, large_max_tokens, overhead, large_overlap_tokens, "large"
-    )
+    small = _merge_budgeted(units, prefix, small_max_tokens, overhead, small_overlap_tokens, "small")
+    large = _merge_budgeted(units, prefix, large_max_tokens, overhead, large_overlap_tokens, "large")
     return small, large
 
 

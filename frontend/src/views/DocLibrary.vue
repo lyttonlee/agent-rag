@@ -202,10 +202,10 @@ function openUpload() {
   dialog.value = true
 }
 const strategyDesc: Record<ChunkStrategy, string> = {
-  paragraph: '按段落边界切分（默认，最稳妥，尽量不切断语义）',
+  paragraph: '按自然段切分（默认：段内不切断，仅超预算段按句/子句降级）',
   fixed: '定长滑动窗口（无视边界，召回最均匀）',
   sentence: '按句子切分后合并（保证单句完整，问答友好）',
-  section: '按章节/条款结构切分（公文条款级，保留结构）',
+  section: '按章节/条款结构切分（条款标题+正文为整体）',
 }
 const form = reactive({
   title: '',
@@ -228,6 +228,8 @@ const dualGran = ref<{
   small_overlap: number
   large: number
   large_overlap: number
+  noise_clean: boolean
+  paragraph_rebuild: boolean
 } | null>(null)
 
 /** 拉取配置中心的双粒度切片参数（只读展示；失败则置空，不影响上传） */
@@ -243,6 +245,9 @@ async function loadDualGranularity() {
       small_overlap: Number(raw('small_overlap_tokens') ?? 40),
       large: Number(raw('large_max_tokens') ?? 2500),
       large_overlap: Number(raw('large_overlap_tokens') ?? 200),
+      // 解析清洗（页码/页眉剔除 + 乱码修复）与段落重建开关（2026-10-15 V2.0）
+      noise_clean: raw('parse_noise_clean') === undefined ? true : raw('parse_noise_clean') === true || raw('parse_noise_clean') === 'true',
+      paragraph_rebuild: raw('chunk_paragraph_rebuild') === undefined ? true : raw('chunk_paragraph_rebuild') === true || raw('chunk_paragraph_rebuild') === 'true',
     }
   } catch {
     dualGran.value = null
@@ -617,6 +622,8 @@ async function quickIngest() {
             大块 {{ dualGran.large }} token（重叠 {{ dualGran.large_overlap }}）
             <template v-if="!dualGran.enabled">（双粒度已关，回退单粒度 800 字符）</template>
             <br />由「配置中心 · 检索配置」统一管理，此处不再单独设置
+            <br />页码/页眉清洗：{{ dualGran.noise_clean ? '开' : '关' }} ·
+            段落重建：{{ dualGran.paragraph_rebuild ? '开' : '关' }}
           </span>
           <span v-else class="hint">由「配置中心 · 检索配置」统一管理</span>
         </el-form-item>
