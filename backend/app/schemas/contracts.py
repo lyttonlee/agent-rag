@@ -199,6 +199,9 @@ class RetrieveRequest(BaseModel):
     caller_scope: list[str] = Field(default_factory=list)
     max_clearance: SecurityLevelInput = "INTERNAL"
     rerank: bool = True
+    debug: bool = Field(
+        False, description="调试：返回检索过程 trace（各阶段召回/融合/rerank 原始分/耗时），供排查检索质量"
+    )
 
 
 class Citation(BaseModel):
@@ -222,6 +225,7 @@ class RetrieveResp(BaseModel):
     truncated_by_security: bool = False   # 是否存在因密级/权限被过滤的结果
     top_vector_distance: float | None = None  # 向量路 top1 余弦距离（"无有用信息"判定信号）
     keyword_hits: int = 0                 # 关键词路命中数（"无有用信息"判定信号）
+    trace: dict | None = None             # 检索过程调试信息（debug=True 时返回，见 RetrieveRequest.debug）
 
 
 # ---- 推理生成 ----

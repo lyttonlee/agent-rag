@@ -480,6 +480,7 @@ export async function retrieve(
     caller_scope?: string[]
     max_clearance?: SecurityLevel
     rerank?: boolean
+    debug?: boolean
   },
 ) {
   const r = await client.post('/retrieve', {
@@ -489,6 +490,7 @@ export async function retrieve(
     caller_scope: opts.caller_scope ?? [],
     max_clearance: opts.max_clearance ?? 'INTERNAL',
     rerank: opts.rerank ?? true,
+    debug: opts.debug ?? false,
   })
   return r.data
 }

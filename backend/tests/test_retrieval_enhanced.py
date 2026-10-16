@@ -126,6 +126,22 @@ class TestToResp:
         assert resp.citations[-1].granularity == GRANULARITY_LARGE
         assert resp.citations[-1].content == "父块完整正文"
 
+    def test_trace_returned_when_debug(self):
+        """debug=True：透出检索过程 trace（排查相似度/rerank 质量）。"""
+        raw = _raw(2)
+        raw.trace = {"embedding": {"dim": 1024}, "rerank": {"scores": [{"score": 0.9}]}}
+        resp = _to_resp(RetrieveRequest(query="q", debug=True), raw)
+        assert resp.trace is not None
+        assert resp.trace["embedding"]["dim"] == 1024
+        assert resp.trace["rerank"]["scores"][0]["score"] == 0.9
+
+    def test_trace_none_when_not_debug(self):
+        """默认（debug=False）：不返回 trace，保持生产响应精简。"""
+        raw = _raw(2)
+        raw.trace = {"embedding": {"dim": 1024}}
+        resp = _to_resp(RetrieveRequest(query="q"), raw)
+        assert resp.trace is None
+
 
 class TestRenderContext:
     def test_large_uses_full_content(self):

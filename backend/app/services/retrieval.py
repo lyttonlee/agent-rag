@@ -62,14 +62,48 @@ class _RawResult:
     keyword_hits: int = 0
     reranked: bool = False
     injected: list[Citation] = field(default_factory=list)
+    # 检索过程调试信息（embedding/召回/融合/rerank 原始分/耗时）；
+    # debug=True 时经 _to_resp 透出到页面，方便排查"相似度低/rerank 不理想"
+    trace: dict = field(default_factory=dict)
 
 
 async def _hybrid_retrieve_raw(
     db: AsyncSession, req: RetrieveRequest, cfg: RetrievalConfig
 ) -> _RawResult:
-    """基础混合检索（仅检索小块 granularity='small'，返回原始结果。"""
+    """基础混合检索（仅检索小块 granularity='small'，返回原始结果）。
+
+    逐阶段记录 trace（debug=True 时透出到页面）并打日志，用于排查
+    "相似度低 / rerank 不理想"：query 向量维度与范数、向量召回 top-N
+    余弦距离、关键词召回 top-N、RRF 融合分、rerank 模型返回的**原始
+    relevance_score**（逐条，含降级标记与耗时）、各阶段耗时。
+    """
+    trace: dict = {
+        "query": req.query,
+        "config": {
+            "vector_top_n": cfg.vector_top_n,
+            "keyword_top_n": cfg.keyword_top_n,
+            "final_top_n": cfg.final_top_n,
+            "rerank_enabled": cfg.rerank_enabled,
+            "vec_distance_threshold": cfg.vec_distance_threshold,
+            "rerank_doc_max_chars": getattr(_settings, "rerank_doc_max_chars", None),
+        },
+    }
+    timing: dict = {}
+
+    # ---- query embedding ----
     emb = ModelProvider(role="emb")
+    t0 = time.monotonic()
     query_vec = (await emb.embed([req.query]))[0]
+    timing["embedding_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    l2 = sum(x * x for x in query_vec) ** 0.5
+    trace["embedding"] = {
+        "model": emb.model_name, "dim": len(query_vec),
+        "l2_norm": round(l2, 4), "latency_ms": timing["embedding_ms"],
+    }
+    logger.debug(
+        "检索[embedding] model=%s dim=%d l2=%.4f %.1fms",
+        emb.model_name, len(query_vec), l2, timing["embedding_ms"],
+    )
 
     vis_filter = build_visibility_filter(
         req.max_clearance, req.caller_scope,
@@ -94,6 +128,7 @@ async def _hybrid_retrieve_raw(
         return q
 
     # ---- 向量召回 ----
+    t0 = time.monotonic()
     vec_q = (
         select(Chunk, Chunk.embedding.cosine_distance(query_vec).label("dist"))
         .options(joinedload(Chunk.document))
@@ -105,9 +140,23 @@ async def _hybrid_retrieve_raw(
     # .all() 保留 (Chunk, dist) 元组：既供 RRF 融合取 Chunk，
     # 也供"无有用信息"判定取 top1 向量距离（见文件末尾信号计算）。
     vec_result = (await db.execute(vec_q)).all()
+    timing["vector_ms"] = round((time.monotonic() - t0) * 1000, 1)
     vec_rows = [row[0] for row in vec_result]
+    trace["vector_recall"] = [
+        {
+            "rank": i, "chunk_id": c.id, "dist": round(float(d), 4),
+            "title": (c.document.title if c.document else ""),
+            "snippet": c.content[:80],
+        }
+        for i, (c, d) in enumerate(vec_result, 1)
+    ]
+    logger.debug(
+        "检索[向量召回] top%d 余弦距离(升序): %s",
+        len(vec_result), [round(float(d), 4) for _, d in vec_result[:10]],
+    )
 
     # ---- 关键词召回（zhparser 中文分词 + ts_rank）----
+    t0 = time.monotonic()
     kw_ts = func.plainto_tsquery("chinese", req.query)
     kw_q = (
         select(Chunk, func.ts_rank_cd(Chunk.search_vec, kw_ts).label("rank"))
@@ -118,7 +167,23 @@ async def _hybrid_retrieve_raw(
         .limit(cfg.keyword_top_n)
     )
     kw_q = _apply(kw_q)
-    kw_rows = (await db.execute(kw_q)).scalars().all()
+    # .all() 保留 (Chunk, ts_rank)：ts_rank 仅入 trace 供排查，
+    # RRF 融合仍按召回序号计权（与旧行为一致）。
+    kw_result = (await db.execute(kw_q)).all()
+    timing["keyword_ms"] = round((time.monotonic() - t0) * 1000, 1)
+    kw_rows = [row[0] for row in kw_result]
+    trace["keyword_recall"] = [
+        {
+            "rank": i, "chunk_id": c.id, "ts_rank": round(float(r), 4),
+            "title": (c.document.title if c.document else ""),
+            "snippet": c.content[:80],
+        }
+        for i, (c, r) in enumerate(kw_result, 1)
+    ]
+    logger.debug(
+        "检索[关键词召回] top%d ts_rank(降序): %s",
+        len(kw_result), [round(float(r), 4) for _, r in kw_result[:10]],
+    )
 
     # ---- RRF 融合 ----
     rrf: dict[str, tuple[Chunk, float]] = {}
@@ -131,6 +196,15 @@ async def _hybrid_retrieve_raw(
 
     fused = sorted(rrf.values(), key=lambda x: x[1], reverse=True)
     top = fused[: cfg.final_top_n]
+    trace["rrf_fusion"] = [
+        {"rank": i, "chunk_id": c.id, "rrf": round(s, 5), "snippet": c.content[:80]}
+        for i, (c, s) in enumerate(top, 1)
+    ]
+    trace["fused_count"] = len(fused)
+    logger.debug(
+        "检索[RRF融合] fused=%d top%d rrf(降序): %s",
+        len(fused), len(top), [round(s, 5) for _, s in top[:10]],
+    )
 
     # ---- 重排（在线，best-effort）----
     # 兼容 RetrieveRequest（含 rerank）与 GenerateRequest（无 rerank，默认开启）。
@@ -138,20 +212,45 @@ async def _hybrid_retrieve_raw(
     # 优雅回退到 RRF 融合分排序，保证检索主链路不中断（生产级健壮性）。
     # 全局开关来自配置中心（cfg.rerank_enabled），请求级 rerank=False 同样可关。
     reranked = False
-    if getattr(req, "rerank", True) and cfg.rerank_enabled and top:
+    rr_on = bool(getattr(req, "rerank", True) and cfg.rerank_enabled and top)
+    rr_trace: dict = {
+        "enabled": rr_on, "model": None, "degraded": False, "latency_ms": None,
+        "doc_max_chars": getattr(_settings, "rerank_doc_max_chars", None), "scores": [],
+    }
+    if rr_on:
         try:
+            t0 = time.monotonic()
             reranker = ModelProvider(role="rerank")
+            rr_trace["model"] = reranker.model_name
             scores = await reranker.rerank(req.query, [c.content for c, _ in top])
+            rr_trace["latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
             ranked = sorted(zip(top, scores, strict=True), key=lambda x: x[1], reverse=True)
             reranked = True
+            # 逐条记录模型返回的原始 relevance_score（排查 rerank 质量的关键）
+            rr_trace["scores"] = [
+                {
+                    "index": i, "score": round(float(s), 4), "chunk_id": c.id,
+                    "snippet": c.content[:80],
+                }
+                for i, ((c, _), s) in enumerate(zip(top, scores, strict=True))
+            ]
+            logger.info(
+                "检索[rerank] model=%s %.1fms 原始 relevance_score(降序): %s",
+                reranker.model_name, rr_trace["latency_ms"],
+                [round(float(s), 4) for s in sorted(scores, reverse=True)],
+            )
         except Exception as exc:  # 重排服务不可用：回退 RRF 顺序，不阻断检索
             logger.warning("rerank 调用失败，回退 RRF 顺序：%s", exc)
+            rr_trace["degraded"] = True
+            rr_trace["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
             # 与成功分支保持同一形状：((Chunk, rrf_score), 展示分)
             ranked = [((c, s_rrf), s_rrf) for (c, s_rrf) in top]
     else:
         # 不做重排：以 RRF 融合分作为展示分，保持与上面分支一致的形状
         # ((Chunk, rrf_score), display_score)
         ranked = [((c, s), s) for c, s in top]
+        rr_trace["note"] = "rerank 未启用（配置中心关闭 / 请求关闭 / 无候选）"
+    trace["rerank"] = rr_trace
 
     # ---- "无有用信息"判定信号（供 Agent 直答拒答 / 任务型兜底决策）----
     # top_vector_distance：向量路 top1 的余弦距离（已按距离升序，取首个）。
@@ -160,12 +259,29 @@ async def _hybrid_retrieve_raw(
     # 两者需同时异常才判定"无有用信息"（见 agent/policies.is_no_useful_info），
     # 单一脸弱信号误杀率高；rerank 可用时该信号依然有效（距离与分词不依赖 rerank）。
     top_vector_distance = float(vec_result[0][1]) if vec_result else None
+    trace["top_vector_distance"] = top_vector_distance
+    trace["keyword_hits"] = len(kw_rows)
+    trace["timing_ms"] = timing
+    trace["final"] = [
+        {
+            "rank": i, "chunk_id": c.id, "score": round(float(s), 4),
+            "title": (c.document.title if c.document else ""),
+            "snippet": c.content[:80],
+        }
+        for i, ((c, _), s) in enumerate(ranked, 1)
+    ]
+    logger.info(
+        "检索完成 q=%.48s | 向量top1距离=%s 关键词命中=%d | rerank降级=%s | top1分=%.4f",
+        req.query, top_vector_distance, len(kw_rows), rr_trace["degraded"],
+        (ranked[0][1] if ranked else 0.0),
+    )
     return _RawResult(
         chunks=[(c, float(s)) for (c, _), s in ranked],
         total_matched=len(fused),
         top_vector_distance=top_vector_distance,
         keyword_hits=len(kw_rows),
         reranked=reranked,
+        trace=trace,
     )
 
 
@@ -290,6 +406,21 @@ async def _rewrite_and_retry(
     # 对原 query 重新打分（合并候选分数同量纲），截回 final_top_n
     merged = await _rerank_raw(db, req, merged, cfg)
     merged.chunks = merged.chunks[: cfg.final_top_n]
+    # 保留首次检索全过程 trace，并追加改写段（改写后的最终排序见 citations）
+    merged.trace = {
+        **raw.trace,
+        "rewrite": {
+            "triggered": True,
+            "strategy": cfg.rewrite_strategy,
+            "variants": list(variants[: cfg.rewrite_max_rounds]),
+            "rounds": done_rounds,
+            "merged_total": merged.total_matched,
+        },
+    }
+    logger.info(
+        "query 改写重检：strategy=%s variants=%d rounds=%d 合并候选=%d",
+        cfg.rewrite_strategy, len(variants), done_rounds, merged.total_matched,
+    )
     return merged
 
 
@@ -379,11 +510,22 @@ async def _inject_parents(
         keyword_hits=raw.keyword_hits,
         reranked=raw.reranked,
         injected=injected,
+        trace={
+            **raw.trace,
+            "parent_inject": {
+                "triggered": True, "injected_count": len(kept),
+                "budget_left": max(budget, 0),
+            },
+        },
     )
 
 
 def _to_resp(req: RetrieveRequest, raw: _RawResult) -> RetrieveResp:
-    """原始结果 → 响应 Model（父块注入的 Citation 追加在尾部）。"""
+    """原始结果 → 响应 Model（父块注入的 Citation 追加在尾部）。
+
+    req.debug=True 时附带 trace（各阶段召回/融合/rerank 原始分/耗时），
+    供前端排查检索质量；默认不返回，保持生产响应精简。
+    """
     citations = [
         Citation(
             chunk_id=c.id,
@@ -404,6 +546,7 @@ def _to_resp(req: RetrieveRequest, raw: _RawResult) -> RetrieveResp:
         truncated_by_security=False,
         top_vector_distance=raw.top_vector_distance,
         keyword_hits=raw.keyword_hits,
+        trace=raw.trace if getattr(req, "debug", False) else None,
     )
 
 
@@ -420,11 +563,29 @@ async def retrieve_enhanced(db: AsyncSession, req: RetrieveRequest) -> RetrieveR
     顺序：基础检索 →（弱信号）query 改写重检 →（仍弱）条件父块注入。
     每一步都可被配置中心独立关闭；任何一步异常只降级不抛出
     （改写/注入是增强，不是主链路依赖）。
+
+    trace（req.debug=True 时透出）：记录弱信号判定依据、是否触发改写/
+    父块注入，配合 _hybrid_retrieve_raw 的各阶段明细，完整还原一次检索，
+    便于定位"相似度低 / rerank 不理想"出在哪一步。
     """
     cfg = await load_retrieval_config(db)
     raw = await _hybrid_retrieve_raw(db, req, cfg)
 
-    if cfg.rewrite_enabled and _is_weak(raw, cfg):
+    # 弱信号判定留痕：解释"为何（未）触发改写 / 父块注入"
+    weak = _is_weak(raw, cfg)
+    raw.trace["weak_signal"] = {
+        "is_weak": weak,
+        "top_vector_distance": raw.top_vector_distance,
+        "keyword_hits": raw.keyword_hits,
+        "reranked": raw.reranked,
+        "rerank_top1": (
+            round(float(raw.chunks[0][1]), 4) if (raw.chunks and raw.reranked) else None
+        ),
+        "vec_distance_threshold": cfg.vec_distance_threshold,
+        "parent_inject_min_rerank": cfg.parent_inject_min_rerank,
+    }
+
+    if cfg.rewrite_enabled and weak:
         raw = await _rewrite_and_retry(db, req, raw, cfg)
 
     if cfg.parent_inject_enabled and _is_weak(raw, cfg):
