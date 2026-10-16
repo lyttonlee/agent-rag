@@ -12,10 +12,14 @@ const degraded = ref(false)
 const trace = ref<any>(null)
 
 // 调用方上下文控制（演示密级 / 权限下推）
+// rerank 默认 true：与后端 RetrieveRequest 默认值、配置中心 rerank_enabled 对齐——
+// 后端语义是"请求级优先于全局"（req.rerank AND cfg.rerank_enabled），
+// 若页面默认 false 会覆盖配置中心的开启状态，导致 rerank 步骤被直接跳过。
+// 用户显式取消勾选才走请求级关闭。
 const ctx = reactive({
   max_clearance: 'TOP_SECRET' as SecurityLevel,
   caller_scope: 'scope:dept:office',
-  rerank: false,
+  rerank: true,
   debug: true,
 })
 
@@ -79,7 +83,7 @@ doRetrieve()
         </el-select>
         <label>权限标签</label>
         <el-input v-model="ctx.caller_scope" placeholder="scope:dept:office" style="width: 220px" />
-        <el-checkbox v-model="ctx.rerank" label="启用重排(超时自动降级)" />
+        <el-checkbox v-model="ctx.rerank" label="启用重排(默认跟随配置中心)" />
         <el-checkbox v-model="ctx.debug" label="调试(返回检索过程)" />
       </div>
     </div>
