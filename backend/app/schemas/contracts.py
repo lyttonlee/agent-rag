@@ -354,6 +354,17 @@ class ChatRequest(BaseModel):
     agent_mode: bool | None = Field(
         None, description="Agent 模式：意图路由 + 分步执行；缺省走配置中心开关（默认开启），false 强制回退纯直答"
     )
+    # ---- 深度推理问答（ReAct，2026-10-16）----
+    # None=跟随配置中心（默认全开，用户 2026-10-16 确认）；显式 false 切回
+    # 普通问答（单轮检索直答 / 复杂任务分步）。切换不改会话存储，历史通用。
+    deep_reason: bool | None = Field(
+        None, description="深度推理问答（ReAct TAO 循环）；缺省走配置中心开关（默认开启）"
+    )
+    # 档位：fast=快速模式（2 轮/60s）/ deep=深度模式（5 轮/180s）；
+    # 缺省取配置中心 deep_default_mode。仅 deep_reason 生效时使用。
+    react_mode: str | None = Field(
+        None, description="深度推理档位：fast（快速）/ deep（深度）；缺省取配置中心默认档"
+    )
     sensitive_words: list[str] | None = None
 
 

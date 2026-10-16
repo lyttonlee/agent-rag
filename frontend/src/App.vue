@@ -48,6 +48,7 @@ function onLogout() {
         <el-menu-item index="/docs"><el-icon><Document /></el-icon>文档库</el-menu-item>
         <el-menu-item index="/retrieve"><el-icon><Search /></el-icon>智能检索问答</el-menu-item>
         <el-menu-item index="/chat"><el-icon><ChatDotRound /></el-icon>智能问答</el-menu-item>
+        <el-menu-item index="/deep-qa"><el-icon><MagicStick /></el-icon>深度问答</el-menu-item>
         <el-menu-item index="/draft"><el-icon><EditPen /></el-icon>智能起草</el-menu-item>
         <el-menu-item index="/templates"><el-icon><Files /></el-icon>模板库</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/auth"><el-icon><Key /></el-icon>认证管理</el-menu-item>

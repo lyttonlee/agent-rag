@@ -257,6 +257,7 @@ export const INTENT_LABELS: Record<string, string> = {
   draft: '公文起草',
   chitchat: '闲聊',
   out_of_scope: '超出范围',
+  deep_reason: '深度推理',
 }
 
 export function intentLabelOf(intent: string | null | undefined): string {
@@ -711,7 +712,93 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
   return controller
 }
 
+/**
+ * 拉取深度推理各阶段提示词全文 + 工具清单（提示词管理面板数据源）。
+ *
+ * 返回的是**运行时实际使用的那份**（工具清单与轮数已按当前档位注入），
+ * 因此面板内容与真实请求完全一致——改 prompt 不用翻代码。
+ */
+export async function getReactPrompts(reactMode?: ReactMode | null): Promise<ReactPromptsResp> {
+  const q = reactMode ? `?react_mode=${reactMode}` : ''
+  const resp = await fetch(`/v1/chat/react/prompts${q}`, {
+    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+  })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  return (await resp.json()) as ReactPromptsResp
+}
+
 // ============================ 智能问答（SSE，多轮会话） ============================
+/** 深度推理档位：fast=快速模式（低延迟）/ deep=深度模式（质量优先） */
+export type ReactMode = 'fast' | 'deep'
+
+/** ReAct 一轮的观测命中（observation 事件） */
+export interface ReactObsHit {
+  n: number
+  chunk_id?: string
+  document_id?: string
+  title: string
+  doc_no?: string | null
+  /** 截断后的摘要（注入模型决策上下文的版本） */
+  snippet: string
+  /** 完整片段（前端展示用，不截断） */
+  full_snippet?: string
+  score: number
+}
+
+/** ReAct 一轮的行动（action 事件） */
+export interface ReactAction {
+  tool: string
+  query: string
+  /** true=被去重/未知工具/缺参跳过，未真实执行 */
+  skipped?: boolean
+}
+
+/** ReAct 一轮的完整记录（前端时间线数据单元） */
+export interface ReactRound {
+  round: number
+  max_rounds?: number
+  thought?: string
+  action?: ReactAction
+  hits?: ReactObsHit[]
+  quality?: Record<string, number | null>
+  note?: string
+  /** 该轮耗时（毫秒，后端统计，含决策+工具执行） */
+  elapsed_ms?: number
+  /** 该轮工具返回的命中总数（可能大于注入决策上下文的条数） */
+  hits_total?: number
+  /** 该轮是否仍在运行（等待 observation 或尚未开始） */
+  running?: boolean
+}
+
+/** 提问理解阶段结果（analysis 事件） */
+export interface ReactAnalysis {
+  /** 模型对用户诉求的复述 */
+  restate: string
+  /** 模型自述是否需要查知识库（仅供参考，不构成路由） */
+  needs_knowledge: boolean
+  needs_knowledge_reason: string
+  /** 候选检索方向 */
+  candidates: string[]
+  /** 可能的歧义点 */
+  ambiguities: string[]
+}
+
+/** 深度推理提示词（提示词管理面板） */
+export interface ReactPromptItem {
+  key: string
+  name: string
+  stage: string
+  content: string
+  variables: string[]
+}
+
+export interface ReactPromptsResp {
+  mode: string
+  max_rounds: number
+  total_budget_ms: number
+  tools: { name: string; description: string }[]
+  prompts: ReactPromptItem[]
+}
 
 export interface StreamChatOpts {
   query: string
@@ -723,6 +810,10 @@ export interface StreamChatOpts {
   rerank?: boolean
   top_n?: number
   agent_mode?: boolean
+  /** 深度推理开关：null/undefined=跟随后端配置（默认全开）；false=切回普通问答 */
+  deep_reason?: boolean | null
+  /** 深度推理档位（仅 deep_reason 生效时使用） */
+  react_mode?: ReactMode | null
 }
 
 export interface ChatHandlers {
@@ -736,6 +827,38 @@ export interface ChatHandlers {
   onStepEnd?: (stepId: string, ok: boolean, summary: string) => void
   onToken?: (text: string) => void
   onReasoning?: (text: string) => void
+  // ---- 深度推理（ReAct）事件：TAO 时间线数据源 ----
+  /** ReAct 循环启动（档位参数与可用工具清单） */
+  onReactStart?: (info: { max_rounds: number; total_budget_ms: number; tools: string[] }) => void
+  /** 提问理解结果（模型复述诉求 + 自述是否需要查库 + 候选方向） */
+  onAnalysis?: (info: ReactAnalysis) => void
+  /** 新一轮开始（时间线追加容器） */
+  onReactRound?: (round: number, maxRounds: number) => void
+  /** 本轮思考（模型显式 Thought 文本） */
+  onThought?: (round: number, text: string) => void
+  /** 本轮行动（工具 + query；skipped=true 表示未真实执行） */
+  onAction?: (round: number, tool: string, query: string, skipped?: boolean) => void
+  /** 本轮观察（命中列表 + 质量信号 + 提示语 + 耗时） */
+  onObservation?: (
+    round: number,
+    o: {
+      tool: string
+      query: string
+      hits: ReactObsHit[]
+      quality: Record<string, number | null>
+      note: string
+      elapsed_ms?: number
+      hits_total?: number
+    },
+  ) => void
+  /** 循环结束（轮数 / 停止原因 / 累计引用 / 总耗时） */
+  onReactEnd?: (info: {
+    rounds: number
+    stop_reason: string
+    stop_label?: string
+    citations_total: number
+    total_ms?: number
+  }) => void
   /** 流式完成（含脱敏后完整答案、敏感词命中、会话 ID、Agent 收尾信息） */
   onDone?: (answer: string, sensitiveHits: string[], model: string, conversationId: string, extra?: DoneExtra) => void
   onError?: (message: string) => void
@@ -767,6 +890,8 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
           rerank: opts.rerank ?? true,
           top_n: opts.top_n ?? 8,
           agent_mode: opts.agent_mode ?? null,
+          deep_reason: opts.deep_reason ?? null,
+          react_mode: opts.react_mode ?? null,
         }),
         signal: controller.signal,
       })
@@ -839,6 +964,52 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
               break
             case 'reasoning':
               handlers.onReasoning?.(evt.text ?? '')
+              break
+            // ---- 深度推理（ReAct）事件：老客户端无此分支，自动忽略 ----
+            case 'react_start':
+              handlers.onReactStart?.({
+                max_rounds: evt.max_rounds ?? 4,
+                total_budget_ms: evt.total_budget_ms ?? 0,
+                tools: evt.tools ?? [],
+              })
+              break
+            case 'analysis':
+              handlers.onAnalysis?.({
+                restate: evt.restate ?? '',
+                needs_knowledge: !!evt.needs_knowledge,
+                needs_knowledge_reason: evt.needs_knowledge_reason ?? '',
+                candidates: evt.candidates ?? [],
+                ambiguities: evt.ambiguities ?? [],
+              })
+              break
+            case 'react_round':
+              handlers.onReactRound?.(evt.round ?? 1, evt.max_rounds ?? 4)
+              break
+            case 'thought':
+              handlers.onThought?.(evt.round ?? 1, evt.text ?? '')
+              break
+            case 'action':
+              handlers.onAction?.(evt.round ?? 1, evt.tool ?? '', evt.query ?? '', !!evt.skipped)
+              break
+            case 'observation':
+              handlers.onObservation?.(evt.round ?? 1, {
+                tool: evt.tool ?? '',
+                query: evt.query ?? '',
+                hits: evt.hits ?? [],
+                quality: evt.quality ?? {},
+                note: evt.note ?? '',
+                elapsed_ms: evt.elapsed_ms,
+                hits_total: evt.hits_total,
+              })
+              break
+            case 'react_end':
+              handlers.onReactEnd?.({
+                rounds: evt.rounds ?? 0,
+                stop_reason: evt.stop_reason ?? 'max_rounds',
+                stop_label: evt.stop_label,
+                citations_total: evt.citations_total ?? 0,
+                total_ms: evt.total_ms,
+              })
               break
             case 'done':
               handlers.onDone?.(

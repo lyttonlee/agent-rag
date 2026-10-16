@@ -122,3 +122,16 @@ INTENT_OUT_OF_SCOPE = register_intent(
         description="超出企业公文知识库能力边界的问题：明确拒答，不编造",
     )
 )
+# 深度推理问答（ReAct，用户 2026-10-16 新增）：TAO 循环多轮检索。
+# 由编排层在 direct_qa/complex_task 上动态接管（意图改写），
+# 闲聊/拒答/起草意图不受影响；无材料时仍是确切回答型——委婉拒答。
+INTENT_DEEP_REASON = register_intent(
+    IntentSpec(
+        name="deep_reason",
+        label="深度推理",
+        strategy="react",
+        needs_retrieval=True,
+        allows_self_capability=False,  # 确切回答型：多轮检索仍无材料 → 委婉拒答，禁止编造
+        description="ReAct TAO 循环：对比/多条件/排查/跨文档综合问题，思考链全程可见",
+    )
+)

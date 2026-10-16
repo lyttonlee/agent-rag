@@ -77,13 +77,23 @@ class ModelProvider:
 
     # ---- 生成 ----
     async def generate(
-        self, messages: list[dict], temperature: float = 0.3, max_tokens: int = 2048
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+        extra_body: dict | None = None,
     ) -> str:
+        """非流式生成；extra_body 透传底层参数（如 Qwen3 的
+        ``chat_template_kwargs={"enable_thinking": False}``——ReAct 决策
+        调用需要纯 JSON 输出，关闭思考链避免 reasoning 干扰解析）。
+        """
+        kwargs: dict = {"extra_body": extra_body} if extra_body else {}
         resp = await self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,  # type: ignore[arg-type]
             temperature=temperature,
             max_tokens=max_tokens,
+            **kwargs,
         )
         return resp.choices[0].message.content or ""
 

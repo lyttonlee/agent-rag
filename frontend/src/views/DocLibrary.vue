@@ -195,7 +195,9 @@ async function load() {
 // ---- 接入文档（上传 + 切分策略 + 状态机进度）----
 const dialog = ref(false)
 const uploading = ref(false)
-const fileRef = ref<File | null>(null)
+/** 接入文件列表（受控 el-upload）；多文件按队列提交 */
+const fileList = ref<any[]>([])
+const pendingFiles = ref<File[]>([])
 
 /** 打开上传对话框：默认把文档放到当前正在浏览的空间 */
 function openUpload() {
@@ -204,6 +206,13 @@ function openUpload() {
     ElMessage.warning(`空间「${currentSpaceObj.value.name}」仅创建者可上传文档`)
     return
   }
+  // 关键修复：每次打开对话框重置文件与标题，避免残留上一次的接入信息
+  //（el-upload 受控 file-list 清空 + 标题/文号归零）
+  fileList.value = []
+  pendingFiles.value = []
+  form.title = ''
+  form.issuer = ''
+  form.doc_no = ''
   form.space_id = currentSpace.value || ''
   loadDualGranularity()
   dialog.value = true
@@ -365,69 +374,106 @@ async function removeSpace(s: DocSpace) {
   }
 }
 
-function onFileChange(file: any) {
-  fileRef.value = file.raw as File
-  if (!form.title) form.title = file.name.replace(/\.[^.]+$/, '')
+function onFileChange(_file: any, fl: any[]) {
+  fileList.value = fl
+  pendingFiles.value = (fl.map((f) => f.raw).filter(Boolean) as File[])
+  // 仅单个文件且用户未手动填标题时默认取文件名；多文件不共用标题，由文件名兜底
+  if (pendingFiles.value.length === 1 && !form.title) {
+    form.title = pendingFiles.value[0].name.replace(/\.[^.]+$/, '')
+  }
 }
 
-// 状态机步骤
-const STEPS = ['已提交', '解析中', '切片中', '向量化中', '已完成']
-const STATUS_STEP: Record<string, number> = {
-  PENDING: 0, PARSING: 1, CHUNKING: 2, EMBEDDING: 3, INDEXED: 4,
+function onFileRemove(_file: any, fl: any[]) {
+  fileList.value = fl
+  pendingFiles.value = (fl.map((f) => f.raw).filter(Boolean) as File[])
 }
-const activeJob = ref<IngestionJob | null>(null)
+
+// ---- 批量入库进度（多文件队列，统一轮询，全部完成后自动关闭）----
+const batchJobs = ref<IngestionJob[]>([])
 const jobDialog = ref(false)
-let pollTimer: number | null = null
+let batchTimer: number | null = null
 
-function startPoll(jobId: string) {
+const batchAllDone = computed(() =>
+  batchJobs.value.length > 0 &&
+  batchJobs.value.every((j) => j.status === 'INDEXED' || j.status === 'FAILED'),
+)
+const batchOkCount = computed(() => batchJobs.value.filter((j) => j.status === 'INDEXED').length)
+const batchFailCount = computed(() => batchJobs.value.filter((j) => j.status === 'FAILED').length)
+
+function startBatchPoll(jobs: IngestionJob[]) {
+  batchJobs.value = jobs.map((j) => ({ ...j }))
   jobDialog.value = true
   const tick = async () => {
-    try {
-      const j = await getJob(jobId)
-      activeJob.value = j
-      if (j.status === 'INDEXED' || j.status === 'FAILED') {
-        if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
-        if (j.status === 'INDEXED') ElMessage.success('入库完成')
-        else ElMessage.error('入库失败：' + (j.error_message || '未知错误'))
-        load()
+    let allDone = true
+    for (const job of batchJobs.value) {
+      try {
+        const j = await getJob(job.id)
+        const finished = j.status === 'INDEXED' || j.status === 'FAILED'
+        Object.assign(job, j)
+        if (!finished) allDone = false
+      } catch {
+        // 单条轮询失败不视为完成，下一秒重试（保持弹窗不提前关闭）
+        allDone = false
       }
-    } catch (e) {
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+    }
+    if (allDone) {
+      if (batchTimer) { clearInterval(batchTimer); batchTimer = null }
+      if (batchFailCount.value === 0) {
+        ElMessage.success(`全部 ${batchOkCount.value} 篇文档入库完成`)
+      } else {
+        ElMessage.warning(`${batchOkCount.value} 篇完成，${batchFailCount.value} 篇失败`)
+      }
+      load()
+      // 完成后进度弹窗自动关闭（保留 1.5s 展示完成态）
+      window.setTimeout(() => { jobDialog.value = false }, 1500)
     }
   }
   tick()
-  pollTimer = window.setInterval(tick, 1000)
+  batchTimer = window.setInterval(tick, 1000)
 }
 
 async function submit() {
-  if (!fileRef.value) {
+  if (pendingFiles.value.length === 0) {
     ElMessage.warning('请先选择文件')
     return
   }
   uploading.value = true
+  const jobs: IngestionJob[] = []
+  let failed = 0
   try {
-    const job = await uploadDocument(fileRef.value, {
-      title: form.title,
-      doc_type: form.doc_type,
-      issuer: form.issuer,
-      doc_no: form.doc_no,
-      security_level: form.security_level,
-      permission_tags: form.permission_tags,
-      space_id: form.space_id || undefined,
-      chunk_strategy: form.chunk_strategy,
-    })
+    // 按队列依次接入：逐个提交（顺序 await），全部提交完再统一轮询进度
+    for (const file of pendingFiles.value) {
+      try {
+        const job = await uploadDocument(file, {
+          title: '', // 多文件不共用标题，由各自文件名兜底
+          doc_type: form.doc_type,
+          issuer: form.issuer,
+          doc_no: form.doc_no,
+          security_level: form.security_level,
+          permission_tags: form.permission_tags,
+          space_id: form.space_id || undefined,
+          chunk_strategy: form.chunk_strategy,
+        })
+        jobs.push(job)
+      } catch (e: any) {
+        failed += 1
+        ElMessage.error(`「${file.name}」提交失败：${e?.response?.data?.detail || e.message}`)
+      }
+    }
+    if (jobs.length === 0) return // 全部提交失败，留在对话框
     dialog.value = false
-    ElMessage.success('已提交，开始入库')
-    startPoll(job.id)
-  } catch (e: any) {
-    ElMessage.error('上传失败：' + (e?.response?.data?.detail || e.message))
+    if (failed > 0) {
+      ElMessage.warning(`${failed} 个文件提交失败，其余 ${jobs.length} 个已开始入库`)
+    } else {
+      ElMessage.success(`已提交 ${jobs.length} 个文件，开始入库`)
+    }
+    startBatchPoll(jobs)
   } finally {
     uploading.value = false
-    fileRef.value = null
   }
 }
 
-onBeforeUnmount(() => { if (pollTimer) clearInterval(pollTimer) })
+onBeforeUnmount(() => { if (batchTimer) clearInterval(batchTimer) })
 
 // ---- 切片详情抽屉 ----
 const drawer = ref(false)
@@ -585,9 +631,10 @@ async function quickIngest() {
     <!-- 接入文档对话框 -->
     <el-dialog v-model="dialog" title="接入文档（解析 → 切片 → 向量化 → 入库）" width="620px">
       <el-upload
-        drag :auto-upload="false" :show-file-list="true" accept=".pdf,.docx,.doc,.ofd,.txt,.md"
-        :on-change="onFileChange" :limit="1">
-        <div class="up-tip">将 PDF / DOCX / OFD 拖到此处，或点击选择</div>
+        drag multiple :auto-upload="false" :show-file-list="true"
+        accept=".pdf,.docx,.doc,.ofd,.txt,.md"
+        :file-list="fileList" :on-change="onFileChange" :on-remove="onFileRemove">
+        <div class="up-tip">将 PDF / DOCX / OFD / TXT 文件拖到此处，或点击选择（支持一次拖拽多个，按队列依次接入）</div>
       </el-upload>
       <el-form :model="form" label-width="92px" style="margin-top: 14px">
         <el-form-item label="标题"><el-input v-model="form.title" placeholder="默认取文件名" /></el-form-item>
@@ -675,21 +722,28 @@ async function quickIngest() {
       </template>
     </el-dialog>
 
-    <!-- 入库进度（状态机）对话框 -->
-    <el-dialog v-model="jobDialog" title="入库进度" width="520px" :close-on-click-modal="false">
-      <div v-if="activeJob" class="job">
-        <div class="job-file">{{ activeJob.filename }} · 策略 {{ activeJob.strategy }}</div>
-        <el-steps :active="STATUS_STEP[activeJob.status] ?? 0" align-center finish-status="success" style="margin: 18px 0">
-          <el-step v-for="s in STEPS" :key="s" :title="s" />
-        </el-steps>
-        <el-progress
-          :percentage="activeJob.progress"
-          :status="activeJob.status === 'FAILED' ? 'exception' : (activeJob.status === 'INDEXED' ? 'success' : '')" />
-        <div class="job-meta text-muted">
-          <span v-if="activeJob.total_chunks">切片 {{ activeJob.processed_chunks }} / {{ activeJob.total_chunks }}</span>
-          <span>状态 {{ activeJob.status }}</span>
+    <!-- 入库进度（批量队列）对话框 -->
+    <el-dialog v-model="jobDialog" title="入库进度" width="560px" :close-on-click-modal="false">
+      <div v-if="batchJobs.length">
+        <div v-for="job in batchJobs" :key="job.id" class="job">
+          <div class="job-file">
+            <span :class="{ fail: job.status === 'FAILED' }">{{ job.filename }}</span>
+            <el-tag size="small" :type="job.status === 'INDEXED' ? 'success' : (job.status === 'FAILED' ? 'danger' : 'info')">
+              {{ job.status }}
+            </el-tag>
+          </div>
+          <el-progress
+            :percentage="job.progress"
+            :status="job.status === 'FAILED' ? 'exception' : (job.status === 'INDEXED' ? 'success' : '')"
+            style="margin: 8px 0 4px" />
+          <div v-if="job.total_chunks" class="job-meta text-muted">
+            切片 {{ job.processed_chunks }} / {{ job.total_chunks }}
+          </div>
+          <div v-if="job.status === 'FAILED'" class="job-err">{{ job.error_message }}</div>
         </div>
-        <div v-if="activeJob.status === 'FAILED'" class="job-err">{{ activeJob.error_message }}</div>
+        <div v-if="batchAllDone" class="batch-summary text-muted">
+          全部完成：{{ batchOkCount }} 成功 / {{ batchFailCount }} 失败（弹窗将自动关闭）
+        </div>
       </div>
     </el-dialog>
 
@@ -796,8 +850,10 @@ async function quickIngest() {
 .st.ok { color: var(--c-success); }
 .up-tip { color: var(--text-muted); padding: 18px 0; }
 .hint { color: var(--text-muted); font-size: 12px; margin-left: 10px; }
-.job-file { color: var(--text-strong); }
+.job-file { color: var(--text-strong); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.job-file .fail { color: var(--c-danger); }
 .job-meta { display: flex; gap: 18px; margin-top: 10px; font-size: 13px; }
+.batch-summary { margin-top: 12px; font-size: 13px; }
 .job-err { color: var(--c-danger); font-size: 12px; margin-top: 8px; word-break: break-all; }
 .d-head { margin-bottom: 14px; }
 .d-title { font-size: 17px; color: var(--text-strong); margin-bottom: 6px; }

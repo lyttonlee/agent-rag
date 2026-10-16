@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.contracts import ChatRequest
+from app.services.agent.react_config import load_react_config
+from app.services.agent.react_prompt import export_prompts
+from app.services.agent.react_tools import TOOL_DESCRIPTIONS, tool_lines
 from app.services.audit import actor_from_request
 from app.services.auth import Caller, get_caller
 from app.services.chat import stream_chat
@@ -35,6 +38,13 @@ async def chat_stream(
     前端用 fetch + ReadableStream 消费，实时渲染；点「停止」时后端
     自动保存已生成部分为助手消息。
 
+    深度推理（ReAct，2026-10-16）：请求 deep_reason（缺省跟配置中心，
+    默认全开）时，问答类意图（确切回答/复杂任务）由编排层改写为
+    deep_reason 意图并进入 TAO 循环，额外推送 react_start / analysis /
+    react_round / thought / action / observation / react_end 事件，
+    最终答案仍走既有 meta / token / done。显式 deep_reason=false 可
+    完全切回普通问答。
+
     认证（2026-10-13）：双模认证（用户 JWT / 第三方 X-API-Key）；
     请求声明的 max_clearance 会被调用方额度压低（权限管控入口），
     第三方客户端还需具备 chat 能力域。
@@ -52,7 +62,7 @@ async def chat_stream(
     # 权限管控：请求密级不得超过调用方额度（密级过滤下推的入口）
     req.max_clearance = caller.cap_clearance(req.max_clearance)
     return StreamingResponse(
-        stream_chat(db, req, actor=actor_from_request(request)),
+        stream_chat(db, req, actor=actor_from_request(request), caller=caller),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -60,3 +70,27 @@ async def chat_stream(
             "X-Accel-Buffering": "no",  # 关闭代理缓冲，保证实时
         },
     )
+
+
+@router.get("/react/prompts", summary="深度推理提示词清单（提示词管理面板）")
+async def react_prompts(
+    react_mode: str | None = Query(None, description="档位 fast/deep；缺省用配置中心默认档"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """返回深度推理各阶段提示词全文 + 可用工具清单。
+
+    供前端「提示词管理」面板展示：运维/用户可直接查看"模型到底被如何
+    指示"，无需翻代码。提示词为**运行时实际使用的那份**（工具清单与轮数
+    已按当前档位注入），因此面板内容与真实请求完全一致。
+    """
+    cfg = await load_react_config(db)
+    max_rounds, budget_ms = cfg.for_mode(react_mode)
+    return {
+        "mode": (react_mode or cfg.default_mode),
+        "max_rounds": max_rounds,
+        "total_budget_ms": budget_ms,
+        "tools": [
+            {"name": name, "description": desc} for name, desc in TOOL_DESCRIPTIONS.items()
+        ],
+        "prompts": export_prompts(tool_lines(), max_rounds),
+    }

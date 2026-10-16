@@ -111,6 +111,17 @@ async def lifespan(app: FastAPI):
             logger.info("配置中心种子：新增 %d 项默认检索配置", added)
     except Exception as exc:
         logger.warning("配置中心种子失败：%s", exc)
+    # 深度推理（ReAct）配置种子：与检索配置同款语义（幂等、不覆盖已改值），
+    # 默认全开 + 双档位（fast 2轮/60s、deep 5轮/180s，用户 2026-10-16 确认）
+    try:
+        from app.services.agent.react_config import ensure_react_configs
+
+        async with AsyncSessionLocal() as db:
+            react_added = await ensure_react_configs(db)
+        if react_added:
+            logger.info("深度推理配置种子：新增 %d 项默认配置", react_added)
+    except Exception as exc:
+        logger.warning("深度推理配置种子失败：%s", exc)
     # 依赖自检（存储 / Embedding / Rerank；数据库已在入口预检）：
     # 真实探测而非配置检查，失败记 WARNING 不阻断启动——相关功能降级
     # （如 rerank 失败 → 检索层回退 RRF），与运行时策略一致。

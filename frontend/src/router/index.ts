@@ -10,6 +10,7 @@ const routes = [
   { path: '/docs', name: 'docs', component: () => import('@/views/DocLibrary.vue'), meta: { title: '文档库' } },
   { path: '/retrieve', name: 'retrieve', component: () => import('@/views/Retrieve.vue'), meta: { title: '智能检索问答' } },
   { path: '/chat', name: 'chat', component: () => import('@/views/Chat.vue'), meta: { title: '智能问答' } },
+  { path: '/deep-qa', name: 'deep-qa', component: () => import('@/views/DeepQa.vue'), meta: { title: '深度问答' } },
   { path: '/draft', name: 'draft', component: () => import('@/views/Draft.vue'), meta: { title: '智能起草' } },
   { path: '/templates', name: 'templates', component: () => import('@/views/Templates.vue'), meta: { title: '模板库' } },
   { path: '/auth', name: 'auth', component: () => import('@/views/AuthManager.vue'), meta: { title: '认证管理' } },

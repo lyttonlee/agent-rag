@@ -16,19 +16,26 @@
 - direct_qa：单轮检索 + 直答；**无材料时委婉拒答（固定话术，不编造）**；
 - complex_task：Planner 拆步 → Executor 分步执行（过程可见）→ Aggregator
   汇总；无材料时改用模型自身能力完成，并追加甄别声明；
+- deep_reason（2026-10-16 新增）：ReAct TAO 循环多轮检索（Thought →
+  Action → Observation 动态决策，**不是计划定死的分步**）→ 多轮材料
+  综合 + 交叉验证 → 最终生成。deep_on 时编排层把 direct_qa /
+  complex_task 动态改写为该意图接管；关闭则行为与旧版完全一致；
 - draft：问答场景下的起草/创作诉求按直答策略处理（有素材则检索+生成）；
   **任务型意图无材料时不拒答**——按意图规格 allows_self_capability 分流：
   确切回答型拒答，任务型用自身能力完成并追加甄别声明；
 - chitchat：不走检索，固定话术即时寒暄；
 - out_of_scope：明确拒答 + 说明能力边界。
 
-思考链留痕：reasoning 事件内容累积并随助手消息落库，回答结束后前端
-以"默认折叠、可展开"面板展示，不再随正文出现而消失。
+思考链留痕：reasoning 事件内容累积并随助手消息落库；深度推理额外把
+TAO 全链文本（每轮思考/行动/观察/停止原因）写入 reasoning，前端以
+"默认折叠、可展开"面板展示，回答结束后不再随正文出现而消失。
 
 事件序列（SSE，向后兼容——老前端忽略不认识的 type 即可）：
   meta（conversation_id / intent / citations / no_result）
   plan（steps，仅 complex_task）
   step_start / step_end（仅 complex_task）
+  react_start / analysis（仅 deep_reason）
+  react_round / thought / action / observation / react_end（仅 deep_reason）
   token / reasoning
   done（answer + sensitive_hits + intent + no_result + disclaimer）
   error
@@ -68,7 +75,11 @@ from app.services.agent import (
     plan_steps,
     stream_text,
 )
+from app.services.agent.react_config import load_react_config
+from app.services.agent.react_engine import ReactRunResult, run_react
+from app.services.agent.react_prompt import build_final_messages as build_react_final_messages
 from app.services.audit import record_audit
+from app.services.auth import Caller
 from app.services.generation_prompt import build_chat_messages
 from app.services.model_provider import ModelProvider
 from app.services.retrieval import retrieve_enhanced
@@ -103,6 +114,8 @@ class _ChatCtx:
     intent: IntentResult
     actor: str
     agent_on: bool = True                 # Agent 是否开启（meta 事件如实回报）
+    # 调用方（doc_lookup 工具的空间可见性判定用；内部调用可为 None）
+    caller: Caller | None = None
     parts: list[str] = field(default_factory=list)      # 已生成正文片段
     reasoning_parts: list[str] = field(default_factory=list)  # 思考链片段（回答后可展开查看）
     citations: list[Citation] = field(default_factory=list)  # 最终引用（汇总合并后）
@@ -305,6 +318,54 @@ async def _run_step_plan(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
         yield evt
 
 
+async def _run_react(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
+    """deep_reason：ReAct TAO 循环 → 最终生成。
+
+    与 ``_run_step_plan``（一次性拆步）的本质区别：步骤不是计划定死的，
+    而是每轮 Thought → Action → Observation 动态决策——**模型自己决定**
+    是否检索、用哪个工具、要不要打开文档看原文、何时收尾；过程以 SSE
+    全程透出（react_round / thought / action / observation），TAO 全链文本
+    随助手消息落库可回看。
+
+    用户 2026-10-16 明确要求（红线）：
+    - **不拒答**：循环结束零引用时**不拒答、不做强制兜底检索**，直接进入
+      最终生成——最终生成 prompt 会切到"通用知识兜底"分支，模型基于自身
+      知识完成任务并标注依据不足，答案末尾统一附「AI 生成，请人工鉴别」。
+    - **多轮上下文**：会话历史注入决策上下文（引擎 history 参数）。
+    """
+    cfg = await load_react_config(ctx.db)
+    # 档位解析：请求级 react_mode > 配置中心默认档（fast/deep → 轮数/预算）
+    max_rounds, budget_ms = cfg.for_mode(getattr(ctx.req, "react_mode", None))
+    result = ReactRunResult()
+
+    # TAO 主循环：SSE 事件原样透传，结论（引用/轮数/trace）写入 result
+    async for evt in run_react(
+        ctx.db, ctx.req, cfg, max_rounds, budget_ms, result,
+        caller=ctx.caller, history=ctx.history,
+    ):
+        yield _sse(evt)
+
+    gen = ModelProvider(role="gen")
+    ctx.model_name = gen.model_name
+
+    # 引用：全部来自模型自主调用的工具结果（模型没调用检索就是 0 条，
+    # 这**不是错误也不是拒答理由**——最终生成会走通用知识兜底完成任务）
+    ctx.citations[:] = result.citations
+
+    # TAO 全链文本追加到思考链：统一收尾处随助手消息落库（reasoning 字段），
+    # 历史消息打开即以"默认折叠、可展开"面板回看完整思维链。
+    if result.trace_text:
+        ctx.reasoning_parts.append(result.trace_text)
+
+    # 所有深度推理答案统一附 AI 声明（材料充分与否都提示人工鉴别）
+    ctx.disclaimer = True
+
+    yield _sse(_meta_event(ctx, gen.model_name, ctx.citations, no_result=False))
+    messages = build_react_final_messages(ctx.req.query, ctx.history, ctx.citations, result.rounds_log)
+    async for evt in _stream_model(ctx, messages, gen):
+        yield evt
+
+
 async def _run_chitchat(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
     """chitchat：不走检索，固定话术即时寒暄（省 token、零延迟、零编造）。"""
     gen = ModelProvider(role="gen")
@@ -334,18 +395,24 @@ _CHAT_STRATEGIES: dict[str, _Strategy] = {
     # 问答场景下的起草诉求：仍走检索+生成（起草的完整策略在 /v1/generate）
     "draft": _run_direct_answer,
     "complex_task": _run_step_plan,
+    # 深度推理（ReAct）：编排层在 deep_on 时把 direct_qa/complex_task
+    # 动态改写为该意图后进入（stream_chat 内），此处仅登记分发
+    "deep_reason": _run_react,
     "chitchat": _run_chitchat,
     "out_of_scope": _run_refuse,
 }
 
 
-async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymous"):
+async def stream_chat(
+    db: AsyncSession, req: ChatRequest, actor: str = "anonymous", caller: Caller | None = None
+):
     """智能问答流式生成器（SSE 文本片段）。
 
     Args:
         db: 数据库会话。
         req: 问答请求（agent_mode 缺省时读配置中心开关）。
         actor: 操作者身份（上游网关下发，用于意图识别审计留痕）。
+        caller: 调用方（深度推理 doc_lookup 工具判定空间可见性用；可缺省）。
     """
     # 1) 会话收敛 + 空间范围确定（请求级 > 会话绑定 > 不限）
     conv = await _ensure_conversation(db, req)
@@ -369,8 +436,20 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
     # 4) Agent 配置与意图识别（agent_mode 关闭时行为与旧版完全一致）
     agent_cfg = await load_agent_config(db)
     agent_on = req.agent_mode if req.agent_mode is not None else agent_cfg.enabled
+    # 深度推理（ReAct）开关：请求级 deep_reason > 配置中心（默认全开，
+    # 用户 2026-10-16 确认）。**仅接管问答类意图**（direct_qa / complex_task）
+    # ——闲聊/拒答/起草意图不受影响；显式 deep_reason=false 即完全回到旧行为。
+    react_cfg = await load_react_config(db)
+    deep_on = req.deep_reason if req.deep_reason is not None else react_cfg.enabled
     if agent_on:
         intent_result = await IntentRouter(agent_cfg).classify(db, req.query)
+        if deep_on and intent_result.intent in ("direct_qa", "complex_task"):
+            intent_result = IntentResult(
+                "deep_reason",
+                intent_result.confidence,
+                intent_result.channel,
+                f"深度推理接管（原意图 {intent_result.intent}）",
+            )
         # 审计：意图识别留痕（可按意图统计用量、复盘误判）
         await record_audit(
             actor=actor,
@@ -389,6 +468,7 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
             ),
         )
     else:
+        # Agent 关闭：深度推理一并退出（纯直答，与旧版完全一致）
         intent_result = IntentResult("direct_qa", 1.0, "disabled", "Agent 已关闭，按直答处理")
 
     ctx = _ChatCtx(
@@ -400,6 +480,7 @@ async def stream_chat(db: AsyncSession, req: ChatRequest, actor: str = "anonymou
         intent=intent_result,
         actor=actor,
         agent_on=agent_on,
+        caller=caller,
     )
     strategy = _CHAT_STRATEGIES.get(intent_result.intent, _run_direct_answer)
 
