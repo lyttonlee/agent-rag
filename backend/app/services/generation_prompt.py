@@ -52,6 +52,24 @@ def _pick(templates: dict[str, str] | None, key: str, default: str) -> str:
     return default
 
 
+# ---- 多轮修改（用户 2026-10-16 硬性要求：同一会话内再次提修改意见时，
+# 必须把往轮对话注入上下文，否则模型只看到本轮 query + 检索材料，会重新
+# 生成一份完整文稿而不是在上一稿基础上修改）----
+# 历史消息截断上限：往轮草稿（assistant）是修改基准，阈值放宽；用户修改
+# 意见（user）从紧。防止早期超长草稿挤占上下文窗口。
+_DRAFT_HISTORY_USER_MAX = 1000
+_DRAFT_HISTORY_ASSISTANT_MAX = 6000
+
+# 多轮修订规则：独立于可配置模板追加——运维自定义 draft_system 后，
+# "在上一稿基础上修改、输出完整文稿"的规则依然生效（配置只覆盖正文指令）。
+_DRAFT_REVISION_RULE = (
+    "【多轮修改】对话历史中包含本轮之前的用户要求与往轮草稿。"
+    "若历史中已有草稿：本轮请求是对上一稿的修改——请以上一稿为基础进行修改，"
+    "输出完整的修改后文稿（不要只描述改动或输出片段，未涉及部分保留原文），"
+    "文种格式与上一稿保持一致。\n"
+)
+
+
 def _render_context(citations: list[Citation]) -> str:
     """渲染检索材料上下文。
 
@@ -76,6 +94,7 @@ def build_generation_messages(
     no_materials: bool = False,
     templates: dict[str, str] | None = None,
     template_name: str | None = None,
+    history: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     """构造公文起草 messages。
 
@@ -90,6 +109,9 @@ def build_generation_messages(
             None 或缺键时用代码默认文案。
         template_name: 具体模板名称（同一文种可配置多模板，用户选定后传入）；
             用于在文种指令中带出"模板：XXX"，让生成更贴合所选模板。
+        history: 会话历史 [(role, content), ...]（按时间正序，已排除本轮
+            user 消息）——同一会话内再次提修改意见时注入往轮要求与上稿，
+            使模型"在上一稿基础上修改"而非重新起草（用户 2026-10-16 需求）。
     """
     system = _pick(
         templates,
@@ -102,12 +124,18 @@ def build_generation_messages(
             line += f"（采用模板：{template_name}）"
         line += "\n"
         system += line
+    # 多轮修改：有历史（往轮草稿）时追加修订规则（独立于可配置模板）
+    if history:
+        system += _DRAFT_REVISION_RULE
 
+    messages: list[dict] = [{"role": "system", "content": system}]
+    # 历史轮次（assistant=往轮草稿放宽截断，user=修改意见从紧，见常量注释）
+    for role, content in (history or []):
+        cap = _DRAFT_HISTORY_ASSISTANT_MAX if role == "assistant" else _DRAFT_HISTORY_USER_MAX
+        messages.append({"role": role, "content": content[:cap]})
     user = f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{req.query}"
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    messages.append({"role": "user", "content": user})
+    return messages
 
 
 def build_chat_messages(

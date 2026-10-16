@@ -8,6 +8,8 @@
 历史搜索（2026-10-15 用户需求）：列表端点支持两种定位方式——
 `keyword` 模糊搜索（标题 + 消息内容，命中消息时返回 match_snippet
 片段）与 `id` 精确查找（明确 ID 直达，不存在返回 404）。
+`conversation_id` 为 `id` 的别名（2026-10-16 加固：按自然命名传参
+不再静默退化为全量列表，见 _resolve_lookup_id）。
 """
 
 from __future__ import annotations
@@ -65,6 +67,21 @@ def _msg_resp(m: ConversationMessage) -> MessageResp:
 def _escape_like(text: str) -> str:
     """转义 ILIKE 通配符（% _ \\）——用户搜索词含这些字符时按字面匹配。"""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _resolve_lookup_id(id: str | None, conversation_id: str | None) -> str:
+    """收敛"按 ID 精确查找"的入参：id 为主，conversation_id 为别名。
+
+    背景（用户 2026-10-16 反馈"会话ID搜索无效，依然可以搜索出所有会话"）：
+    接口各处（导出/生成）都用 conversation_id 指代会话，第三方按自然命名
+    传 ``?conversation_id=xxx`` 时，旧实现只认 ``id``——不认识的参数被
+    静默忽略，请求退化为**无过滤条件的全量列表**，从调用方看就是
+    "ID 搜索无效"。
+
+    防御：两个名都收（以 id 为准），统一 strip；空串按未传处理
+    （由调用方回落关键字/全量列表，与旧行为一致）。
+    """
+    return (id or conversation_id or "").strip()
 
 
 def _build_conversation_stmt(*, conv_type: str | None, keyword: str, limit: int):
@@ -159,24 +176,31 @@ async def list_conversations(
     id: str | None = Query(
         None, description="按会话 ID 精确查找；不存在返回 404"
     ),
+    # conversation_id 为 id 的别名（导出/生成等接口的自然命名）；
+    # 不收敛会导致按自然命名传参时静默返回全量列表（见 _resolve_lookup_id）
+    conversation_id: str | None = Query(
+        None, description="id 的别名：按会话 ID 精确查找；两者都传以 id 为准"
+    ),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[ConversationResp]:
     """会话列表（按最后活跃时间倒序，供前端历史栏展示）。
 
     两种搜索形态（2026-10-15 用户需求）：
-    - `id`：明确 ID 精确查找，直达某条历史（找不到 → 404）；
+    - `id`（或别名 `conversation_id`）：明确 ID 精确查找，直达某条历史
+      （找不到 → 404）；
     - `keyword`：模糊搜索标题与消息内容（ILIKE，通配符已转义），
       命中消息内容的会话附返 match_snippet 片段。
     两者可组合（如 id + conv_type 校验类型）；都不传即常规列表。
     """
     # 明确 ID：精确查找，不存在时 404（与"关键字无匹配"返回空列表区分）
-    if id:
-        stmt = select(Conversation).where(Conversation.id == id)
+    lookup_id = _resolve_lookup_id(id, conversation_id)
+    if lookup_id:
+        stmt = select(Conversation).where(Conversation.id == lookup_id)
         if conv_type:
             stmt = stmt.where(Conversation.conv_type == conv_type)
         row = (await db.execute(stmt)).scalar_one_or_none()
         if not row:
-            raise HTTPException(status_code=404, detail=f"会话不存在：{id}")
+            raise HTTPException(status_code=404, detail=f"会话不存在：{lookup_id}")
         return [_conv_resp(row)]
 
     keyword = (keyword or "").strip()

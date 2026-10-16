@@ -5,8 +5,10 @@
  * 职责：会话列表加载、新建、切换、重命名、删除，以及**历史搜索**
  * （2026-10-15 用户需求）——支持两种定位形态：
  *   1. 关键字模糊搜索：匹配标题与消息内容，命中消息时展示高亮片段；
- *   2. 明确 ID 精确查找：输入形如会话 ID 的整串（≥8 位字母数字），
- *      直达某条历史；不存在时给出友好空态（后端 404）。
+ *   2. 明确 ID 精确查找：输入形如会话 ID 的整串（32 位十六进制，
+ *      uuid4().hex），直达某条历史；不存在时给出友好空态（后端 404）。
+ *      粘贴带前后缀的文本（如「会话ID：xxx」）也能提取其中的 ID。
+ * 每一条历史都可一键复制会话 ID（明确 ID 搜索的前提：ID 可发现）。
  * 搜索态下 load() 仍保持搜索结果（新消息到达不把用户踢出搜索态）。
  *
  * 不关心消息内容本身（由各页面自行渲染），只做"会话级"管理，
@@ -45,9 +47,16 @@ const searching = ref(false)   // 是否处于搜索态（有查询词）
 const idNotFound = ref('')     // 明确 ID 未命中时记录，供空态提示
 let searchTimer: number | undefined
 
-/** 整串疑似会话 ID（≥8 位字母/数字/短横）时按"明确 ID"查找，否则按关键字 */
-function looksLikeId(text: string): boolean {
-  return /^[A-Za-z0-9-]{8,}$/.test(text)
+/**
+ * 提取会话 ID：32 位十六进制（uuid4().hex，本系统会话 ID 的实际格式）。
+ * 整串精确匹配 → 直接用；粘贴带前后缀的文本（如「会话ID：xxx」/带引号）
+ * → 提取其中的 ID；其余一律按关键字模糊搜索——不用"≥8 位字母数字"
+ * 这类宽规则，避免把 Training2026 这种英文关键字误判成 ID 而扑空
+ * （用户 2026-10-16 反馈 ID 搜索体验问题后的收敛）。
+ */
+function extractConversationId(text: string): string | null {
+  const m = text.match(/[0-9a-fA-F]{32}/)
+  return m ? m[0].toLowerCase() : null
 }
 
 async function load() {
@@ -66,7 +75,7 @@ async function load() {
   }
 }
 
-/** 执行一次搜索（ID 形态走精确查找，其余走关键字模糊搜索） */
+/** 执行一次搜索（提取到 32 位 ID 走精确查找，其余走关键字模糊搜索） */
 async function runSearch() {
   const text = searchText.value.trim()
   if (!text) {
@@ -76,14 +85,15 @@ async function runSearch() {
   searching.value = true
   idNotFound.value = ''
   loading.value = true
+  const convId = extractConversationId(text)
   try {
-    rows.value = looksLikeId(text)
-      ? await listConversations(props.convType, { id: text })
+    rows.value = convId
+      ? await listConversations(props.convType, { id: convId })
       : await listConversations(props.convType, { keyword: text })
   } catch {
     // 明确 ID 不存在 → 后端 404：转友好空态，不弹 toast 打断输入
     rows.value = []
-    if (looksLikeId(text)) idNotFound.value = text
+    if (convId) idNotFound.value = convId
   } finally {
     loading.value = false
   }
@@ -120,6 +130,18 @@ function escHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string
   ))
+}
+
+/** 复制会话 ID 到剪贴板（明确 ID 搜索的前提：ID 可发现、可复制） */
+async function copyId(row: Conversation, ev: MouseEvent) {
+  ev.stopPropagation() // 不触发条目选中
+  try {
+    await navigator.clipboard.writeText(row.id)
+    ElMessage.success('会话 ID 已复制，可粘贴到搜索框精确查找')
+  } catch {
+    // 剪贴板不可用（非安全上下文等）：回退展示 ID 供手动复制
+    ElMessage.info(`复制失败，请手动复制：${row.id}`)
+  }
 }
 
 /** 命中关键字高亮（大小写不敏感；正则特殊字符先转义） */
@@ -254,6 +276,7 @@ function startNew() {
             <span>{{ relTime(c.last_message_at || c.created_at) }}</span>
           </div>
           <div class="conv-ops" @click.stop>
+            <el-button link type="primary" size="small" @click="copyId(c, $event)">复制ID</el-button>
             <el-button link type="primary" size="small" @click="startRename(c)">重命名</el-button>
             <el-button link type="danger" size="small" @click="remove(c)">删除</el-button>
           </div>

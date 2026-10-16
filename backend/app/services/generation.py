@@ -6,7 +6,11 @@
 - 流式输出：先回传检索元数据（citations），再逐 token 流式返回正文，
   避免大草稿在等待期间被前端判定为"超时/假死"。
 - 会话持久化（conversation_id）：公文起草同样支持多轮修改——
-  user/assistant 消息落库，停止时保存部分答案。
+  user/assistant 消息落库，停止时保存部分答案；
+- **多轮上下文注入（用户 2026-10-16 硬性要求）**：同一会话内再次提
+  修改意见时，往轮 user 要求 + 上稿 assistant 草稿注入模型上下文
+  （见 _load_draft_history / generation_prompt._DRAFT_REVISION_RULE），
+  模型在上一稿基础上修改并输出完整文稿，而非重新起草。
 
 Agent 接入（P1，用户 2026-10-13 确认起草链路纳入）：
 - 意图识别：template_doc_type 显式指定 → draft（强意图信号）；
@@ -44,6 +48,11 @@ from app.services.retrieval import retrieve_enhanced
 from app.services.runtime_config import load_prompt_templates, load_retrieval_config
 
 logger = logging.getLogger(__name__)
+
+# 多轮上下文：取最近 N 条消息（约 N/2 轮"要求→草稿"）。
+# 与 chat 链路 _HISTORY_LIMIT 对齐；草稿较长，截断上限在
+# generation_prompt 中单独放宽（assistant 6000 / user 1000 字符）。
+_DRAFT_HISTORY_LIMIT = 10
 
 
 async def _resolve_sensitive_words(db: AsyncSession, req: GenerateRequest) -> list[str]:
@@ -102,6 +111,29 @@ async def _ensure_draft_conversation(
         space_ids=req.space_ids or [],
     )
     return row.id
+
+
+async def _load_draft_history(
+    db: AsyncSession, conversation_id: str | None, current_query: str
+) -> list[tuple[str, str]]:
+    """加载起草会话的多轮历史（排除刚写入的本轮 user 消息）。
+
+    多轮修改的关键（用户 2026-10-16 硬性要求，同会话一致 conversation_id）：
+    同一会话内再次提修改意见时，必须把往轮 user 要求 + 上稿 assistant
+    草稿注入模型上下文。此前两条生成链路都只把本轮 query + 检索材料交给
+    模型，导致"改个标题"也重新生成一份完整文稿——上一稿完全丢失。
+
+    Returns:
+        [(role, content), ...] 按时间正序；无会话 / 首轮为空列表。
+    """
+    if not conversation_id:
+        return []
+    rows = await conv_service.recent_history(db, conversation_id, limit=_DRAFT_HISTORY_LIMIT)
+    return [
+        (m.role, m.content)
+        for m in rows
+        if not (m.role == "user" and m.content == current_query)
+    ]
 
 
 async def _resolve_template(
@@ -204,9 +236,11 @@ async def generate_answer(
     req.template_doc_type = resolved_doc_type
 
     gen = ModelProvider(role="gen")
+    # 多轮上下文：指定了会话 ID 时注入往轮要求与上稿（在上一稿基础上修改）
+    history = await _load_draft_history(db, req.conversation_id, req.query)
     messages = build_generation_messages(
         req, citations, no_materials=no_materials, templates=templates,
-        template_name=template_name,
+        template_name=template_name, history=history,
     )
     raw = await gen.generate(messages)
     if no_materials:
@@ -267,6 +301,13 @@ async def stream_generate(
     conversation_id = await _ensure_draft_conversation(db, req, doc_type=resolved_doc_type)
     if conversation_id:
         await conv_service.append_message(db, conversation_id, "user", req.query)
+
+    # 多轮上下文（用户 2026-10-16 硬性要求）：同一会话内再次提修改意见时，
+    # 注入往轮 user 要求 + 上稿 assistant 草稿——否则模型只看到本轮 query
+    # 与检索材料，会重新生成一份完整文稿而不是在上一稿基础上修改。
+    # 注意顺序：必须先 append 本轮 user 消息（上面），再把"除本轮外"的
+    # 历史取出来，保证首轮为空、修改轮带上上稿。
+    history = await _load_draft_history(db, conversation_id, req.query)
 
     # Agent 意图识别：显式文种 → draft（强信号）；否则规则+LLM 分类。
     # agent_mode 关闭时跳过分类，meta 不带 intent，行为与旧版一致。
@@ -371,7 +412,7 @@ async def stream_generate(
         gen = ModelProvider(role="gen")
         messages = build_generation_messages(
             req, citations, no_materials=no_materials, templates=templates,
-            template_name=template_name,
+            template_name=template_name, history=history,
         )
 
         # 2) 先回传检索元数据，前端可立即渲染"参考材料"与意图标签

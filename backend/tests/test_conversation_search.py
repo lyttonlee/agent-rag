@@ -16,8 +16,29 @@ from app.api.routes.conversations import (
     _conv_resp,
     _escape_like,
     _make_snippet,
+    _resolve_lookup_id,
 )
 from app.db.models import Conversation
+
+
+# ---- ID 查找入参收敛（2026-10-16 加固） ----
+
+
+def test_lookup_id_prefers_id_over_alias():
+    """id 与别名 conversation_id 都传时以 id 为准。"""
+    assert _resolve_lookup_id("abc", "xyz") == "abc"
+
+
+def test_lookup_id_falls_back_to_alias():
+    """只传 conversation_id（自然命名）时按 ID 查找，不退化为全量列表。"""
+    assert _resolve_lookup_id(None, "abc") == "abc"
+
+
+def test_lookup_id_strips_and_ignores_empty():
+    """统一 strip；空串按未传处理（调用方回落关键字/全量列表）。"""
+    assert _resolve_lookup_id("  abc  ", None) == "abc"
+    assert _resolve_lookup_id("   ", "  ") == ""
+    assert _resolve_lookup_id(None, None) == ""
 
 
 # ---- ILIKE 转义 ----
