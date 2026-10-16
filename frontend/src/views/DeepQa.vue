@@ -116,8 +116,41 @@ const reactEnd = ref<{ rounds: number; stop_reason: string; stop_label?: string;
 /** 提示词管理抽屉 */
 const promptsOpen = ref(false)
 
+/**
+ * 阶段播报 + 模型思考链（2026-10-16 新增，修"SSE 在返回但页面像断了"）
+ *
+ * 问题根因：① 模型每次调用要 1-4 秒，此前这些时间没有任何 SSE 事件，页面
+ * 完全静止；② `reasoning` 事件（模型的思考内容）DeepQa 根本没接 handler，
+ * 全部丢弃——用户看到的是"什么都没发生，然后突然蹦出答案"。
+ * 现在：phaseLabel 持续显示"正在做什么 + 已等待 Ns"，modelThinking 实时
+ * 追加模型的思考文本，两者叠加消除静默期。
+ */
+const phase = ref<{ phase: string; label: string; round?: number } | null>(null)
+const phaseElapsed = ref(0)
+/** 模型思考链实时文本（reasoning 事件累积） */
+const modelThinking = ref('')
+let phaseTimer: number | null = null
+/** 阶段开始时间戳（用于"已思考 Ns"计时） */
+let phaseSince = 0
+
+function startPhaseTimer() {
+  if (phaseTimer) return
+  phaseTimer = window.setInterval(() => {
+    if (phaseSince) phaseElapsed.value = Math.round((Date.now() - phaseSince) / 100) / 10
+  }, 100)
+}
+function stopPhaseTimer() {
+  if (phaseTimer) {
+    clearInterval(phaseTimer)
+    phaseTimer = null
+  }
+  phaseElapsed.value = 0
+  phaseSince = 0
+}
 const hasMessages = computed(() => messages.value.length > 0 || loading.value)
 const showTrace = computed(() => reactInfo.value !== null || rounds.value.length > 0)
+/** 是否有任何可见的"进行中"信号（阶段播报或模型思考），决定是否显示等待条 */
+const showProgress = computed(() => loading.value && (phase.value !== null || modelThinking.value.length > 0))
 
 /** 示例问题（空态引导：覆盖多跳/对比/排查/无需检索四类，凸显自主决策优势） */
 const examples = [
@@ -175,6 +208,9 @@ function resetTurn() {
   analysis.value = null
   rounds.value = []
   reactEnd.value = null
+  phase.value = null
+  modelThinking.value = ''
+  stopPhaseTimer()
 }
 
 /** 切换知识范围：持久化到会话绑定 */
@@ -210,6 +246,8 @@ function stop() {
   controller?.abort()
   controller = null
   loading.value = false
+  stopPhaseTimer()
+  phase.value = null
   rounds.value.forEach((r) => (r.running = false))
   if (activeId.value) {
     getConversation(activeId.value)
@@ -261,6 +299,19 @@ function send(text?: string) {
         reactInfo.value = info
         scrollBottom()
       },
+      // ---- 阶段播报：每个耗时动作前后更新"正在做什么 + 已等待 Ns" ----
+      onPhase: (p) => {
+        // answer 阶段说明模型已进入正文生成，此时思考链不再增长，阶段条可收起
+        if (p.phase === 'answer') {
+          phase.value = { phase: p.phase, label: p.label }
+        } else {
+          phase.value = { phase: p.phase, label: p.label, round: p.round }
+          phaseSince = Date.now()
+          phaseElapsed.value = 0
+          startPhaseTimer()
+        }
+        scrollBottom()
+      },
       onAnalysis: (a) => {
         analysis.value = a
         scrollBottom()
@@ -273,6 +324,20 @@ function send(text?: string) {
       },
       onThought: (round, text) => {
         roundOf(round).thought = text
+        scrollBottom()
+      },
+      /**
+       * 模型思考链（reasoning 事件）：此前 DeepQa 未接 handler，全部丢弃——
+       * 用户看不到任何"模型在想什么"。现在实时追加并显示。
+       */
+      onReasoning: (t) => {
+        modelThinking.value += t
+        scrollBottom()
+      },
+      onToken: (t) => {
+        // 正文开始流出即收起阶段条（答案本身是最好的进度指示）
+        if (answer.value === '') phase.value = null
+        answer.value += t
         scrollBottom()
       },
       onAction: (round, tool, query, skipped) => {
@@ -295,14 +360,13 @@ function send(text?: string) {
         rounds.value.forEach((r) => (r.running = false))
         scrollBottom()
       },
-      onToken: (t) => {
-        answer.value += t
-        scrollBottom()
-      },
       onDone: (finalAnswer, sensitiveHits, model, conversationId, extra) => {
         answer.value = finalAnswer
         hits.value = sensitiveHits
         modelName.value = model
+        // 收尾：停掉阶段计时器（否则计时器会一直跑到组件卸载）
+        stopPhaseTimer()
+        phase.value = null
         if (conversationId) activeId.value = conversationId
         if (activeId.value) {
           getConversation(activeId.value)
@@ -320,6 +384,8 @@ function send(text?: string) {
       },
       onError: (message) => {
         ElMessage.error('问答失败：' + message)
+        stopPhaseTimer()
+        phase.value = null
         rounds.value.forEach((r) => (r.running = false))
         if (activeId.value) {
           getConversation(activeId.value)
@@ -340,6 +406,7 @@ function onDeleted(id: string) {
 
 onBeforeUnmount(() => {
   controller?.abort()
+  stopPhaseTimer()
 })
 </script>
 
@@ -454,6 +521,20 @@ onBeforeUnmount(() => {
             <div class="bubble">{{ sentQuery }}</div>
           </div>
           <div class="msg assistant">
+            <!-- 阶段进度条（消除静默期：模型每次调用 1-4 秒，此前页面完全静止） -->
+            <div v-if="phase" class="phase-bar" :class="{ streaming: answer }">
+              <span class="spinner" />
+              <span class="phase-label">{{ phase.label }}</span>
+              <span v-if="phaseElapsed > 0.3" class="phase-elapsed mono">{{ phaseElapsed }}s</span>
+            </div>
+            <!-- 模型思考链实时展示（reasoning 事件，此前被完全丢弃） -->
+            <div v-if="modelThinking && !answer" class="thinking-live panel">
+              <div class="tl-head">
+                <span class="tl-tag">模型思考</span>
+                <span class="text-muted tl-hint">实时生成中</span>
+              </div>
+              <div class="tl-text">{{ modelThinking }}</div>
+            </div>
             <!-- 思维链内联在答案上方（2026-10-16 重做：旧版放在消息列表外，
                  视觉上等于"没有思维链"）。默认展开、完整多行、不截断。 -->
             <ReActTracePanel
@@ -467,7 +548,7 @@ onBeforeUnmount(() => {
             />
             <div class="bubble panel">
               <MarkdownText :text="answer" /><span v-if="answer" class="cursor" />
-              <span v-if="!answer && !showTrace" class="thinking">正在思考…</span>
+              <span v-if="!answer && !showTrace && !showProgress" class="thinking">正在思考…</span>
             </div>
             <div v-if="citations.length" class="msg-refs">
               <span class="ref-label">引用 {{ citations.length }} 条</span>
@@ -548,6 +629,40 @@ onBeforeUnmount(() => {
   color: var(--brand); background: var(--brand-soft); border: 1px solid var(--brand-line);
 }
 .thinking { color: var(--text-muted); }
+
+/* 阶段进度条：模型每次调用 1-4 秒，期间保持可见进展 */
+.phase-bar {
+  display: flex; align-items: center; gap: 8px; align-self: stretch;
+  padding: 7px 12px; margin-bottom: 8px; border-radius: 8px;
+  background: var(--brand-soft); border: 1px solid var(--brand-line);
+  font-size: 12.5px; color: var(--brand);
+}
+.phase-bar.streaming { background: transparent; border-color: var(--line); color: var(--text-muted); }
+.spinner {
+  width: 11px; height: 11px; flex-shrink: 0; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.phase-label { min-width: 0; word-break: break-word; }
+.phase-elapsed { margin-left: auto; flex-shrink: 0; color: var(--text-faint); font-size: 11px; }
+
+/* 模型思考链实时展示 */
+.thinking-live {
+  align-self: stretch; width: 100%; margin-bottom: 8px; padding: 8px 11px;
+  border-radius: 8px; background: var(--bg-shell); border: 1px solid var(--line);
+}
+.tl-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+.tl-tag {
+  font-size: 11px; padding: 0 6px; border-radius: 4px; line-height: 17px;
+  color: var(--text-faint); border: 1px solid var(--line-strong);
+}
+.tl-hint { font-size: 11px; }
+.tl-text {
+  font-size: 12px; line-height: 1.8; color: var(--text-muted);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 132px; overflow: hidden; mask-image: linear-gradient(180deg, #000 72%, transparent);
+}
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--brand); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .msg-refs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }

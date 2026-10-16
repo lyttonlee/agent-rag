@@ -361,6 +361,11 @@ async def _run_react(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
     ctx.disclaimer = True
 
     yield _sse(_meta_event(ctx, gen.model_name, ctx.citations, no_result=False))
+    # 阶段播报：最终生成开始（模型思考+组织答案通常 3-10 秒，此前无提示）
+    yield _sse({
+        "type": "phase", "phase": "answer",
+        "label": "正在综合全部材料组织答案…",
+    })
     messages = build_react_final_messages(ctx.req.query, ctx.history, ctx.citations, result.rounds_log)
     async for evt in _stream_model(ctx, messages, gen):
         yield evt
@@ -433,6 +438,11 @@ async def stream_chat(
         if not (m.role == "user" and m.content == req.query)
     ]
 
+    # 3.5) 首个阶段播报（2026-10-16 新增）：意图分类要 1-3 秒，此前从发出
+    # 请求到第一个 SSE 事件之间**完全静默**，浏览器 fetch 一直挂着，用户看到
+    # "点了没反应"。这里第一时间回一个轻量事件，让连接立刻建立、页面立刻动。
+    yield _sse({"type": "phase", "phase": "start", "label": "正在准备…"})
+
     # 4) Agent 配置与意图识别（agent_mode 关闭时行为与旧版完全一致）
     agent_cfg = await load_agent_config(db)
     agent_on = req.agent_mode if req.agent_mode is not None else agent_cfg.enabled
@@ -442,6 +452,7 @@ async def stream_chat(
     react_cfg = await load_react_config(db)
     deep_on = req.deep_reason if req.deep_reason is not None else react_cfg.enabled
     if agent_on:
+        yield _sse({"type": "phase", "phase": "classify", "label": "正在识别问题类型…"})
         intent_result = await IntentRouter(agent_cfg).classify(db, req.query)
         if deep_on and intent_result.intent in ("direct_qa", "complex_task"):
             intent_result = IntentResult(

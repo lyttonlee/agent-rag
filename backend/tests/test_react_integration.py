@@ -156,9 +156,16 @@ async def test_stream_chat_react_default_on_and_events(monkeypatch):
     events = _parse_sse(chunks)
     types = [e["type"] for e in events]
 
-    # TAO 事件序列
-    assert types[0] == "react_start"
-    assert "analysis" in types
+    # TAO 事件序列（编排层先发 phase「正在准备」，再进 ReAct）
+    assert "phase" in types
+    assert "react_start" in types
+    assert types.index("phase") < types.index("react_start") < types.index("analysis")
+    # 阶段播报覆盖全流程（用户反馈"页面像断了"的修复点）
+    phases = [e["phase"] for e in events if e["type"] == "phase"]
+    assert "understand" in phases, "理解阶段应有播报"
+    assert "decide" in phases, "每轮决策应有播报"
+    assert "tool" in phases, "工具执行应有播报"
+    assert "answer" in phases, "最终生成应有播报"
     assert "react_round" in types and "thought" in types and "observation" in types
     assert types.index("react_round") < types.index("thought") < types.index("observation")
     assert "react_end" in types

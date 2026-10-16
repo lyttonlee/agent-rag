@@ -77,6 +77,13 @@ STOP_REASON_LABELS: dict[str, str] = {
 # query 归一化：去空白与常见标点后小写（重复检索判定用）
 _PUNCT_RE = re.compile(r"[\s,，。.、;；:：?？!！\"'‘’“”\"'()（）\[\]【】]+")
 
+# 工具名 → 阶段播报用的中文动作名（前端显示"正在检索…"）
+_TOOL_PHASE_LABEL: dict[str, str] = {
+    "knowledge_search": "检索知识库",
+    "doc_lookup": "查找候选文件",
+    "read_document": "打开原文",
+}
+
 
 @dataclass
 class ReactRunResult:
@@ -157,6 +164,11 @@ async def run_react(
     started = time.monotonic()
     gen = ModelProvider(role="gen")
 
+    # ---- 阶段播报（2026-10-16 新增，解决"页面像卡住了"）----
+    # 背景：模型每次调用（理解/决策/生成）要 2-4 秒，此前这段完全静默——
+    # 前端只有收到 react_start 才知道在动，而 react_start 之前还有意图分类的
+    # 沉默期，用户看到的就是"什么都没发生"。这里在**每个耗时动作前后**播报阶段，
+    # 让页面持续有可见进展（配前端 elapsed 计时器可显示"已思考 Ns"）。
     yield {
         "type": "react_start",
         "mode": "react",
@@ -164,6 +176,7 @@ async def run_react(
         "total_budget_ms": budget_ms,
         "tools": tool_names(),
     }
+    yield {"type": "phase", "phase": "understand", "label": "正在理解你的问题…"}
 
     # ---- 提问理解（轻量一次调用；**失败不阻断**，仅少一段参考）----
     # 注意：此处不做任何"单跳/多跳"路由，仅让模型复述诉求并自述是否需要
@@ -228,6 +241,11 @@ async def run_react(
             logger.info("ReAct 预算耗尽（%.0fms>%dms），收敛", (time.monotonic() - started) * 1000, budget_ms)
             break
         yield {"type": "react_round", "round": round_no, "max_rounds": max_rounds}
+        # 阶段播报：本轮模型正在推理决策（这段通常 1-4 秒，此前页面无任何提示）
+        yield {
+            "type": "phase", "phase": "decide", "round": round_no,
+            "label": f"第 {round_no} 轮：正在思考下一步该做什么…",
+        }
 
         # ---- 决策调用（严格单 JSON 输出；关思考链防解析干扰）----
         try:
@@ -336,6 +354,12 @@ async def run_react(
             })
             no_progress += 1
         else:
+            # 阶段播报：工具执行（检索/rerank 可能 3-8 秒）
+            yield {
+                "type": "phase", "phase": "tool", "round": round_no,
+                "tool": decision.tool,
+                "label": f"第 {round_no} 轮：正在执行 {_TOOL_PHASE_LABEL.get(decision.tool, decision.tool)}「{decision.query}」…",
+            }
             yield {"type": "action", "round": round_no, "tool": decision.tool,
                    "query": decision.query, "skipped": False}
             # 工具执行：编排层再兜一层异常（工具层已内部捕获；此处防未来

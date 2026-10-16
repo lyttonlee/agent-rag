@@ -834,6 +834,12 @@ export interface ChatHandlers {
   onAnalysis?: (info: ReactAnalysis) => void
   /** 新一轮开始（时间线追加容器） */
   onReactRound?: (round: number, maxRounds: number) => void
+  /**
+   * 阶段播报（2026-10-16 新增）：每个耗时动作前后推送，phase 取值
+   * start|classify|understand|decide|tool|answer。用于消除"点了没反应"的
+   * 静默期——模型每次调用要 1-4 秒，此前这段时间页面完全没有可见进展。
+   */
+  onPhase?: (info: { phase: string; label: string; round?: number; tool?: string }) => void
   /** 本轮思考（模型显式 Thought 文本） */
   onThought?: (round: number, text: string) => void
   /** 本轮行动（工具 + query；skipped=true 表示未真实执行） */
@@ -984,6 +990,14 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
               break
             case 'react_round':
               handlers.onReactRound?.(evt.round ?? 1, evt.max_rounds ?? 4)
+              break
+            case 'phase':
+              handlers.onPhase?.({
+                phase: evt.phase ?? '',
+                label: evt.label ?? '',
+                round: evt.round,
+                tool: evt.tool,
+              })
               break
             case 'thought':
               handlers.onThought?.(evt.round ?? 1, evt.text ?? '')

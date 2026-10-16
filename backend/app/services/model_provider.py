@@ -102,12 +102,18 @@ class ModelProvider:
         self,
         messages: list[dict],
         temperature: float = 0.3,
-        max_tokens: int = 1500,
+        max_tokens: int = 4096,
     ):
         """流式生成，异步产出 ``("content", text)`` 或 ``("reasoning", text)`` 片段。
 
         Qwen3 系列在 delta 中同时携带 ``reasoning_content``（思考链）与 ``content``
         （正式回答）；分别产出，便于前端区分"思考过程"与"正文"。
+
+        max_tokens 默认从 1500 提到 4096（2026-10-16）：Qwen3 **思考链与正文共用
+        同一个 max_tokens 预算**——思考链长时正文会被截断，表现为"答案说到一半
+        戛然而止"。实测原 1500 下一个 300 字回答的思考链就吃掉大半预算，正文只剩
+        157 字且明显断尾。深度推理链路的思考链尤其长（模型要复述材料、规划引用），
+        预算过小必然截断。
         """
         stream = await self.client.chat.completions.create(
             model=self.model_name,

@@ -191,7 +191,9 @@ async def test_react_two_round_finish(monkeypatch):
 
     # 事件序列：react_start → analysis → 轮1(round/thought/action/observation) → 轮2(round/thought) → react_end
     types = _types(events)
-    assert types[0] == "react_start" and types[1] == "analysis"
+    # 阶段播报插在 react_start 之后、analysis 之前（2026-10-16 新增：
+    # 模型每次调用 1-4 秒，此前这段完全静默，页面像卡住了）
+    assert types[0] == "react_start" and types[1] == "phase" and types[2] == "analysis"
     assert types[-1] == "react_end"
     assert types.count("react_round") == 2
     assert types.count("thought") == 2
