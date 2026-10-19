@@ -1,0 +1,26 @@
+# 后端镜像构建上下文排除清单（context = backend/）
+# 原则：镜像只含运行所需代码；数据/缓存/本地虚拟环境/测试一律排除
+
+# Python 本地环境
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# 运行数据与日志（local 模式原文存储根 + 各次联调日志，绝不进镜像）
+data/
+*.log
+
+# 本地凭据（镜像内一律用环境变量注入）
+.env
+.env.*
+!.env.example
+
+# 测试与临时产物（测试不在镜像内运行；部署方离线环境也无 pytest 依赖）
+tests/
+.ipynb_checkpoints/
+*.tmp

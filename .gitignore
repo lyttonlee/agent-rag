@@ -44,6 +44,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!docker/.env.app.example
 
 # ---------------- Node / 前端 ----------------
 node_modules/

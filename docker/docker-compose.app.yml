@@ -1,0 +1,84 @@
+# =============================================================================
+# 企业公文知识库 · 项目镜像编排（仅 backend + frontend 两个项目镜像）
+#
+# 定位：与 docker-compose.yml（基础组件：PG/Redis/SeaweedFS）互补——
+#       本文件面向**部署方已有 PostgreSQL / 模型服务**的生产/内网场景，
+#       只跑本项目构建的两个镜像，不包含任何基础组件。
+#
+# 使用：
+#   cd docker
+#   cp .env.app.example .env        # 按部署环境填写
+#   docker compose -f docker-compose.app.yml up -d
+#
+# 注意：模型服务（vLLM 等）与 PostgreSQL 需由部署方预先就绪；
+#       二者地址通过下方环境变量注入，默认值指向宿主机（开发机联调用）。
+# =============================================================================
+services:
+  # ---- 后端（RAG 引擎服务）----
+  backend:
+    image: ${BACKEND_IMAGE:-gov-doc-rag-backend:1.2.0}
+    container_name: rag-backend
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # ---- PostgreSQL（部署方既有实例）----
+      PG_HOST: ${PG_HOST:-host.docker.internal}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-rag}
+      PG_PASSWORD: ${PG_PASSWORD:?请在 .env 设置 PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE:-gov_doc_rag}
+      # ---- 对象存储（默认 local：原文写容器内卷，需挂卷持久化）----
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      STORAGE_ROOT: /app/data/gov-doc
+      # s3 模式时取消以下几项注释并指向部署方对象存储
+      # STORAGE_PROVIDER: s3
+      # STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-127.0.0.1:8333}
+      # STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-gov-doc}
+      # STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-admin}
+      # STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-admin123}
+      # ---- 模型端点（部署方 vLLM / 自有算力中心，OpenAI 兼容）----
+      MODEL_GEN_BASE_URL: ${MODEL_GEN_BASE_URL:-http://host.docker.internal:8000/v1}
+      MODEL_GEN_API_KEY: ${MODEL_GEN_API_KEY:-EMPTY}
+      MODEL_GEN_NAME: ${MODEL_GEN_NAME:-qwen3-32b-instruct}
+      MODEL_EMB_BASE_URL: ${MODEL_EMB_BASE_URL:-http://host.docker.internal:8001/v1}
+      MODEL_EMB_API_KEY: ${MODEL_EMB_API_KEY:-EMPTY}
+      MODEL_EMB_NAME: ${MODEL_EMB_NAME:-qwen3-embedding-4b}
+      MODEL_RERANK_BASE_URL: ${MODEL_RERANK_BASE_URL:-http://host.docker.internal:8002/v1}
+      MODEL_RERANK_API_KEY: ${MODEL_RERANK_API_KEY:-EMPTY}
+      MODEL_RERANK_NAME: ${MODEL_RERANK_NAME:-qwen3-reranker-0.6b}
+      # ---- Redis（可选，检索缓存）----
+      REDIS_URL: ${REDIS_URL:-redis://host.docker.internal:6379/0}
+      # ---- 安全（必须修改为部署方自己的密钥！）----
+      JWT_SECRET: ${JWT_SECRET:?请在 .env 设置 JWT_SECRET（勿用默认值）}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - storage-data:/app/data          # local 模式原文存储（持久化）
+    # PG/模型在宿主机时，Linux 需把 host.docker.internal 映射到宿主机（Docker 20.10+ 默认支持）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # ---- 前端（运维台 + 配置中心）----
+  frontend:
+    image: ${FRONTEND_IMAGE:-gov-doc-rag-frontend:1.2.0}
+    container_name: rag-frontend
+    restart: unless-stopped
+    environment:
+      # 同一 compose 网络内直接用服务名访问后端
+      BACKEND_UPSTREAM: http://backend:8000
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  storage-data:      # local 模式原文存储卷（s3 模式可删除）

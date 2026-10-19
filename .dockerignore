@@ -1,0 +1,28 @@
+# =============================================================================
+# 仓库根 .dockerignore
+# 作用范围：**仅前端镜像构建**（上下文 = 仓库根，因为运行期配置 docker/ 在
+# frontend/ 之外，必须随源码一起进上下文）。
+# 后端镜像构建上下文是 backend/，使用 backend/.dockerignore，不受本文件影响。
+#
+# 白名单策略：默认排除一切，仅放行前端构建与 nginx 运行期配置所需文件，
+# 避免把语料（sichuan_gov_docs 等 GB 级目录）打进构建上下文。
+# =============================================================================
+*
+
+!frontend
+!frontend/**
+
+# frontend 内部仍需排除的本地产物
+frontend/node_modules
+frontend/dist
+frontend/.env
+frontend/.env.*
+
+# 运行期配置（nginx 模板 + 入口脚本）
+!docker/nginx.conf
+!docker/entrypoint.sh
+
+# 构建说明（随镜像注释一起，无需进上下文；此处显式排除防止误放行）
+docker/README.md
+docker/*.Dockerfile
+docker/docker-compose*.yml

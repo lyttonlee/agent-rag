@@ -131,3 +131,31 @@ docker exec -i rag-redis redis-cli ping                      # 应返回 PONG
 | `STORAGE_S3_*` | 127.0.0.1:8333 / gov-doc / admin | s3 模式：SeaweedFS / Ceph / 国产对象存储 |
 | `REDIS_URL` | redis://127.0.0.1:6379/0 | redis |
 | `MODEL_*_BASE_URL` | http://127.0.0.1:8000/v1 | vllm（local/std） |
+
+---
+
+## 七、项目镜像（backend + frontend）
+
+除本文的基础组件外，**本项目自身的两个镜像**构建文件位于 `docker/`（详见 `docker/README.md`）：
+
+| 镜像 | 构建文件 | 内容 | 大小量级 |
+|---|---|---|---|
+| `gov-doc-rag-backend:1.2.0` | `docker/backend.Dockerfile` | Python 3.12 + uv 锁版本依赖 + app/ofdkit/alembic，启动 `uvicorn app.main:app` | ~1.5GB（含 PyTorch 无关依赖，无 GPU 库） |
+| `gov-doc-rag-frontend:1.2.0` | `docker/frontend.Dockerfile` | node:22 构建 → nginx:1.27-alpine 托管，`/v1` 反代后端 | ~50MB |
+
+```bash
+# 构建（联网构建机，仓库根目录）
+bash docker/build.sh            # Windows: .\docker\build.ps1
+
+# 运行（部署方既有 PG/模型端点，compose 编排示例）
+cd docker && cp .env.app.example .env && vi .env
+docker compose -f docker-compose.app.yml up -d
+
+# 离线分发：与本文第四节同样 docker save / docker load 一并导出
+docker save -o rag-images.tar gov-doc-rag-backend:1.2.0 gov-doc-rag-frontend:1.2.0 rag-pg:16-zh
+```
+
+要点：
+- **项目镜像不含基础组件**——PG/Redis/对象存储/模型服务全部外置，由部署方既有环境提供（第三节环境变量注入）；
+- 后端启动时自动 `alembic upgrade head`，无需手动迁移；
+- SSE 流式反代要求中间层关闭缓冲（`proxy_buffering off`），镜像内 nginx 已配置，部署方自建网关需同样处理。
