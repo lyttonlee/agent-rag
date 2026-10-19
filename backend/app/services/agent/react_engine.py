@@ -6,6 +6,13 @@
 - 不做最终答案生成（那是策略层的事，复用 generate_stream 流式链路）；
 - 不感知 HTTP/会话/落库——纯编排，可完整单测。
 
+通道（2026-10-19 新增）：同一套引擎同时服务两个任务形态——
+- ``qa``（问答，默认）：智能体回答用户问题，finish 后由策略层生成答案；
+- ``draft``（公文起草，用户 2026-10-19 要求"智能起草也按深度推理的方式、
+  由模型自主决策"）：智能体收集起草依据，finish 后由策略层依据全部材料
+  与文种模板成稿。两通道差异全部收敛在 ``TaskPromptPack``（提示词/停止
+  标签/阶段用词），引擎本体零分支。
+
 核心设计红线（2026-10-16 用户明确要求）：
 - **工具调用权完全归模型**：本模块不包含"要不要检索""要不要看文档"的任何
   路由或前置判断。第一轮就是决策轮，模型可以直接 finish（基于通用知识
@@ -45,6 +52,9 @@ from app.schemas.contracts import Citation
 from app.services.agent.react_config import ReactConfig
 from app.services.agent.react_prompt import (
     TOOL_FINISH,
+    DRAFT_PACK,
+    QA_PACK,
+    TaskPromptPack,
     AnalysisResult,
     build_decision_system,
     build_trace_text,
@@ -121,11 +131,15 @@ def _merge_citations(existing: list[Citation], new_hits: list[Citation], cap: in
     return added
 
 
-def build_history_hint(history: list[tuple[str, str]] | None, limit: int = 6) -> str:
+def build_history_hint(
+    history: list[tuple[str, str]] | None, limit: int = 6, chars: int = 500
+) -> str:
     """把会话历史转成决策上下文的提示文本（多轮指代消解）。
 
     只取最近 limit 条（策略层已按 _HISTORY_LIMIT 取过），assistant 回答
-    截断到 500 字——决策阶段只需知道"前面聊过什么"，不需要完整答案。
+    截断到 chars 字——决策阶段只需知道"前面聊过什么"，不需要完整答案
+    （起草通道放宽到 1200 字：模型需知道上一稿的文种与篇幅才能判断
+    该改哪里、要不要补查依据）。
     """
     if not history:
         return ""
@@ -134,8 +148,8 @@ def build_history_hint(history: list[tuple[str, str]] | None, limit: int = 6) ->
     for role, content in rows:
         who = "用户" if role == "user" else "我"
         text = (content or "").strip().replace("\n", " ")
-        if len(text) > 500:
-            text = text[:500] + "…"
+        if len(text) > chars:
+            text = text[:chars] + "…"
         if text:
             lines.append(f"{who}：{text}")
     if not lines:
@@ -150,24 +164,34 @@ async def run_react(
     result: ReactRunResult,
     caller=None,
     history: list[tuple[str, str]] | None = None,
+    *,
+    pack: TaskPromptPack | None = None,
+    task_context: str = "",
 ) -> AsyncGenerator[dict, None]:
     """ReAct 主循环：yield SSE 事件字典，结论写入 result。
 
     Args:
         db: 数据库会话（工具执行用）。
-        req: 问答请求（读取 space_ids/doc_types/caller_scope/max_clearance）。
+        req: 问答/起草请求（读取 space_ids/doc_types/caller_scope/max_clearance）。
         cfg: **已按档位派生**的生效配置（调用方先做 ``cfg.for_mode(mode)``），
             其中 ``max_rounds=0`` 表示不限轮数、``budget_ms=0`` 表示不限时长。
         result: 结论收集器（调用方持有引用）。
         caller: 调用方（doc_lookup/read_document 空间可见性用；可为 None）。
         history: 会话历史 [(role, content)]，注入决策上下文支持多轮追问。
+        pack: 任务形态提示词包（默认问答 QA_PACK；起草传 DRAFT_PACK）——
+            决定理解/决策提示词、停止原因中文标签与阶段播报用词。
+        task_context: 附加任务上下文（起草通道注入文种/模板/任务说明），
+            拼在首条 user 消息里，让模型一开始就知道自己在做什么。
     """
+    pack = pack or QA_PACK
     started = time.monotonic()
     gen = ModelProvider(role="gen")
     # 轮数策略：0 = 不限（默认）。这里只做展示/文本注入，不做硬性判断，
     # 真正的硬闸在循环里用 `max_rounds > 0` 判断——0 是"不限"而非"零轮"。
     max_rounds = cfg.max_rounds
     budget_ms = cfg.budget_ms
+    stop_labels = pack.stop_labels or STOP_REASON_LABELS
+    tool_phase_label = pack.tool_phase_labels or _TOOL_PHASE_LABEL
 
     # ---- 阶段播报（2026-10-16 新增，解决"页面像卡住了"）----
     # 背景：模型每次调用（理解/决策/生成）要 2-4 秒，此前这段完全静默——
@@ -177,6 +201,8 @@ async def run_react(
     yield {
         "type": "react_start",
         "mode": "react",
+        # 通道标识：前端据此区分"问答推理面板"与"起草推理面板"（文案/标题差异）
+        "channel": pack.channel,
         "max_rounds": max_rounds,
         # 显式标记"不限轮数"，避免前端把 0 显示成"0 轮"
         "unlimited_rounds": max_rounds <= 0,
@@ -188,13 +214,17 @@ async def run_react(
     # ---- 提问理解（轻量一次调用；**失败不阻断**，仅少一段参考）----
     # 注意：此处不做任何"单跳/多跳"路由，仅让模型复述诉求并自述是否需要
     # 查库，结果注入决策历史供参考——动作决定权仍在每轮决策里。
-    # 提示词可被配置中心整段覆盖（cfg.prompt_understand，空=内置默认）。
+    # 提示词按通道取覆盖值（起草用 deep_prompt_draft_understand，
+    # 空=对应通道的内置默认），互不串台。
+    is_draft = pack.channel == "draft"
+    understand_override = cfg.prompt_draft_understand if is_draft else cfg.prompt_understand
+    decision_override = cfg.prompt_draft_decision if is_draft else cfg.prompt_decision
     analysis = AnalysisResult()
     try:
         raw = await asyncio.wait_for(
             gen.generate(
                 [
-                    {"role": "system", "content": (cfg.prompt_understand or "").strip() or _UNDERSTAND_SYSTEM},
+                    {"role": "system", "content": (understand_override or "").strip() or pack.understand_system},
                     {"role": "user", "content": req.query[:500]},
                 ],
                 temperature=0,
@@ -226,7 +256,12 @@ async def run_react(
     # 红线：首条 user 消息必须含原始问题——决策模型不知道"用户在问什么"
     # 就会回「用户尚未提出具体问题」直接 finish（真实端到端踩坑）。
     # 多轮：会话历史一并注入，"它/那份文件/上一步"等指代才能正确解析。
-    first_hint = build_history_hint(history) + f"【用户问题】\n{req.query}\n\n"
+    first_hint = build_history_hint(history, chars=pack.history_hint_chars)
+    first_hint += f"【用户问题】\n{req.query}\n\n"
+    # 任务上下文（起草通道注入文种/模板/任务说明）：让模型第 1 轮就清楚
+    # 自己在为谁做什么，finish 之后会发生什么。
+    if task_context.strip():
+        first_hint += task_context.strip() + "\n\n"
     first_hint += analysis.as_hint_text() + "\n\n"
     first_hint += "请开始：输出一个 JSON 决策（thought + action）。" \
                   "你可以选择 knowledge_search / doc_lookup / read_document，" \
@@ -234,7 +269,9 @@ async def run_react(
     history_msgs: list[dict] = [
         {
             "role": "system",
-            "content": build_decision_system(max_rounds, tool_lines(), cfg.prompt_decision),
+            "content": build_decision_system(
+                max_rounds, tool_lines(), decision_override, template=pack.decision_template
+            ),
         },
         {"role": "user", "content": first_hint},
     ]
@@ -387,7 +424,7 @@ async def run_react(
             yield {
                 "type": "phase", "phase": "tool", "round": round_no,
                 "tool": decision.tool,
-                "label": f"第 {round_no} 轮：正在执行 {_TOOL_PHASE_LABEL.get(decision.tool, decision.tool)}「{decision.query}」…",
+                "label": f"第 {round_no} 轮：正在执行 {tool_phase_label.get(decision.tool, decision.tool)}「{decision.query}」…",
             }
             yield {"type": "action", "round": round_no, "tool": decision.tool,
                    "query": decision.query, "skipped": False}
@@ -466,7 +503,7 @@ async def run_react(
             })
 
 
-    stop_label = STOP_REASON_LABELS.get(result.stop_reason, result.stop_reason)
+    stop_label = stop_labels.get(result.stop_reason, result.stop_reason)
     yield {
         "type": "react_end",
         "rounds": result.rounds,
@@ -484,10 +521,6 @@ async def run_react(
         citations_total=len(result.citations),
     )
     logger.info(
-        "ReAct 循环结束：rounds=%d stop=%s citations=%d",
-        result.rounds, result.stop_reason, len(result.citations),
+        "ReAct 循环结束：channel=%s rounds=%d stop=%s citations=%d",
+        pack.channel, result.rounds, result.stop_reason, len(result.citations),
     )
-
-
-# 提问理解 system prompt（在 react_prompt 中定义，此处引用避免循环导入的延迟绑定问题）
-from app.services.agent.react_prompt import UNDERSTAND_SYSTEM as _UNDERSTAND_SYSTEM  # noqa: E402

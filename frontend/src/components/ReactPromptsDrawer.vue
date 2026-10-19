@@ -7,11 +7,18 @@
  * （GET /v1/chat/react/prompts：工具清单与收尾规则已注入，自定义覆盖时
  * 返回覆盖文本）。所见即所跑，不需要翻代码。
  *
+ * 双通道（2026-10-19 新增）：``channel`` 决定拉哪一套——
+ * - ``chat``（默认）：问答通道（提问理解 / 推理决策 / 最终答案生成）；
+ * - ``draft``：公文起草通道（起草需求理解 / 起草推理决策；最终成稿提示词
+ *   在配置中心「提示词模板」维护，此处只读预览并标注来源）。
+ * 起草页与深度问答页各挂各的通道，互不覆盖。
+ *
  * 能力（2026-10-19 新增编辑）：
  * - **查看**：按阶段折叠，一键复制；展示运行时变量占位符；
  * - **编辑保存**（admin）：改完点保存即写配置中心，**立即生效**（无需重启）；
  * - **恢复默认**：提交空字符串清除覆盖，回到代码内置版本；
- * - **来源标记**：custom=已自定义 / default=内置默认 / builtin=只读。
+ * - **来源标记**：custom=已自定义 / default=内置默认 / builtin=只读逻辑 /
+ *   external=在配置中心其他页维护（只读预览）。
  *
  * 轮数语义：后端默认 ``max_rounds=0`` = **不限轮数**，面板显示"不限"，
  * 不再出现"0 轮"这种误导性文案。
@@ -29,7 +36,13 @@ import {
 
 const visible = defineModel<boolean>({ default: false })
 
-const props = defineProps<{ reactMode?: ReactMode }>()
+const props = defineProps<{
+  reactMode?: ReactMode
+  /** 通道：chat=问答（默认）/ draft=公文起草 */
+  channel?: 'chat' | 'draft'
+}>()
+
+const channel = computed<'chat' | 'draft'>(() => props.channel ?? 'chat')
 
 const loading = ref(false)
 const saving = ref(false)
@@ -46,7 +59,7 @@ async function load() {
   loading.value = true
   err.value = ''
   try {
-    data.value = await getReactPrompts(props.reactMode ?? null)
+    data.value = await getReactPrompts(props.reactMode ?? null, channel.value)
   } catch (e: any) {
     err.value = e?.message || '加载提示词失败'
   } finally {
@@ -54,10 +67,14 @@ async function load() {
   }
 }
 
-// 打开抽屉或切换档位时重新拉取（档位不同 → 决策 prompt 的检索广度说明不同）
-watch([visible, () => props.reactMode], ([v]) => {
+// 打开抽屉 / 切换档位 / 切换通道时重新拉取
+watch([visible, () => props.reactMode, channel], ([v]) => {
   if (v) {
     editingKey.value = null
+    // 起草通道默认展开的是起草版前两段
+    opened.value = new Set(channel.value === 'draft'
+      ? ['deep_prompt_draft_understand', 'deep_prompt_draft_decision']
+      : ['deep_prompt_understand', 'deep_prompt_decision'])
     load()
   }
 }, { immediate: true })
@@ -146,20 +163,22 @@ async function resetToDefault(p: ReactPromptItem) {
   }
 }
 
-/** 来源标签：自定义 / 默认 / 只读 */
-function sourceTag(p: ReactPromptItem): { text: string; type: 'warning' | 'info' } {
+/** 来源标签：自定义 / 默认 / 只读逻辑 / 外部配置页维护 */
+function sourceTag(p: ReactPromptItem): { text: string; type: 'warning' | 'info' | 'success' } {
+  if (p.source === 'external') return { text: '只读·配置中心维护', type: 'success' }
   if (!p.editable) return { text: '只读', type: 'info' }
   return p.source === 'custom' ? { text: '已自定义', type: 'warning' } : { text: '默认', type: 'info' }
 }
 </script>
 
 <template>
-  <el-drawer v-model="visible" title="深度推理提示词管理" size="760px">
+  <el-drawer v-model="visible" :title="channel === 'draft' ? '深度推理起草 · 提示词管理' : '深度推理问答 · 提示词管理'" size="760px">
     <div v-loading="loading" class="pp">
       <el-alert v-if="err" type="error" :closable="false" :title="err" show-icon />
 
       <template v-else-if="data">
         <div class="pp-meta">
+          <el-tag size="small" type="info">{{ channel === 'draft' ? '公文起草通道' : '智能问答通道' }}</el-tag>
           <el-tag size="small" type="info">档位 {{ data.mode === 'deep' ? '深度' : '快速' }}</el-tag>
           <el-tag size="small" type="success">{{ roundsLabel }}</el-tag>
           <el-tag size="small" type="info">{{ budgetLabel }}</el-tag>
@@ -169,7 +188,10 @@ function sourceTag(p: ReactPromptItem): { text: string; type: 'warning' | 'info'
         </div>
         <p class="pp-tip text-muted">
           以下为<strong>运行时实际生效</strong>的提示词（工具清单等变量已注入）。修改后点保存即写入配置中心，
-          下一次问答立即生效；无需重启服务。
+          下一次{{ channel === 'draft' ? '起草' : '问答' }}立即生效；无需重启服务。
+          <template v-if="channel === 'draft'">
+            标注<strong>「只读·配置中心维护」</strong>的成稿提示词，请到「配置中心 → 提示词模板」编辑。
+          </template>
         </p>
 
         <!-- 可用工具契约 -->

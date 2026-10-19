@@ -26,6 +26,7 @@ from app.services.agent.react_tools import TOOL_DESCRIPTIONS, tool_lines
 from app.services.audit import actor_from_request
 from app.services.auth import Caller, get_caller, require_admin
 from app.services.chat import stream_chat
+from app.services.runtime_config import load_prompt_templates
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -102,6 +103,7 @@ class ReactPromptPatchBody(BaseModel):
 )
 async def react_prompts(
     react_mode: str | None = Query(None, description="档位 fast/deep；缺省用配置中心默认档"),
+    channel: str | None = Query(None, description="通道：chat（问答，默认）/ draft（公文起草）"),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """返回深度推理各阶段提示词全文 + 可用工具清单 + 生效运行参数。
@@ -111,33 +113,63 @@ async def react_prompts(
     收尾规则已注入；若配置中心有自定义覆盖则返回覆盖版并标注
     ``source="custom"``），因此面板内容与真实请求完全一致。
 
+    双通道（2026-10-19 新增，``channel`` 参数）：
+    - ``chat``（默认）：问答通道——提问理解 / 推理决策 / 最终答案生成；
+    - ``draft``：公文起草通道——起草需求理解 / 起草推理决策（均可配置），
+      最终成稿提示词复用配置中心「提示词模板」（``draft_system`` /
+      ``no_materials_system``），此处**只读预览**并标注 ``source="external"``
+      （编辑入口在配置中心，避免两处可改互相覆盖）。
+
     轮数语义（2026-10-19）：``max_rounds=0`` 表示**不限轮数**，
     同时返回 ``unlimited_rounds=true`` 便于前端直接展示"不限"。
     """
     cfg = await load_react_config(db)
     mode = cfg.resolved_mode(react_mode)
     eff = cfg.for_mode(mode)  # 档位派生：检索广度（轮数/时长不受档位影响）
-    return {
+    ch = (channel or "chat").strip().lower()
+    if ch not in ("chat", "draft"):
+        ch = "chat"
+    payload = {
         "mode": mode,
+        "channel": ch,
         "max_rounds": eff.max_rounds,          # 0 = 不限
         "unlimited_rounds": eff.max_rounds <= 0,
         "total_budget_ms": eff.budget_ms,      # 0 = 不限
         "no_progress_limit": eff.no_progress_limit,
         "retrieve_top_n": eff.retrieve_top_n,
         "obs_hits": eff.obs_hits,
+        "draft_enabled": eff.draft_enabled,
         "tools": [
             {"name": name, "description": desc} for name, desc in TOOL_DESCRIPTIONS.items()
         ],
-        "prompts": export_prompts(
+    }
+    if ch == "draft":
+        # 起草通道：成稿提示词来自配置中心「提示词模板」，拉来只读预览
+        tpl = await load_prompt_templates(db)
+        payload["prompts"] = export_prompts(
             tool_lines(),
             eff.max_rounds,
             {
-                "deep_prompt_understand": eff.prompt_understand,
-                "deep_prompt_decision": eff.prompt_decision,
-                "deep_prompt_final": eff.prompt_final,
+                "deep_prompt_draft_understand": eff.prompt_draft_understand,
+                "deep_prompt_draft_decision": eff.prompt_draft_decision,
             },
-        ),
-    }
+            channel="draft",
+            draft_templates={
+                "draft_system": tpl.get("draft_system", ""),
+                "no_materials_system": tpl.get("no_materials_system", ""),
+            },
+        )
+        return payload
+    payload["prompts"] = export_prompts(
+        tool_lines(),
+        eff.max_rounds,
+        {
+            "deep_prompt_understand": eff.prompt_understand,
+            "deep_prompt_decision": eff.prompt_decision,
+            "deep_prompt_final": eff.prompt_final,
+        },
+    )
+    return payload
 
 
 @router.put(
@@ -150,9 +182,14 @@ async def update_react_prompts(body: ReactPromptPatchBody, db: AsyncSession = De
 
     语义：
     - ``content`` 非空 → upsert 到配置中心 ``category=agent``，**保存即生效**
-      （下次问答读取，无需重启）；
+      （下次问答/起草读取，无需重启）；
     - ``content`` 为空 → 删除覆盖，**恢复代码内置默认**；
     - 单段最长 20000 字符；未知 key 直接 400（防任意键污染配置库）。
+
+    可用键（双通道，2026-10-19）：
+    - 问答：``deep_prompt_understand`` / ``deep_prompt_decision`` / ``deep_prompt_final``；
+    - 起草：``deep_prompt_draft_understand`` / ``deep_prompt_draft_decision``。
+    （起草的**成稿**提示词在配置中心「提示词模板」维护，不在此处。）
 
     失败语义：**任一段非法则整批不落库**（先全量校验，再逐条写入），
     避免运维看到"部分保存成功"的中间态。

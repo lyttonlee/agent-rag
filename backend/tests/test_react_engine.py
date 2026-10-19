@@ -24,11 +24,12 @@ import json
 
 import pytest
 
-from app.schemas.contracts import Citation, ChatRequest
+from app.schemas.contracts import Citation, ChatRequest, GenerateRequest
 from app.services.agent import react_engine as engine
 from app.services.agent.react_config import ReactConfig
 from app.services.agent.react_engine import ReactRunResult, _merge_citations, _normalize_query
 from app.services.agent.react_prompt import (
+    DRAFT_PACK,
     AnalysisResult,
     build_trace_text,
     parse_analysis,
@@ -704,3 +705,144 @@ def test_final_prompt_override_and_material_rule():
     )
     sys_yes = has_material[0]["content"]
     assert "必须标注引用" in sys_yes and "不得拒答" not in sys_yes
+
+
+# =========================================================================
+# 起草通道（DRAFT_PACK，2026-10-19 智能起草 ReAct 化）
+# 同一套引擎服务两个任务形态，差异全部收敛在提示词包，引擎零分支。
+# =========================================================================
+
+@pytest.mark.asyncio
+async def test_react_draft_pack_prompts(monkeypatch):
+    """起草通道：理解/决策必须用起草版提示词，任务上下文注入首条 user。"""
+    provider = _install(monkeypatch, [
+        json.dumps({"restate": "起草安全大检查通知", "needs_knowledge": True}),
+        _decision("finish", thought="依据足够"),
+    ])
+    result = ReactRunResult()
+    events = [e async for e in engine.run_react(
+        None,
+        GenerateRequest(query="起草一份安全生产大检查的通知", template_doc_type="通知"),
+        _cfg(), result, pack=DRAFT_PACK,
+        task_context="【任务类型】公文起草（不是问答）。",
+    )]
+    # 理解调用用的是起草版提示词（不是问答版"提问理解器"）
+    assert "起草需求理解器" in provider.calls[0][0]["content"]
+    # 决策调用用的是起草版决策模板（智能体身份是"公文起草"）
+    assert "「公文起草」智能体" in provider.calls[1][0]["content"]
+    # 任务上下文（文种/任务类型）注入首条 user 消息
+    assert "【任务类型】公文起草" in provider.calls[1][1]["content"]
+    # react_start 带 channel=draft（前端区分问答/起草推理面板）
+    start = next(e for e in events if e["type"] == "react_start")
+    assert start["channel"] == "draft"
+    # 停止原因中文标签用起草版（finish = 开始起草，不是"答完问题"）
+    end = next(e for e in events if e["type"] == "react_end")
+    assert end["stop_label"] == "依据已足够（模型主动结束，开始起草）"
+    # 阶段播报用词也是起草版（"检索起草依据"而非"检索知识库"）——由后端
+    # phase 事件 label 携带，这里验证工具标签表已切换
+    assert DRAFT_PACK.tool_phase_labels["knowledge_search"] == "检索起草依据"
+
+
+@pytest.mark.asyncio
+async def test_react_qa_pack_labels_unchanged(monkeypatch):
+    """问答通道：默认 pack 行为不变（回归保护，防止起草改造污染问答）。"""
+    provider = _install(monkeypatch, [
+        json.dumps({"restate": "查检查范围", "needs_knowledge": True}),
+        _decision("finish", thought="够了"),
+    ])
+    result = ReactRunResult()
+    events = [e async for e in engine.run_react(
+        None, ChatRequest(query="检查范围是什么"), _cfg(), result,
+    )]
+    assert "提问理解器" in provider.calls[0][0]["content"]
+    assert "「深度推理问答」智能体" in provider.calls[1][0]["content"]
+    assert next(e for e in events if e["type"] == "react_start")["channel"] == "qa"
+    end = next(e for e in events if e["type"] == "react_end")
+    assert end["stop_label"] == "信息充分（模型主动结束）"
+    # 任务上下文缺省时不注入多余文本
+    assert "【任务类型】" not in provider.calls[1][1]["content"]
+
+
+def test_export_prompts_draft_channel():
+    """提示词导出：起草通道的键名、来源与只读标记正确。"""
+    from app.services.agent.react_prompt import export_prompts
+
+    items = export_prompts("- knowledge_search：检索", 0, channel="draft")
+    keys = [i["key"] for i in items]
+    assert keys == [
+        "deep_prompt_draft_understand", "deep_prompt_draft_decision",
+        "draft_system", "no_materials_system", "deep_prompt_observation",
+    ]
+    by = {i["key"]: i for i in items}
+    assert by["deep_prompt_draft_understand"]["editable"] is True
+    assert "起草需求理解器" in by["deep_prompt_draft_understand"]["content"]
+    assert "「公文起草」智能体" in by["deep_prompt_draft_decision"]["content"]
+    assert "不设轮数上限" in by["deep_prompt_draft_decision"]["content"]
+    # 成稿提示词只读（编辑入口在配置中心「提示词模板」，避免两处可改）
+    assert by["draft_system"]["editable"] is False
+    assert by["draft_system"]["source"] == "external"
+    assert by["deep_prompt_observation"]["editable"] is False
+    # 自定义覆盖生效并标注 source=custom；{tool_lines} 必须被注入
+    items2 = export_prompts(
+        "- t", 0,
+        {"deep_prompt_draft_decision": "自定义起草决策：{tool_lines}"},
+        channel="draft",
+    )
+    dec = next(i for i in items2 if i["key"] == "deep_prompt_draft_decision")
+    assert dec["source"] == "custom" and "- t" in dec["content"]
+
+
+def test_react_config_draft_defaults():
+    """配置：起草默认开启；起草提示词键与问答键互相独立。"""
+    cfg = ReactConfig()
+    assert cfg.draft_enabled is True
+    assert cfg.prompt_draft_understand == "" and cfg.prompt_draft_decision == ""
+    from app.services.agent.react_config import (
+        PROMPT_KEYS,
+        PROMPT_KEYS_DRAFT,
+        PROMPT_KEYS_QA,
+    )
+
+    assert set(PROMPT_KEYS_DRAFT).isdisjoint(set(PROMPT_KEYS_QA))
+    assert set(PROMPT_KEYS) == set(PROMPT_KEYS_QA) | set(PROMPT_KEYS_DRAFT)
+    assert "deep_prompt_draft_understand" in PROMPT_KEYS
+
+
+@pytest.mark.asyncio
+async def test_react_prompts_endpoint_channels(monkeypatch):
+    """提示词接口分通道：channel 缺省=问答，draft=起草；键集合不串台。"""
+    from types import SimpleNamespace
+
+    from app.api.routes import chat as chat_routes
+
+    async def fake_react_cfg(db):
+        return ReactConfig()
+
+    async def fake_tpl(db):
+        return {"draft_system": "（配置中心）起草提示词"}
+
+    monkeypatch.setattr(chat_routes, "load_react_config", fake_react_cfg)
+    monkeypatch.setattr(chat_routes, "load_prompt_templates", fake_tpl)
+
+    # 缺省 channel → 问答
+    qa = await chat_routes.react_prompts(react_mode=None, channel=None, db=None)
+    assert qa["channel"] == "chat"
+    qa_keys = [i["key"] for i in qa["prompts"]]
+    assert "deep_prompt_understand" in qa_keys and "deep_prompt_final" in qa_keys
+    assert not any(k.startswith("deep_prompt_draft_") for k in qa_keys)
+
+    # channel=draft → 起草
+    draft = await chat_routes.react_prompts(react_mode=None, channel="draft", db=None)
+    assert draft["channel"] == "draft"
+    assert draft["draft_enabled"] is True
+    d_keys = [i["key"] for i in draft["prompts"]]
+    assert "deep_prompt_draft_understand" in d_keys and "deep_prompt_draft_decision" in d_keys
+    assert not any(k in d_keys for k in ("deep_prompt_understand", "deep_prompt_final"))
+    # 成稿提示词取配置中心模板值（只读预览）
+    final = next(i for i in draft["prompts"] if i["key"] == "draft_system")
+    assert "（配置中心）起草提示词" in final["content"]
+    assert final["editable"] is False
+
+    # 非法 channel 回落 chat（不 500）
+    bad = await chat_routes.react_prompts(react_mode=None, channel="hacker", db=None)
+    assert bad["channel"] == "chat"

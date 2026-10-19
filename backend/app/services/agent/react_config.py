@@ -39,11 +39,17 @@ REACT_MODES = ("fast", "deep")
 
 # ---- 提示词配置键（2026-10-19）----
 # 空字符串 = 使用代码内置默认值；非空 = 整段替换（仍注入运行时变量）。
-PROMPT_KEYS: tuple[str, ...] = (
+# 分通道：问答（qa）与公文起草（draft）各自独立配置，互不影响。
+PROMPT_KEYS_QA: tuple[str, ...] = (
     "deep_prompt_understand",
     "deep_prompt_decision",
     "deep_prompt_final",
 )
+PROMPT_KEYS_DRAFT: tuple[str, ...] = (
+    "deep_prompt_draft_understand",
+    "deep_prompt_draft_decision",
+)
+PROMPT_KEYS: tuple[str, ...] = PROMPT_KEYS_QA + PROMPT_KEYS_DRAFT
 # 单段提示词长度上限（防止把超长文本塞进配置库/上下文）
 PROMPT_MAX_CHARS = 20000
 
@@ -74,6 +80,10 @@ class ReactConfig:
 
     enabled: bool = True                    # 总开关（默认全开，用户 2026-10-16 确认）
     default_mode: str = "fast"              # 默认档位：fast=快速模式
+    # 公文起草是否走深度推理（2026-10-19 用户要求"智能起草也按深度推理的
+    # 方式、由模型自主决策"）：默认开。false 时 /v1/generate 回退单趟
+    # 检索+生成（旧行为，可作降级开关）。
+    draft_enabled: bool = True
 
     # ---- 收尾条件：默认都不设上限 ----
     max_rounds: int = 0                     # 0 = 不限轮数（2026-10-19 用户要求）
@@ -101,6 +111,9 @@ class ReactConfig:
     prompt_understand: str = ""
     prompt_decision: str = ""
     prompt_final: str = ""
+    # 起草通道覆盖（与问答通道分开：起草的"依据收集完成"语义不同于"答完问题"）
+    prompt_draft_understand: str = ""
+    prompt_draft_decision: str = ""
 
     def for_mode(self, mode: str | None) -> "ReactConfig":
         """按档位派生**生效配置**（返回新实例，不改自身）。
@@ -201,6 +214,10 @@ REACT_SEED: dict[str, object] = {
     "deep_prompt_understand": "",
     "deep_prompt_decision": "",
     "deep_prompt_final": "",
+    # 起草通道：总开关 + 提示词覆盖（2026-10-19）
+    "deep_draft_enabled": True,
+    "deep_prompt_draft_understand": "",
+    "deep_prompt_draft_decision": "",
 }
 
 
@@ -232,6 +249,7 @@ async def load_react_config(db: AsyncSession) -> ReactConfig:
     return ReactConfig(
         enabled=_coerce_bool(values.get("deep_reason_enabled"), cfg.enabled),
         default_mode=_coerce_mode(values.get("deep_default_mode"), cfg.default_mode),
+        draft_enabled=_coerce_bool(values.get("deep_draft_enabled"), cfg.draft_enabled),
         # 0 = 不限：下限给 0，上限给一个"足够大但不至于跑飞"的硬顶（运维可调）
         max_rounds=_coerce_int(values.get("deep_max_rounds"), cfg.max_rounds, 0, 200),
         budget_ms=_coerce_int(values.get("deep_budget_ms"), cfg.budget_ms, 0, 86400000),
@@ -258,6 +276,8 @@ async def load_react_config(db: AsyncSession) -> ReactConfig:
         prompt_understand=_coerce_prompt(values.get("deep_prompt_understand")),
         prompt_decision=_coerce_prompt(values.get("deep_prompt_decision")),
         prompt_final=_coerce_prompt(values.get("deep_prompt_final")),
+        prompt_draft_understand=_coerce_prompt(values.get("deep_prompt_draft_understand")),
+        prompt_draft_decision=_coerce_prompt(values.get("deep_prompt_draft_decision")),
     )
 
 

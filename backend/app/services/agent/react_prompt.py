@@ -39,6 +39,13 @@ import json
 from dataclasses import dataclass, field
 
 from app.schemas.contracts import Citation
+# 起草成稿提示词的默认文案（配置中心「提示词模板」的代码内置值）：
+# react_prompt 需要它做"只读预览"的兜底，generation_prompt 不依赖本模块，
+# 单向引用不成环。
+from app.services.generation_prompt import (
+    DEFAULT_DRAFT_SYSTEM,
+    DEFAULT_NO_MATERIALS_SYSTEM,
+)
 
 # 停止动作标识（模型输出该 action 表示信息充分、进入最终生成）
 TOOL_FINISH = "finish"
@@ -61,6 +68,23 @@ UNDERSTAND_SYSTEM = (
     "本判断不构成任何强制指令。"
 )
 
+# ---- 起草通道理解 prompt（2026-10-19 新增）----
+# 与问答版的差异：复述的对象是"起草诉求"（文种/主题/对象/关键要求），
+# 歧义点解释为"成稿时需留占位或说明的点"而非"要向用户澄清的点"。
+UNDERSTAND_SYSTEM_DRAFT = (
+    "你是企业公文知识库的起草需求理解器。请先理解用户想起草什么，只输出 JSON，不要任何其他文字。\n"
+    'JSON 格式：{"restate": "用你自己的话复述起草诉求（文种/主题/对象/关键要求）", '
+    '"needs_knowledge": true 或 false, '
+    '"needs_knowledge_reason": "为什么需要/不需要查知识库参考", '
+    '"candidates": ["可查的参考方向，最多4个"], '
+    '"ambiguities": ["需求中不明确、成稿时需要留占位或说明的点，没有则空数组"]}\n'
+    "判定参考：\n"
+    "- 涉及本单位具体规定、口径、数据、历史文件、特定事项 → needs_knowledge=true；\n"
+    "- 通用公文格式、通用写法，或用户已给足信息 → needs_knowledge=false；\n"
+    "- 你只需陈述判断，**后续是否真的调用检索工具由推理阶段的智能体自行决定**，"
+    "本判断不构成任何强制指令。"
+)
+
 # ---- 决策 system prompt（TAO 循环每轮）----
 # 收尾规则单独抽成一段，便于"不限轮数"与"有硬上限"两种形态复用。
 # 注意：{round_rule} 由 build_decision_system 注入，覆盖提示词里也可引用。
@@ -71,6 +95,35 @@ DECISION_ROUND_RULE_UNLIMITED = (
     "6. 信息足够就 finish，不要为问而问。**不设轮数上限**——需要几轮就做几轮，"
     "但禁止机械重复同一检索；若已连续多轮没有新材料，请换角度或直接基于现有"
     "材料 finish 完成任务（不得拒答）。"
+)
+
+# ---- 起草通道决策 prompt（2026-10-19 新增，公文起草与问答共用引擎但任务不同）----
+# 与问答版的差异：① 智能体身份是"公文起草"而非"问答"；② finish 的语义是
+# "依据已足够，交由系统成稿"；③ 明确"不得编造文号/指标/人名"的起草红线。
+DECISION_SYSTEM_TMPL_DRAFT = (
+    "你是企业公文知识库的「公文起草」智能体。你为一份公文收集起草依据——"
+    "查知识库有没有相关规定、口径、同类文件，材料足够后由系统依据全部材料起草成文。\n"
+    "每一轮你只能输出一个 JSON 对象，不得输出任何其他文字，三种形态：\n"
+    '1) 调用工具：{{"thought": "本轮思考：已知什么、缺什么、下一步为什么选这个工具", '
+    '"action": {{"tool": "<工具名>", "query": "给该工具的具体参数"}}}}\n'
+    '2) 打开文档看全文：{{"thought": "为什么需要看这份原文", '
+    '"action": {{"tool": "read_document", "query": "<chunk_id 或文档标题>"}}}}\n'
+    '3) 依据已足够：{{"thought": "为什么现有材料已足够动笔（或为什么可直接按通用公文规范起草）", '
+    '"action": {{"tool": "finish", "query": ""}}}}\n'
+    "可用工具：\n{tool_lines}\n"
+    "自主决策规则（重要）：\n"
+    "1. **是否需要检索、是否需要看文档，由你根据起草需求自行判断**——"
+    "通用格式/写法类请求（如只要求「写一份会议通知」且无特定口径要求）可以直接 finish；\n"
+    "2. 用户给了具体单位、事项、数据时，先用 knowledge_search 查库内是否有对应"
+    "规定/口径/历史文件，必要时用 read_document 核对原文——**不得凭记忆编造"
+    "文号、指标、人名、发布日期**；\n"
+    "3. query 必须具体，一次只查一个点；公文的结构性要素（标题/主送/正文/落款）"
+    "由系统成稿时处理，你只需保证事实性依据充分；\n"
+    "4. 观察结果为空或不相关时，更换关键词或换角度重试，禁止原样重复；\n"
+    "5. **任何情况下都不要放弃任务**：即使查不到材料，也要 finish 让系统按通用"
+    "公文规范完成起草（依据不足处由成稿阶段标注提示），最后由系统统一附加"
+    "「AI 生成，请人工鉴别」声明；\n"
+    "{round_rule}"
 )
 
 DECISION_SYSTEM_TMPL = (
@@ -159,7 +212,68 @@ def _inject(template: str, variables: dict[str, str]) -> str:
     return text
 
 
-def build_decision_system(max_rounds: int, tool_lines: str, override: str = "") -> str:
+@dataclass(frozen=True)
+class TaskPromptPack:
+    """任务形态提示词包：让同一套 ReAct 引擎服务"问答"与"公文起草"两种任务。
+
+    为什么需要它：起草与问答的 TAO 循环结构完全相同（都是自主决策调用工具
+    收集依据），但智能体身份、finish 语义、停止原因的中文标签都不同——
+    直接复用问答 prompt 会让起草场景的模型以为自己在"回答问题"而不是"收集
+    起草依据"。因此把差异化部分收进 pack，引擎与编排零分支。
+
+    字段：
+    - channel: 通道标识（qa / draft），SSE react_start 与 trace 落库用；
+    - understand_system: 理解阶段内置提示词（可被配置覆盖）；
+    - decision_template: 决策阶段内置模板（可被配置覆盖）；
+    - stop_labels: 停止原因 → 中文标签（缺省用 STOP_REASON_LABELS 共享表）；
+    - tool_phase_labels: 工具 → 阶段播报动作名；
+    - history_hint_chars: 会话历史注入决策上下文的截断长度
+      （问答 500 字够用；起草需让模型知道上一稿文种与篇幅，放宽到 1200）。
+    """
+
+    channel: str
+    understand_system: str
+    decision_template: str
+    stop_labels: dict[str, str] = field(default_factory=dict)
+    tool_phase_labels: dict[str, str] = field(default_factory=dict)
+    history_hint_chars: int = 500
+
+
+# 问答通道（默认，2026-10-16 起）
+QA_PACK = TaskPromptPack(
+    channel="qa",
+    understand_system=UNDERSTAND_SYSTEM,
+    decision_template=DECISION_SYSTEM_TMPL,
+)
+
+# 起草通道（2026-10-19 新增：智能起草改为 ReAct 自主决策）
+DRAFT_PACK = TaskPromptPack(
+    channel="draft",
+    understand_system=UNDERSTAND_SYSTEM_DRAFT,
+    decision_template=DECISION_SYSTEM_TMPL_DRAFT,
+    stop_labels={
+        "final": "依据已足够（模型主动结束，开始起草）",
+        "max_rounds": "达到轮数上限",
+        "budget": "超出时间预算",
+        "no_progress": "连续多轮无新材料，已开始起草",
+        "parse_fail": "决策输出连续不可解析",
+        "decision_fail": "决策调用连续失败",
+    },
+    tool_phase_labels={
+        "knowledge_search": "检索起草依据",
+        "doc_lookup": "查找候选文件",
+        "read_document": "打开原文",
+    },
+    history_hint_chars=1200,
+)
+
+
+def build_decision_system(
+    max_rounds: int,
+    tool_lines: str,
+    override: str = "",
+    template: str | None = None,
+) -> str:
     """组装决策 system prompt（工具清单与收尾规则由配置注入）。
 
     Args:
@@ -167,6 +281,8 @@ def build_decision_system(max_rounds: int, tool_lines: str, override: str = "") 
         tool_lines: 工具契约文本（由 react_tools.tool_lines() 生成）。
         override: 配置中心的自定义提示词；非空则整段替换默认模板，
             并注入 `{tool_lines}` / `{max_rounds}` / `{round_rule}` 三个变量。
+        template: 内置模板；缺省用问答模板（``DECISION_SYSTEM_TMPL``）。
+            起草通道传 ``DECISION_SYSTEM_TMPL_DRAFT``（见 TaskPromptPack）。
 
     Returns:
         最终注入模型的 system 文本。
@@ -183,7 +299,7 @@ def build_decision_system(max_rounds: int, tool_lines: str, override: str = "") 
         if "{tool_lines}" not in override and tool_lines not in text:
             text = f"{text}\n\n可用工具：\n{tool_lines}"
         return text
-    return _inject(DECISION_SYSTEM_TMPL, variables)
+    return _inject(template if template is not None else DECISION_SYSTEM_TMPL, variables)
 
 
 
@@ -436,8 +552,10 @@ def export_prompts(
     tool_lines: str,
     max_rounds: int,
     prompts: dict[str, str] | None = None,
+    channel: str = "qa",
+    draft_templates: dict[str, str] | None = None,
 ) -> list[dict]:
-    """导出各阶段提示词全文，供前端提示词管理面板查看/编辑/复制。
+    """导出各阶段提示词全文，供前端「提示词管理」面板查看/编辑/复制。
 
     返回的是**运行时实际生效的那份**（默认模板 + 已注入工具清单与收尾规则，
     或配置中心的自定义覆盖），因此面板所见与模型实际收到的一致。
@@ -445,8 +563,13 @@ def export_prompts(
     Args:
         tool_lines: 工具契约文本。
         max_rounds: 轮数硬上限；``0`` 表示不限（面板显示"不限"）。
-        prompts: 配置中心的三段覆盖值，键为 ``PROMPT_KEYS``；
-            缺省/空字符串表示使用默认。
+        prompts: 配置中心的提示词覆盖值；问答通道键为 ``PROMPT_KEYS_QA``，
+            起草通道为 ``PROMPT_KEYS_DRAFT``（缺省/空字符串表示使用默认）。
+        channel: ``qa``（问答，默认）/ ``draft``（公文起草）。
+        draft_templates: 起草通道专用——配置中心的起草提示词模板
+            （``draft_system`` / ``no_materials_system``，category=prompt），
+            用于"最终成稿提示词"的只读预览（该模板的编辑入口在配置中心
+            「提示词模板」页，不在此面板，避免两处可改互相覆盖）。
 
     Returns:
         列表项字段：
@@ -456,7 +579,8 @@ def export_prompts(
         - ``content`` 当前生效全文
         - ``default_content`` 代码内置默认全文（供"恢复默认"预览/对比）
         - ``variables`` 可用的运行时占位符
-        - ``source`` ``custom``（已自定义）/ ``default``（内置默认）/ ``builtin``（只读）
+        - ``source`` ``custom``（已自定义）/ ``default``（内置默认）/
+          ``external``（在其他配置页维护，本面板只读）/ ``builtin``（只读逻辑）
         - ``editable`` 是否允许在面板编辑保存
     """
     p = prompts or {}
@@ -464,6 +588,7 @@ def export_prompts(
     def _item(
         *, key: str, name: str, stage: str, default: str, override: str,
         variables: list[str], editable: bool = True, effective: str | None = None,
+        source: str | None = None,
     ) -> dict:
         custom = bool((override or "").strip())
         # effective 用于"覆盖文本需要注入运行时变量"的场景（如决策提示词）：
@@ -476,11 +601,75 @@ def export_prompts(
             "content": content,
             "default_content": default,
             "variables": variables,
-            "source": ("custom" if custom else "default") if editable else "builtin",
+            "source": source or (("custom" if custom else "default") if editable else "builtin"),
             "editable": editable,
         }
 
     round_label = f"{max_rounds} 轮" if max_rounds and max_rounds > 0 else "不限轮数"
+
+    if channel == "draft":
+        # ---- 起草通道：理解/决策可配（deep_prompt_draft_*），成稿提示词
+        # 复用配置中心「提示词模板」（draft_system/no_materials_system），只读预览 ----
+        draft_tpl = draft_templates or {}
+        final_default = draft_tpl.get("draft_system") or DEFAULT_DRAFT_SYSTEM
+        final_no_material = draft_tpl.get("no_materials_system") or DEFAULT_NO_MATERIALS_SYSTEM
+        decision_default = build_decision_system(
+            max_rounds, tool_lines, template=DECISION_SYSTEM_TMPL_DRAFT
+        )
+        decision_effective = build_decision_system(
+            max_rounds, tool_lines, p.get("deep_prompt_draft_decision", ""),
+            template=DECISION_SYSTEM_TMPL_DRAFT,
+        )
+        return [
+            _item(
+                key="deep_prompt_draft_understand",
+                name="起草需求理解",
+                stage="理解阶段（每次起草 1 次，temperature=0；失败不阻断循环）",
+                default=UNDERSTAND_SYSTEM_DRAFT,
+                override=p.get("deep_prompt_draft_understand", ""),
+                variables=[],
+            ),
+            _item(
+                key="deep_prompt_draft_decision",
+                name="起草推理决策（TAO 每轮）",
+                stage=f"决策阶段（每轮 1 次；轮数策略：{round_label}）",
+                default=decision_default,
+                override=p.get("deep_prompt_draft_decision", ""),
+                variables=["{tool_lines}", "{max_rounds}", "{round_rule}"],
+                effective=decision_effective,
+            ),
+            _item(
+                key="draft_system",
+                name="最终成稿提示词（只读预览）",
+                stage="循环结束后依据全部材料成稿；编辑入口：配置中心 → 提示词模板",
+                default=final_default,
+                override="",
+                variables=[],
+                editable=False,
+                source="external",
+            ),
+            _item(
+                key="no_materials_system",
+                name="无材料成稿提示词（只读预览）",
+                stage="未收集到任何依据时按通用公文规范成稿（不得虚构库内依据）",
+                default=final_no_material,
+                override="",
+                variables=[],
+                editable=False,
+                source="external",
+            ),
+            _item(
+                key="deep_prompt_observation",
+                name="观察结果格式（只读）",
+                stage="工具执行后回灌给模型的观察消息模板（结构化逻辑，不建议改）",
+                default=OBSERVATION_TEMPLATE_PREVIEW,
+                override="",
+                variables=["{tool}", "{query}", "{n}"],
+                editable=False,
+            ),
+        ]
+
+    # ---- 问答通道（默认）----
     decision_default = build_decision_system(max_rounds, tool_lines)
     decision_effective = build_decision_system(
         max_rounds, tool_lines, p.get("deep_prompt_decision", "")

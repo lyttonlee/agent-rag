@@ -16,6 +16,7 @@ import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import ReasoningPanel from '@/components/ReasoningPanel.vue'
 import MarkdownText from '@/components/MarkdownText.vue'
+import ReActTracePanel from '@/components/ReActTracePanel.vue'
 import {
   caller,
   getConversation,
@@ -28,6 +29,8 @@ import {
   type CitationPayload,
   type DocSpace,
   type PlanStep,
+  type ReactAnalysis,
+  type ReactRound,
 } from '@/api/client'
 
 // ---- 知识空间（问答范围多选）----
@@ -80,6 +83,51 @@ const disclaimer = ref(false)
 const showAgentPanel = computed(
   () => loading.value || !!intentLabel.value || turnSteps.value.length > 0 || noResult.value || disclaimer.value,
 )
+
+// ---- 深度推理（ReAct）状态：TAO 循环事件驱动（2026-10-16）----
+// deep_reason 默认全开：问答类意图会进入 TAO 循环并推送 react_* 事件。
+// 本页必须消费这些事件——否则"思维链"在后端跑完但前端完全看不到。
+const reactInfo = ref<{
+  max_rounds: number
+  unlimited_rounds?: boolean
+  total_budget_ms: number
+  tools: string[]
+  channel?: 'qa' | 'draft'
+} | null>(null)
+const analysis = ref<ReactAnalysis | null>(null)
+const rounds = ref<ReactRound[]>([])
+const reactEnd = ref<{ rounds: number; stop_reason: string; stop_label?: string; citations_total: number; total_ms?: number } | null>(null)
+/** 阶段播报（修"SSE 在返回但页面像断了"）：持续显示"正在做什么 + 已等待 Ns" */
+const phase = ref<{ phase: string; label: string; round?: number } | null>(null)
+const phaseElapsed = ref(0)
+let phaseTimer: number | null = null
+let phaseSince = 0
+const showTrace = computed(() => reactInfo.value !== null || rounds.value.length > 0)
+
+function startPhaseTimer() {
+  if (phaseTimer) return
+  phaseTimer = window.setInterval(() => {
+    if (phaseSince) phaseElapsed.value = Math.round((Date.now() - phaseSince) / 100) / 10
+  }, 100)
+}
+function stopPhaseTimer() {
+  if (phaseTimer) {
+    clearInterval(phaseTimer)
+    phaseTimer = null
+  }
+  phaseElapsed.value = 0
+  phaseSince = 0
+}
+
+function roundOf(no: number): ReactRound {
+  let r = rounds.value.find((x) => x.round === no)
+  if (!r) {
+    r = { round: no, running: true }
+    rounds.value.push(r)
+    rounds.value.sort((a, b) => a.round - b.round)
+  }
+  return r
+}
 
 const hasMessages = computed(() => messages.value.length > 0 || loading.value)
 
@@ -137,6 +185,13 @@ function resetAgentTurn() {
   turnSteps.value = []
   noResult.value = false
   disclaimer.value = false
+  // ReAct 运行时态一并清理（历史思维链从消息 reasoning 回看）
+  reactInfo.value = null
+  analysis.value = null
+  rounds.value = []
+  reactEnd.value = null
+  phase.value = null
+  stopPhaseTimer()
 }
 
 /** 切换知识范围：持久化到会话绑定（换范围继续聊） */
@@ -202,6 +257,60 @@ function send(text?: string) {
       rerank: true,
     },
     {
+      // ---- 深度推理（ReAct）事件：智能体自主决策全过程 ----
+      onReactStart: (info) => {
+        reactInfo.value = info
+        phaseSince = Date.now()
+        startPhaseTimer()
+        scrollBottom()
+      },
+      onAnalysis: (a) => {
+        analysis.value = a
+        scrollBottom()
+      },
+      onReactRound: (round) => {
+        roundOf(round)
+        scrollBottom()
+      },
+      onPhase: (p) => {
+        phase.value = { phase: p.phase, label: p.label, round: p.round }
+        phaseSince = Date.now()
+        phaseElapsed.value = 0
+        scrollBottom()
+      },
+      onThought: (round, text) => {
+        roundOf(round).thought = text
+        scrollBottom()
+      },
+      onAction: (round, tool, query, skipped) => {
+        roundOf(round).action = { tool, query, skipped }
+        scrollBottom()
+      },
+      onObservation: (round, o) => {
+        const r = roundOf(round)
+        r.hits = o.hits.map((h) => ({
+          n: h.n,
+          chunk_id: h.chunk_id,
+          document_id: h.document_id,
+          title: h.title,
+          doc_no: h.doc_no,
+          snippet: h.snippet,
+          full_snippet: h.full_snippet,
+          score: h.score,
+        }))
+        r.quality = o.quality
+        r.note = o.note
+        r.elapsed_ms = o.elapsed_ms
+        r.hits_total = o.hits_total
+        r.running = false
+        scrollBottom()
+      },
+      onReactEnd: (info) => {
+        reactEnd.value = info
+        rounds.value.forEach((r) => (r.running = false))
+        phase.value = null
+        scrollBottom()
+      },
       onMeta: (conversationId, model, cits, _truncated, meta) => {
         // 首轮：后端自动创建会话并回传 ID，后续轮次复用
         if (conversationId && conversationId !== activeId.value) {
@@ -270,6 +379,7 @@ function send(text?: string) {
         }
         sidebar.value?.load()
         loading.value = false
+        stopPhaseTimer()
         if (sensitiveHits.length) {
           ElMessage.warning(`敏感词命中 ${sensitiveHits.length} 处，已脱敏`)
         }
@@ -285,6 +395,7 @@ function send(text?: string) {
             .catch(() => undefined)
         }
         loading.value = false
+        stopPhaseTimer()
       },
     },
   )
@@ -296,6 +407,7 @@ function onDeleted(id: string) {
 
 onBeforeUnmount(() => {
   controller?.abort()
+  stopPhaseTimer()
 })
 </script>
 
@@ -395,6 +507,21 @@ onBeforeUnmount(() => {
             <div class="bubble">{{ sentQuery }}</div>
           </div>
           <div class="msg assistant">
+            <!-- 阶段播报：深度推理进行中持续显示"正在做什么 + 已等待 Ns" -->
+            <div v-if="phase" class="phase-bar">
+              <span class="live"><i class="dot" />{{ phase.label }}</span>
+              <span class="mono text-muted">已等待 {{ phaseElapsed.toFixed(1) }}s</span>
+            </div>
+            <!-- 推理面板（ReAct TAO 时间线）：内联在答案上方，默认展开、不截断 -->
+            <ReActTracePanel
+              v-if="showTrace"
+              class="live-trace"
+              :rounds="rounds"
+              :analysis="analysis"
+              :info="reactInfo"
+              :end="reactEnd"
+              :loading="loading"
+            />
             <!-- 思考过程：推理中自动展开，正文开始后自动收起，回答结束后保留可展开 -->
             <ReasoningPanel
               v-if="reasoning"
@@ -496,6 +623,16 @@ onBeforeUnmount(() => {
   border: 1px solid var(--brand-line);
 }
 .thinking { color: var(--text-muted); }
+/* 阶段播报条（深度推理进行中：消除静默期） */
+.phase-bar {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 10px;
+  font-size: 13px; padding: 6px 12px; border-radius: 8px;
+  background: var(--brand-soft); border: 1px solid var(--brand-line);
+}
+.live { display: inline-flex; align-items: center; gap: 6px; color: var(--c-success); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-success); animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.live-trace { margin-bottom: 10px; }
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--brand); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .msg-refs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }

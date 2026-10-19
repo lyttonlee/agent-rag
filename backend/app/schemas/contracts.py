@@ -247,6 +247,19 @@ class GenerateRequest(BaseModel):
     agent_mode: bool | None = Field(
         None, description="Agent 模式：意图路由 + 分步执行；缺省走配置中心开关（默认开启），false 强制回退纯直答"
     )
+    # ---- 深度推理起草（ReAct，2026-10-19：智能起草改为模型自主决策）----
+    # None=跟随配置中心 deep_draft_enabled（默认开）：起草前先由智能体
+    # 自主决定是否检索/查文件/读原文，材料够了再成稿；显式 false 回退
+    # 单趟"检索+生成"旧链路（保留作降级开关）。
+    deep_reason: bool | None = Field(
+        None, description="深度推理起草（智能体自主收集依据后成稿）；缺省走配置中心开关（默认开启）"
+    )
+    # 档位：fast=快速（窄召回、低延迟）/ deep=深度（宽召回、质量优先）；
+    # 缺省取配置中心 deep_default_mode。**轮数默认不限**（2026-10-19 起），
+    # 档位只影响每轮召回/注入条数，不影响轮数。仅 deep_reason 生效时使用。
+    react_mode: str | None = Field(
+        None, description="深度推理档位：fast（快速）/ deep（深度）；缺省取配置中心默认档"
+    )
     stream: bool = False
 
 

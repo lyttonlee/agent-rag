@@ -95,6 +95,7 @@ def build_generation_messages(
     templates: dict[str, str] | None = None,
     template_name: str | None = None,
     history: list[tuple[str, str]] | None = None,
+    process: str = "",
 ) -> list[dict]:
     """构造公文起草 messages。
 
@@ -112,6 +113,10 @@ def build_generation_messages(
         history: 会话历史 [(role, content), ...]（按时间正序，已排除本轮
             user 消息）——同一会话内再次提修改意见时注入往轮要求与上稿，
             使模型"在上一稿基础上修改"而非重新起草（用户 2026-10-16 需求）。
+        process: 深度推理（ReAct）过程的文字摘要（2026-10-19 起草 ReAct 化）。
+            智能体在循环里自主收集了哪些依据、为什么收尾，透传给成稿模型，
+            让它知道"我的同事已经查过什么"，避免重复劳动与依据遗漏；
+            单趟链路传空串（不影响旧行为）。
     """
     system = _pick(
         templates,
@@ -133,7 +138,11 @@ def build_generation_messages(
     for role, content in (history or []):
         cap = _DRAFT_HISTORY_ASSISTANT_MAX if role == "assistant" else _DRAFT_HISTORY_USER_MAX
         messages.append({"role": role, "content": content[:cap]})
-    user = f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{req.query}"
+    process_block = f"【推理过程】\n{process}\n\n" if (process or "").strip() else ""
+    user = (
+        f"{process_block}"
+        f"【检索材料】\n{_render_context(citations)}\n\n【用户问题】\n{req.query}"
+    )
     messages.append({"role": "user", "content": user})
     return messages
 

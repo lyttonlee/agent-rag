@@ -565,7 +565,7 @@ export interface DoneExtra {
 export interface StreamHandlers {
   /** 检索元数据（引用列表）到达；conversationId 为起草会话 ID；meta 携带 Agent 意图信息 */
   onMeta?: (model: string, citations: CitationPayload[], truncated: boolean, conversationId?: string, meta?: AgentMeta) => void
-  /** 步骤计划到达（起草链路透出 检索/生成/脱敏 时间线，过程可见） */
+  /** 步骤计划到达（起草链路透出 理解需求/收集依据/成稿/脱敏 时间线，过程可见） */
   onPlan?: (steps: PlanStep[]) => void
   /** 某步骤开始执行 */
   onStepStart?: (step: PlanStep) => void
@@ -575,6 +575,50 @@ export interface StreamHandlers {
   onToken?: (text: string) => void
   /** 思考链片段到达（推理模型） */
   onReasoning?: (text: string) => void
+  // ---- 深度推理起草（ReAct，2026-10-19）：智能体自主收集依据的 TAO 时间线 ----
+  /** ReAct 循环启动；channel=draft 表示起草通道（与问答共用引擎，文案不同） */
+  onReactStart?: (info: {
+    max_rounds: number
+    unlimited_rounds?: boolean
+    total_budget_ms: number
+    tools: string[]
+    channel?: 'qa' | 'draft'
+  }) => void
+  /** 起草需求理解结果（模型复述诉求 + 自述是否需要查库 + 候选方向） */
+  onAnalysis?: (info: ReactAnalysis) => void
+  /** 新一轮开始（时间线追加容器） */
+  onReactRound?: (round: number, maxRounds: number) => void
+  /**
+   * 阶段播报：每个耗时动作前后推送，phase 取值
+   * start|classify|understand|decide|tool|answer。用于消除"点了没反应"的
+   * 静默期——模型每次调用要 1-4 秒，此前这段时间页面完全没有可见进展。
+   */
+  onPhase?: (info: { phase: string; label: string; round?: number; tool?: string }) => void
+  /** 本轮思考（模型显式 Thought 文本） */
+  onThought?: (round: number, text: string) => void
+  /** 本轮行动（工具 + query；skipped=true 表示未真实执行） */
+  onAction?: (round: number, tool: string, query: string, skipped?: boolean) => void
+  /** 本轮观察（命中列表 + 质量信号 + 提示语 + 耗时） */
+  onObservation?: (
+    round: number,
+    o: {
+      tool: string
+      query: string
+      hits: ReactObsHit[]
+      quality: Record<string, number | null>
+      note: string
+      elapsed_ms?: number
+      hits_total?: number
+    },
+  ) => void
+  /** 循环结束（轮数 / 停止原因 / 累计引用 / 总耗时） */
+  onReactEnd?: (info: {
+    rounds: number
+    stop_reason: string
+    stop_label?: string
+    citations_total: number
+    total_ms?: number
+  }) => void
   /** 流式完成（含脱敏后完整答案与敏感词命中）；extra 携带意图/无材料/甄别声明标志 */
   onDone?: (answer: string, sensitiveHits: string[], model: string, extra?: DoneExtra) => void
   /** 出错（后端推送 error 事件或网络异常） */
@@ -592,6 +636,10 @@ export interface StreamGenerateOpts {
   rerank?: boolean
   top_n?: number
   agent_mode?: boolean
+  /** 深度推理起草开关：null/undefined=跟随后端配置（默认开启）；false=切回单趟旧链路 */
+  deep_reason?: boolean | null
+  /** 深度推理档位（仅 deep_reason 生效时使用；轮数不限，档位只影响召回广度） */
+  react_mode?: ReactMode | null
 }
 
 /**
@@ -621,6 +669,10 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
           rerank: opts.rerank ?? false,
           top_n: opts.top_n ?? 8,
           agent_mode: opts.agent_mode ?? null,
+          // 深度推理起草（2026-10-19）：缺省 null=跟随后端配置（默认开启），
+          // false=单趟旧链路；档位仅影响召回广度（轮数默认不限）
+          deep_reason: opts.deep_reason ?? null,
+          react_mode: opts.react_mode ?? null,
         }),
         signal: controller.signal,
       })
@@ -690,6 +742,62 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
             case 'reasoning':
               handlers.onReasoning?.(evt.text ?? '')
               break
+            // ---- 深度推理起草（ReAct，2026-10-19）事件：与问答同构 ----
+            case 'react_start':
+              handlers.onReactStart?.({
+                max_rounds: evt.max_rounds ?? 0,
+                unlimited_rounds: evt.unlimited_rounds ?? (evt.max_rounds ?? 0) <= 0,
+                total_budget_ms: evt.total_budget_ms ?? 0,
+                tools: evt.tools ?? [],
+                channel: evt.channel ?? 'draft',
+              })
+              break
+            case 'analysis':
+              handlers.onAnalysis?.({
+                restate: evt.restate ?? '',
+                needs_knowledge: !!evt.needs_knowledge,
+                needs_knowledge_reason: evt.needs_knowledge_reason ?? '',
+                candidates: evt.candidates ?? [],
+                ambiguities: evt.ambiguities ?? [],
+              })
+              break
+            case 'react_round':
+              handlers.onReactRound?.(evt.round ?? 1, evt.max_rounds ?? 0)
+              break
+            case 'phase':
+              handlers.onPhase?.({
+                phase: evt.phase ?? '',
+                label: evt.label ?? '',
+                round: evt.round,
+                tool: evt.tool,
+              })
+              break
+            case 'thought':
+              handlers.onThought?.(evt.round ?? 1, evt.text ?? '')
+              break
+            case 'action':
+              handlers.onAction?.(evt.round ?? 1, evt.tool ?? '', evt.query ?? '', !!evt.skipped)
+              break
+            case 'observation':
+              handlers.onObservation?.(evt.round ?? 1, {
+                tool: evt.tool ?? '',
+                query: evt.query ?? '',
+                hits: evt.hits ?? [],
+                quality: evt.quality ?? {},
+                note: evt.note ?? '',
+                elapsed_ms: evt.elapsed_ms,
+                hits_total: evt.hits_total,
+              })
+              break
+            case 'react_end':
+              handlers.onReactEnd?.({
+                rounds: evt.rounds ?? 0,
+                stop_reason: evt.stop_reason ?? 'final',
+                stop_label: evt.stop_label,
+                citations_total: evt.citations_total ?? 0,
+                total_ms: evt.total_ms,
+              })
+              break
             case 'done':
               handlers.onDone?.(evt.answer ?? '', evt.sensitive_hits ?? [], evt.model ?? '', {
                 intent: evt.intent ?? null,
@@ -717,9 +825,18 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
  *
  * 返回的是**运行时实际使用的那份**（工具清单与轮数已按当前档位注入），
  * 因此面板内容与真实请求完全一致——改 prompt 不用翻代码。
+ *
+ * @param reactMode 档位 fast/deep；缺省用配置中心默认档
+ * @param channel 通道：chat=问答（默认）/ draft=公文起草
  */
-export async function getReactPrompts(reactMode?: ReactMode | null): Promise<ReactPromptsResp> {
-  const q = reactMode ? `?react_mode=${reactMode}` : ''
+export async function getReactPrompts(
+  reactMode?: ReactMode | null,
+  channel?: 'chat' | 'draft' | null,
+): Promise<ReactPromptsResp> {
+  const params = new URLSearchParams()
+  if (reactMode) params.set('react_mode', reactMode)
+  if (channel) params.set('channel', channel)
+  const q = params.toString() ? `?${params.toString()}` : ''
   const resp = await fetch(`/v1/chat/react/prompts${q}`, {
     headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
   })
@@ -816,13 +933,18 @@ export interface ReactPromptItem {
   /** 代码内置默认全文（"恢复默认"与 diff 对比用） */
   default_content: string
   variables: string[]
-  /** custom=已自定义 / default=内置默认 / builtin=只读（结构化逻辑） */
-  source: 'custom' | 'default' | 'builtin'
+  /**
+   * custom=已自定义 / default=内置默认 / builtin=只读（结构化逻辑）/
+   * external=在其他配置页维护（起草成稿提示词 → 配置中心「提示词模板」）
+   */
+  source: 'custom' | 'default' | 'builtin' | 'external'
   editable: boolean
 }
 
 export interface ReactPromptsResp {
   mode: string
+  /** 通道：chat=问答 / draft=公文起草（2026-10-19 双通道） */
+  channel: 'chat' | 'draft'
   /** 0 = 不限轮数（2026-10-19 起默认） */
   max_rounds: number
   unlimited_rounds: boolean
@@ -832,6 +954,8 @@ export interface ReactPromptsResp {
   no_progress_limit: number
   retrieve_top_n: number
   obs_hits: number
+  /** 起草通道总开关（仅 channel=draft 返回） */
+  draft_enabled?: boolean
   tools: { name: string; description: string }[]
   prompts: ReactPromptItem[]
 }

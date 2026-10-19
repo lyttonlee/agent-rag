@@ -5,6 +5,13 @@
  * 多轮修改机制：首次起草自动创建 draft 会话（conversation_id 由后端
  * meta 事件回传）；后续在同一会话中输入修改意见（如"语气更严厉一些"），
  * 后端将该轮 user 消息落库，历史在左侧会话栏可回看。
+ *
+ * 深度推理起草（2026-10-19，用户要求"按深度思考问答的方式、由模型自主
+ * 决策"）：默认开启。开启后起草不再是"拿主题一把梭检索 + 直接成稿"，
+ * 而是先由智能体跑 ReAct TAO 循环——是否检索、查什么关键词、要不要
+ * 打开原文核对、何时收尾全部由模型逐轮自主决定，材料够了再成稿。
+ * 推理过程（每轮思考/行动/观察）以 react_* 事件实时透出，内联渲染在
+ * 正文上方；可用右上角开关随时退回单趟链路。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
@@ -12,6 +19,8 @@ import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import AgentStepPanel from '@/components/AgentStepPanel.vue'
 import ReasoningPanel from '@/components/ReasoningPanel.vue'
 import MarkdownText from '@/components/MarkdownText.vue'
+import ReActTracePanel from '@/components/ReActTracePanel.vue'
+import ReactPromptsDrawer from '@/components/ReactPromptsDrawer.vue'
 import {
   caller,
   exportDocx,
@@ -24,6 +33,9 @@ import {
   type CitationPayload,
   type ExportDocxRequest,
   type PlanStep,
+  type ReactAnalysis,
+  type ReactMode,
+  type ReactRound,
   type TemplateItem,
 } from '@/api/client'
 
@@ -105,8 +117,78 @@ const exportLoading = ref(false)
 const exportVersions = ref<{ id: string; label: string; preview: string }[]>([])
 const selectedVersionId = ref<string>('')
 
-// ---- Agent 步骤时间线（检索 → 生成 → 脱敏，过程可见）----
+// ---- Agent 步骤时间线（理解需求 → 收集依据 → 成稿 → 脱敏，过程可见）----
 const steps = ref<PlanStep[]>([])
+
+// ---- 深度推理起草（ReAct）状态（2026-10-19）----
+/**
+ * 开关语义：null = 跟随后端配置（默认开启）；false = 单趟旧链路。
+ * 用户偏好持久化到 localStorage，与 DeepQa 页的总开关保持同一约定。
+ */
+const DEEP_PREF_KEY = 'draft_deep_reason'
+const MODE_PREF_KEY = 'draft_react_mode'
+function loadPrefs() {
+  try {
+    const d = localStorage.getItem(DEEP_PREF_KEY)
+    deepOn.value = d === null ? null : d === '1'
+    const m = localStorage.getItem(MODE_PREF_KEY)
+    reactMode.value = m === 'deep' ? 'deep' : 'fast'
+  } catch {
+    /* 隐私模式等场景忽略：用默认值 */
+  }
+}
+const deepOn = ref<boolean | null>(null)
+const reactMode = ref<ReactMode>('fast')
+const reactInfo = ref<{
+  max_rounds: number
+  unlimited_rounds?: boolean
+  total_budget_ms: number
+  tools: string[]
+  channel?: 'qa' | 'draft'
+} | null>(null)
+const analysis = ref<ReactAnalysis | null>(null)
+const rounds = ref<ReactRound[]>([])
+const reactEnd = ref<{ rounds: number; stop_reason: string; stop_label?: string; citations_total: number; total_ms?: number } | null>(null)
+const promptsOpen = ref(false)
+
+/**
+ * 阶段播报 + 模型思考链（与 DeepQa 同一套机制，修"SSE 在返回但页面像断了"）：
+ * 模型每次调用（理解/决策/生成）要 1-4 秒，此前这段时间页面完全没有可见
+ * 进展；phase 事件让页面持续显示"正在做什么 + 已等待 Ns"。
+ */
+const phase = ref<{ phase: string; label: string; round?: number } | null>(null)
+const phaseElapsed = ref(0)
+let phaseTimer: number | null = null
+let phaseSince = 0
+
+function startPhaseTimer() {
+  if (phaseTimer) return
+  phaseTimer = window.setInterval(() => {
+    if (phaseSince) phaseElapsed.value = Math.round((Date.now() - phaseSince) / 100) / 10
+  }, 100)
+}
+function stopPhaseTimer() {
+  if (phaseTimer) {
+    clearInterval(phaseTimer)
+    phaseTimer = null
+  }
+  phaseElapsed.value = 0
+  phaseSince = 0
+}
+/** 有 ReAct 运行时即展示推理面板（流式中 / 结束后保留到下次起草） */
+const showTrace = computed(() => reactInfo.value !== null || rounds.value.length > 0)
+/** 阶段播报可见性（进行中且有阶段标签时） */
+const showPhase = computed(() => loading.value && phase.value !== null)
+
+function roundOf(no: number): ReactRound {
+  let r = rounds.value.find((x) => x.round === no)
+  if (!r) {
+    r = { round: no, running: true }
+    rounds.value.push(r)
+    rounds.value.sort((a, b) => a.round - b.round)
+  }
+  return r
+}
 
 function startTimer() {
   startedAt = Date.now()
@@ -146,6 +228,13 @@ async function openConversation(id: string) {
     intentKey.value = ''
     noResult.value = false
     disclaimer.value = false
+    // ReAct 运行时态一并清理（历史会话的思维链从消息 reasoning 回看）
+    reactInfo.value = null
+    analysis.value = null
+    rounds.value = []
+    reactEnd.value = null
+    phase.value = null
+    stopPhaseTimer()
   } catch (e: any) {
     ElMessage.error('加载会话失败：' + (e?.response?.data?.detail || e.message))
   } finally {
@@ -174,7 +263,12 @@ async function refreshHistory() {
   sidebar.value?.load()
 }
 
-/** 流式生成：SSE 实时出字（meta → token* → done），思考链折叠展示。 */
+/** 流式生成：SSE 实时出字（meta → token* → done），思考链折叠展示。
+ *
+ * 深度推理起草（deep_reason）开启时事件序列多出整段 TAO 过程：
+ * react_start → analysis → (react_round/thought/action/observation)*
+ * → react_end，再进入成稿（meta → token → done）。
+ */
 async function generate() {
   if (!topic.value.trim()) {
     ElMessage.warning('请输入起草主题')
@@ -191,6 +285,13 @@ async function generate() {
   noResult.value = false
   disclaimer.value = false
   steps.value = []
+  // 重置本轮 ReAct 展示状态
+  reactInfo.value = null
+  analysis.value = null
+  rounds.value = []
+  reactEnd.value = null
+  phase.value = null
+  startPhaseTimer()
   startTimer()
 
   controller = streamGenerate(
@@ -202,9 +303,12 @@ async function generate() {
       caller_scope: caller.caller_scope,
       max_clearance: caller.max_clearance,
       rerank: false,
+      // null = 跟随后端配置（默认深度推理起草）；false = 单趟旧链路
+      deep_reason: deepOn.value,
+      react_mode: reactMode.value,
     },
     {
-      // 步骤计划：渲染 检索/生成/脱敏 时间线（过程可见）
+      // 步骤计划：渲染 理解需求/收集依据/成稿/脱敏 时间线（过程可见）
       onPlan: (plan) => {
         steps.value = plan.map((s) => ({ ...s, status: s.status || 'pending' }))
       },
@@ -222,6 +326,52 @@ async function generate() {
           target.status = ok ? 'done' : 'failed'
           target.summary = summary
         }
+      },
+      // ---- 深度推理（ReAct）事件：智能体自主决策全过程 ----
+      onReactStart: (info) => {
+        reactInfo.value = info
+        phaseSince = Date.now()
+      },
+      onAnalysis: (a) => {
+        analysis.value = a
+      },
+      onReactRound: (round) => {
+        roundOf(round)
+      },
+      onPhase: (p) => {
+        phase.value = { phase: p.phase, label: p.label, round: p.round }
+        phaseSince = Date.now()
+        phaseElapsed.value = 0
+      },
+      onThought: (round, text) => {
+        roundOf(round).thought = text
+      },
+      onAction: (round, tool, query, skipped) => {
+        const r = roundOf(round)
+        r.action = { tool, query, skipped }
+      },
+      onObservation: (round, o) => {
+        const r = roundOf(round)
+        r.hits = o.hits.map((h) => ({
+          n: h.n,
+          chunk_id: h.chunk_id,
+          document_id: h.document_id,
+          title: h.title,
+          doc_no: h.doc_no,
+          snippet: h.snippet,
+          full_snippet: h.full_snippet,
+          score: h.score,
+        }))
+        r.quality = o.quality
+        r.note = o.note
+        r.elapsed_ms = o.elapsed_ms
+        r.hits_total = o.hits_total
+        r.running = false
+      },
+      onReactEnd: (info) => {
+        reactEnd.value = info
+        rounds.value.forEach((r) => (r.running = false))
+        phase.value = null
       },
       onMeta: (model, cits, _truncated, conversationId, meta) => {
         modelName.value = model
@@ -254,6 +404,7 @@ async function generate() {
           if (extra.intent && !intentKey.value) intentKey.value = extra.intent
         }
         loading.value = false
+        stopPhaseTimer()
         stopTimer()
         // 落库完成：刷新会话历史（meta 事件已回传 conversation_id 到 activeId）
         refreshHistory()
@@ -265,6 +416,7 @@ async function generate() {
         ElMessage.error('生成失败：' + message)
         refreshHistory()
         loading.value = false
+        stopPhaseTimer()
         stopTimer()
       },
     },
@@ -275,7 +427,9 @@ function stop() {
   controller?.abort()
   controller = null
   loading.value = false
+  stopPhaseTimer()
   stopTimer()
+  rounds.value.forEach((r) => (r.running = false))
   // 后端已保存部分答案，刷新历史显示
   refreshHistory()
   ElMessage.info('已停止生成，已生成部分已保留在会话中')
@@ -288,11 +442,31 @@ function onDeleted(id: string) {
 onBeforeUnmount(() => {
   controller?.abort()
   stopTimer()
+  stopPhaseTimer()
 })
 
-onMounted(loadTemplates)
+onMounted(() => {
+  loadPrefs()
+  loadTemplates()
+})
 // 文种切换时，默认选中该文种首个模板（如从「通知」切到「报告」）
 watch(docType, syncDefaultTemplate)
+// 开关偏好持久化（用户下次进入起草页保持选择；'1'=开 / '0'=关 / 缺省=跟随后端）
+watch(deepOn, (v) => {
+  try {
+    if (v === null) localStorage.removeItem(DEEP_PREF_KEY)
+    else localStorage.setItem(DEEP_PREF_KEY, v ? '1' : '0')
+  } catch {
+    /* 忽略写入失败（隐私模式） */
+  }
+})
+watch(reactMode, (v) => {
+  try {
+    localStorage.setItem(MODE_PREF_KEY, v)
+  } catch {
+    /* 忽略写入失败（隐私模式） */
+  }
+})
 
 /** 打开导出弹窗：拉取会话消息，筛出 assistant 起草稿作为可导出版本。 */
 async function openExport() {
@@ -369,6 +543,27 @@ async function confirmExport() {
         <div class="ttl serif">智能起草</div>
         <span class="badge INTERNAL">按文种模板 · 引用溯源 · 流式输出</span>
         <div class="spacer" />
+        <!-- 深度推理起草开关（2026-10-19：智能体自主决定是否检索/看原文/何时收尾） -->
+        <el-tooltip
+          :content="deepOn === false
+            ? '单趟链路：直接按主题检索一次后成稿'
+            : '深度推理：智能体自主决定是否检索、查什么、是否打开原文核对，材料够了再成稿（轮数不限）'"
+          placement="bottom"
+        >
+          <span class="deep-toggle">
+            <span class="dt-label">深度推理</span>
+            <el-switch
+              :model-value="deepOn !== false"
+              size="small"
+              @update:model-value="(v: boolean) => (deepOn = v)"
+            />
+          </span>
+        </el-tooltip>
+        <el-radio-group v-if="deepOn !== false" v-model="reactMode" size="small">
+          <el-radio-button value="fast">快速</el-radio-button>
+          <el-radio-button value="deep">深度</el-radio-button>
+        </el-radio-group>
+        <el-button text size="small" @click="promptsOpen = true">提示词</el-button>
         <span class="text-muted" style="font-size: 12px">当前会话：{{ activeTitle }}</span>
       </div>
       <div class="bar">
@@ -383,7 +578,14 @@ async function confirmExport() {
         >
           <el-option v-for="t in typeTemplates" :key="t.code" :label="t.name" :value="t.code" />
         </el-select>
-        <el-input v-model="topic" placeholder="起草主题 / 修改意见（如：语气更严厉）" style="flex: 1" @keyup.enter="generate" />
+        <el-input
+          v-model="topic"
+          :placeholder="deepOn !== false
+            ? '起草主题 / 修改意见（智能体将自主收集依据，Enter 发送）'
+            : '起草主题 / 修改意见（如：语气更严厉）'"
+          style="flex: 1"
+          @keyup.enter="generate"
+        />
         <el-button type="primary" :loading="loading" @click="generate">{{ loading ? '生成中…' : '起草' }}</el-button>
         <el-button v-if="loading" @click="stop">停止</el-button>
         <el-button v-if="canExport" :loading="exportLoading" @click="openExport">导出 docx</el-button>
@@ -395,6 +597,22 @@ async function confirmExport() {
         <span v-if="loading" class="mono text-muted">{{ elapsed.toFixed(1) }}s</span>
         <span v-if="modelName" class="text-muted">模型 {{ modelName }}</span>
       </div>
+      <!-- 深度推理阶段播报（修"SSE 在返回但页面像断了"）：持续显示正在做什么 + 已等待 Ns -->
+      <div v-if="showPhase" class="phase-bar">
+        <span class="live"><i class="dot" />{{ phase?.label || '处理中…' }}</span>
+        <span class="mono text-muted">已等待 {{ phaseElapsed.toFixed(1) }}s</span>
+      </div>
+      <!-- 推理面板（ReAct TAO 时间线）：内联在正文上方，默认展开、完整多行 -->
+      <ReActTracePanel
+        v-if="showTrace"
+        class="live-trace"
+        channel="draft"
+        :rounds="rounds"
+        :analysis="analysis"
+        :info="reactInfo"
+        :end="reactEnd"
+        :loading="loading"
+      />
       <!-- 思考过程：默认折叠、可展开查看；回答结束后不消失 -->
       <ReasoningPanel
         v-if="reasoning"
@@ -459,6 +677,9 @@ async function confirmExport() {
           <el-button type="primary" :loading="exportLoading" @click="confirmExport">导出</el-button>
         </template>
       </el-dialog>
+
+      <!-- 深度推理提示词管理（起草通道：需求理解/推理决策可编辑，成稿提示词只读预览） -->
+      <ReactPromptsDrawer v-model="promptsOpen" channel="draft" :react-mode="reactMode" />
     </div>
   </div>
 </template>
@@ -474,6 +695,16 @@ async function confirmExport() {
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--c-success); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-success); animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+/* 深度推理开关 + 档位（头部工具区） */
+.deep-toggle { display: inline-flex; align-items: center; gap: 6px; }
+.dt-label { font-size: 12px; color: var(--text-muted); }
+/* 阶段播报条（深度推理进行中：消除静默期） */
+.phase-bar {
+  display: flex; align-items: center; gap: 14px; margin-bottom: 10px;
+  font-size: 13px; padding: 6px 12px; border-radius: 8px;
+  background: var(--brand-soft); border: 1px solid var(--brand-line);
+}
+.live-trace { margin-bottom: 12px; }
 .cursor { display: inline-block; width: 2px; height: 1em; background: var(--brand); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .paper { padding: 28px; max-width: 820px; margin: 0 auto; background: #f7f4ec; color: #1c1c1c; }

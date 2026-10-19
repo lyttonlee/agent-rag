@@ -31,6 +31,11 @@ const props = defineProps<{
     total_budget_ms: number
     tools: string[]
   } | null
+  /**
+   * 通道（2026-10-19）：draft=公文起草（面板标题与"理解"区块文案换成
+   * 起草语义）；缺省=问答。同一面板服务两个任务形态。
+   */
+  channel?: 'qa' | 'draft'
   /** 历史 TAO 全链文本（与 rounds 二选一，用于消息回看） */
   traceText?: string | null
   /** 是否流式进行中（当前轮呼吸点 + 面板高亮） */
@@ -56,6 +61,8 @@ const STOP_LABEL: Record<string, string> = {
 }
 
 function toolLabel(t: string): string {
+  // 起草通道里 finish 的语义是"依据已足够，开始成稿"
+  if (t === 'finish') return props.channel === 'draft' ? '开始起草' : '决定作答'
   return TOOL_META[t]?.label || t
 }
 function toolHint(t: string): string {
@@ -182,7 +189,7 @@ const hasBudget = computed(() => (props.info?.total_budget_ms ?? 0) > 0)
           <path d="M6 12a6 6 0 006 6 6 6 0 006-6M12 18v3" />
         </svg>
       </span>
-      <span class="rp-ttl">深度推理过程</span>
+      <span class="rp-ttl">{{ props.channel === 'draft' ? '起草推理过程（智能体自主收集依据）' : '深度推理过程' }}</span>
       <span v-if="endInfo || info" class="rp-count mono">
         {{ roundsText }}
         <span v-if="unlimitedRounds" class="rp-unlimited">不限轮数</span>
@@ -193,7 +200,7 @@ const hasBudget = computed(() => (props.info?.total_budget_ms ?? 0) > 0)
     <!-- ① 提问理解（"问题分析"环节：模型复述诉求 + 自述是否需要查库） -->
     <div v-if="analysis || historyUnderstanding" class="rp-understand">
       <div class="us-line">
-        <span class="us-tag">提问理解</span>
+        <span class="us-tag">{{ props.channel === 'draft' ? '需求理解' : '提问理解' }}</span>
         <span v-if="analysis" class="us-text">{{ analysis.restate }}</span>
         <span v-else class="us-text">{{ historyUnderstanding }}</span>
       </div>
