@@ -45,7 +45,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import redact_sensitive
-from app.db.models import ConfigKV, Conversation, Template
+from app.db.models import ConfigKV, Conversation, DraftReference, Template
 from app.schemas.contracts import Citation, GenerateRequest
 from app.services import conversation as conv_service
 from app.services.agent import (
@@ -63,6 +63,7 @@ from app.services.audit import record_audit
 from app.services.auth import Caller
 from app.services.generation_prompt import build_generation_messages
 from app.services.model_provider import ModelProvider
+from app.services.reference_profile import render_reference_instructions
 from app.services.retrieval import retrieve_enhanced
 from app.services.runtime_config import load_prompt_templates, load_retrieval_config
 
@@ -214,20 +215,29 @@ async def _resolve_template(
 
 
 def _build_draft_task_context(
-    req: GenerateRequest, template_name: str | None, has_history: bool
+    req: GenerateRequest,
+    template_name: str | None,
+    has_history: bool,
+    reference_note: str | None = None,
 ) -> str:
     """起草通道的任务上下文（注入 ReAct 首条决策提示）。
 
-    让智能体第 1 轮就知道三件事：这是**公文起草**任务（不是问答）、
+    让智能体第 1 轮就知道几件事：这是**公文起草**任务（不是问答）、
     目标文种是什么、finish 之后会发生什么（系统据全部材料成稿）。
     没有这段上下文，起草通道的模型容易按"回答问题"的方式收尾，
     产出大纲而不是完整公文的依据集合。
+
+    reference_note（2026-10-19 上传参考文档）：用户上传了格式模板/仿写
+    范文时的说明——格式与风格以参考文档为准，**不需要**再检索"格式范例"，
+    智能体专注于收集内容依据（主题相关规定）。
     """
     doc_type = (req.template_doc_type or "").strip()
     lines = ["【任务类型】公文起草（不是问答）。"]
     lines.append(f"【目标文种】{doc_type or '未指定，请根据主题与用途判断'}")
     if template_name:
         lines.append(f"【采用模板】{template_name}")
+    if reference_note:
+        lines.append(reference_note)
     lines.append(
         "【你的任务】收集足够的起草依据（相关规定、口径、同类文件写法）；"
         "finish 之后由系统依据全部检索材料与文种模板生成完整公文草稿。"
@@ -238,6 +248,59 @@ def _build_draft_task_context(
             "请把修改所需的新依据查全（文种与结构通常保持不变）。"
         )
     return "\n".join(lines)
+
+
+async def _load_draft_reference(
+    db: AsyncSession, req: GenerateRequest, caller: Caller | None
+) -> tuple[str, dict | None, str | None]:
+    """加载用户上传的参考文档（格式模板 / 仿写范文，2026-10-19）。
+
+    Returns:
+        (instructions, layout, note)
+        - instructions：注入成稿 system 的【参考文档要求】块（空=无参考）；
+        - layout：docx 参考的版式 dict（供导出渲染覆盖；无/非 format 模式为 None）；
+        - note：注入 ReAct 任务上下文的一句话（无则为 None）。
+
+    失败语义（SSE 响应头发出前调用，保证状态码可回）：
+    - reference_id 不存在或属于他人 → 404（不可见=不存在，与空间口径一致）；
+    - 参考文档画像解析失败 → 400（上传时已提示过，此处防绕过）。
+    """
+    ref_id = (getattr(req, "reference_id", None) or "").strip()
+    if not ref_id:
+        return "", None, None
+    row = (
+        await db.execute(
+            select(DraftReference).where(DraftReference.id == ref_id)
+        )
+    ).scalar_one_or_none()
+    if row is None or (
+        caller is not None
+        and not (
+            row.owner_type == ("user" if caller.kind == "user" else "client")
+            and row.owner_id == caller.id
+        )
+    ):
+        raise HTTPException(status_code=404, detail="参考文档不存在或无权使用")
+    if row.status != "PARSED":
+        raise HTTPException(
+            status_code=400, detail=f"参考文档解析失败：{row.error or '未知原因'}"
+        )
+    mode = (getattr(req, "reference_mode", None) or "").strip()
+    # 未显式指定模式时的默认：有版式画像→按格式，否则→仿写
+    if mode not in ("format", "imitate", "both"):
+        mode = "format" if row.profile.get("has_real_layout") else "imitate"
+    instructions = render_reference_instructions(row.profile, mode)
+    layout = (
+        row.profile.get("layout") if mode in ("format", "both") and row.profile.get("layout") else None
+    )
+    mode_label = {"format": "按该文档的模板格式生成", "imitate": "仿写该文档",
+                  "both": "按该文档格式并仿写其结构行文"}[mode]
+    note = (
+        f"【格式/风格来源】用户上传了参考文档《{row.filename}》（{mode_label}）："
+        "格式与行文风格以该参考文档为准，无需检索格式范例；"
+        "请专注收集本主题的内容依据（相关规定、口径、同类事实）。"
+    )
+    return instructions, layout, note
 
 
 def _cap_citations(citations: list[Citation], max_chars: int) -> list[Citation]:
@@ -291,6 +354,8 @@ async def _stream_draft_react(
     history: list[tuple[str, str]],
     template_name: str | None,
     intent_result=None,
+    reference_instructions: str = "",
+    reference_note: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """深度推理起草（ReAct）：智能体自主收集依据 → 依据全部材料成稿。
 
@@ -350,7 +415,9 @@ async def _stream_draft_react(
     cfg = await load_react_config(db)
     cfg = cfg.for_mode(getattr(req, "react_mode", None))
     result = ReactRunResult()
-    task_ctx = _build_draft_task_context(req, template_name, bool(history))
+    task_ctx = _build_draft_task_context(
+        req, template_name, bool(history), reference_note=reference_note
+    )
 
     # ---- 步骤计划（过程可见）：理解需求 → 多轮收集依据 → 成稿 → 脱敏 ----
     yield _sse({
@@ -444,6 +511,7 @@ async def _stream_draft_react(
             template_name=template_name,
             history=history,
             process=format_process_summary(result.rounds_log),
+            reference_instructions=reference_instructions,
         )
         yield _sse({"type": "step_start", "id": "generate", "action": "generate",
                     "query": req.query})
@@ -521,11 +589,21 @@ async def generate_answer(
     resolved_doc_type, template_name = await _resolve_template(db, req, caller)
     req.template_doc_type = resolved_doc_type
 
+    # 上传参考文档（格式模板/仿写范文）：先于任何生成动作加载，
+    # 404/400 在此处以正常状态码返回（流式同理，响应头未发出）
+    reference_instructions, _, reference_note = await _load_draft_reference(
+        db, req, caller
+    )
+
     # 深度推理开关：请求级 deep_reason > 配置中心 deep_draft_enabled（默认开）
     react_cfg = await load_react_config(db)
     deep_on = req.deep_reason if req.deep_reason is not None else react_cfg.draft_enabled
     if deep_on:
-        return await _generate_answer_react(db, req, caller, react_cfg, template_name)
+        return await _generate_answer_react(
+            db, req, caller, react_cfg, template_name,
+            reference_instructions=reference_instructions,
+            reference_note=reference_note,
+        )
 
     retrieve_resp = await retrieve_enhanced(db, req)  # type: ignore[arg-type]
     citations: list[Citation] = retrieve_resp.citations
@@ -540,6 +618,7 @@ async def generate_answer(
     messages = build_generation_messages(
         req, citations, no_materials=no_materials, templates=templates,
         template_name=template_name, history=history,
+        reference_instructions=reference_instructions,
     )
     raw = await gen.generate(messages)
     if no_materials:
@@ -562,6 +641,8 @@ async def _generate_answer_react(
     caller: Caller | None,
     react_cfg,
     template_name: str | None,
+    reference_instructions: str = "",
+    reference_note: str | None = None,
 ) -> dict:
     """非流式深度推理起草：跑完 TAO 循环后一次性成稿。
 
@@ -571,7 +652,9 @@ async def _generate_answer_react(
     cfg = react_cfg.for_mode(getattr(req, "react_mode", None))
     result = ReactRunResult()
     history = await _load_draft_history(db, req.conversation_id, req.query)
-    task_ctx = _build_draft_task_context(req, template_name, bool(history))
+    task_ctx = _build_draft_task_context(
+        req, template_name, bool(history), reference_note=reference_note
+    )
     async for _ in run_react(
         db, req, cfg, result,
         caller=caller, history=history,
@@ -590,6 +673,7 @@ async def _generate_answer_react(
         template_name=template_name,
         history=history,
         process=format_process_summary(result.rounds_log),
+        reference_instructions=reference_instructions,
     )
     raw = await gen.generate(messages, max_tokens=_DRAFT_GEN_MAX_TOKENS)
     raw += DRAFT_DISCLAIMER
@@ -655,6 +739,12 @@ async def stream_generate(
     resolved_doc_type, template_name = await _resolve_template(db, req, caller)
     req.template_doc_type = resolved_doc_type
 
+    # 上传参考文档（格式模板/仿写范文）：必须在 SSE 响应头发出前加载，
+    # 404/400 才能以正常状态码返回（流式开始后无法再改状态码）
+    reference_instructions, _, reference_note = await _load_draft_reference(
+        db, req, caller
+    )
+
     # 会话收敛：无 conversation_id 时不建会话（保持旧行为兼容）
     conversation_id = await _ensure_draft_conversation(db, req, doc_type=resolved_doc_type)
     if conversation_id:
@@ -707,6 +797,8 @@ async def stream_generate(
             history=history,
             template_name=template_name,
             intent_result=intent_result,
+            reference_instructions=reference_instructions,
+            reference_note=reference_note,
         ):
             yield chunk
         return
@@ -788,6 +880,7 @@ async def stream_generate(
         messages = build_generation_messages(
             req, citations, no_materials=no_materials, templates=templates,
             template_name=template_name, history=history,
+            reference_instructions=reference_instructions,
         )
 
         # 2) 先回传检索元数据，前端可立即渲染"参考材料"与意图标签

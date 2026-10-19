@@ -260,6 +260,18 @@ class GenerateRequest(BaseModel):
     react_mode: str | None = Field(
         None, description="深度推理档位：fast（快速）/ deep（深度）；缺省取配置中心默认档"
     )
+    # ---- 上传参考文档（2026-10-19：按模板格式生成 / 仿写）----
+    # reference_id 由 POST /v1/generate/reference 上传返回；与知识库文档
+    # 解耦（不进检索语料）。指定后可不选 template_doc_type/template_code
+    # （参考文档取代文种模板地位）；两者都传时参考文档优先。
+    reference_id: str | None = Field(
+        None, description="上传参考文档 ID（按该文档模板格式生成 / 仿写）"
+    )
+    # format=按参考文档版式生成 / imitate=仿写其结构行文 / both=两者；
+    # 缺省：docx 参考默认 format，其他格式默认 imitate。
+    reference_mode: str | None = Field(
+        None, description="参考文档用法：format（按格式）/ imitate（仿写）/ both（两者）"
+    )
     stream: bool = False
 
 
@@ -269,6 +281,25 @@ class GenerateResp(BaseModel):
     sensitive_hits: list[str] = Field(default_factory=list)
     model: str
     truncated_by_security: bool = False
+
+
+# ---- 上传参考文档（2026-10-19：按模板格式生成 / 仿写）----
+class DraftReferenceResp(BaseModel):
+    """POST /v1/generate/reference 的返回：画像摘要 + 建议默认用法。"""
+
+    reference_id: str = Field(..., description="参考文档 ID（起草请求里回传）")
+    filename: str
+    format: str = Field(..., description="嗅探判定的真实格式：docx/pdf/ofd/txt/md")
+    size_bytes: int
+    status: str = Field(..., description="PARSED=可用 / FAILED=解析失败")
+    mode_default: str = Field(
+        ..., description="建议默认用法：format（有版式画像）/ imitate（仅文本）"
+    )
+    error: str | None = Field(None, description="status=FAILED 时的失败原因")
+    profile: dict = Field(
+        default_factory=dict,
+        description="画像摘要：style_notes/outline/para_count/approx_words/has_real_layout",
+    )
 
 
 # ---- 导出（基于已生成内容，不重新生成）----
@@ -285,6 +316,10 @@ class ExportDocxRequest(BaseModel):
         description="指定导出的 assistant 消息版本；缺省取会话内最新一条 assistant 消息",
     )
     template_code: str | None = Field(None, description="版式模板 code（可选，仅影响 docx 排版）")
+    reference_id: str | None = Field(
+        None,
+        description="上传参考文档 ID（2026-10-19）：导出时按该文档版式渲染（字体/红头），仅影响排版",
+    )
 
 
 # ---- 配置中心 ----

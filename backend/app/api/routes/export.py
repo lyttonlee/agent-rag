@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import security_weight
 from app.core.security import redact_sensitive
-from app.db.models import ConfigKV, Conversation, ConversationMessage, Document, Template
+from app.db.models import ConfigKV, Conversation, ConversationMessage, Document, DraftReference, Template
 from app.db.session import get_db
 from app.schemas.contracts import ExportDocxRequest
 from app.services.auth import Caller, get_caller
@@ -81,11 +81,39 @@ async def export_docx(
     if not caller.allows_scope("chat"):
         raise HTTPException(status_code=403, detail="该客户端无 chat 能力域权限")
     template = await _load_usable_template(db, req.template_code, caller)
-    return await _run_export(req, caller, db, template)
+    # 上传参考文档版式（2026-10-19）：reference_id 优先于模板——
+    # 参考文档本来就是"这一稿的格式来源"（用户上传时选择了按格式生成）
+    reference = await _load_reference_layout(db, req.reference_id, caller)
+    return await _run_export(req, caller, db, template, reference_layout=reference)
+
+
+async def _load_reference_layout(
+    db: AsyncSession, reference_id: str | None, caller: Caller
+) -> dict | None:
+    """读取上传参考文档的版式画像（供导出渲染覆盖字体/红头）。
+
+    仅上传者本人可引用（404 防探测）；画像无版式（PDF/OFD/TXT）时返回
+    None——导出保持 GB/T 9704 默认版式（与生成时提示词口径一致）。
+    """
+    if not reference_id:
+        return None
+    row = (
+        await db.execute(
+            select(DraftReference).where(DraftReference.id == reference_id)
+        )
+    ).scalar_one_or_none()
+    if row is None or not (
+        row.owner_type == ("user" if caller.kind == "user" else "client")
+        and row.owner_id == caller.id
+    ):
+        raise HTTPException(status_code=404, detail="参考文档不存在或无权使用")
+    layout = row.profile.get("layout") if isinstance(row.profile, dict) else None
+    return layout or None
 
 
 async def _run_export(
-    req: ExportDocxRequest, caller: Caller, db: AsyncSession, template: Template | None = None
+    req: ExportDocxRequest, caller: Caller, db: AsyncSession, template: Template | None = None,
+    reference_layout: dict | None = None,
 ) -> Response:
     # 1) 定位会话
     conv = (
@@ -138,15 +166,18 @@ async def _run_export(
                 )
 
     # 4) 渲染 docx（公文版式：标题层级/字体/缩进行距/表格/落款/页码）
-    #    模板 layout 可覆盖正文字体与红头样式；缺省走 GB/T 9704 标准版式
+    #    模板 layout 可覆盖正文字体与红头样式；缺省走 GB/T 9704 标准版式。
+    #    上传参考文档（reference_id）的 layout 优先——它就是这一稿的
+    #    格式来源（与生成链路提示词口径一致，2026-10-19）。
     from app.services.docx_render import render_docx
 
+    layout = reference_layout or (template.layout if template else None)
     doc_blob = render_docx(
         title=conv.title or "公文起草",
         content=content,
         citations=[c for c in (target.citations or []) if isinstance(c, dict)],
         sensitive_hits=hits,
-        layout=(template.layout if template else None),
+        layout=layout,
     )
 
     # 直接返回内存字节流（避免临时文件落盘与并发句柄问题）

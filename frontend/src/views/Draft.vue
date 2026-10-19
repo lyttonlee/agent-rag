@@ -28,14 +28,17 @@ import {
   intentLabelOf,
   listTemplates,
   streamGenerate,
+  uploadDraftReference,
   type ConversationDetail,
   type ConversationMessage,
   type CitationPayload,
+  type DraftReferenceInfo,
   type ExportDocxRequest,
   type PlanStep,
   type ReactAnalysis,
   type ReactMode,
   type ReactRound,
+  type ReferenceMode,
   type TemplateItem,
 } from '@/api/client'
 
@@ -87,6 +90,50 @@ function syncDefaultTemplate() {
   const list = templatesByType.value[docType.value] || []
   selectedTemplate.value = list.length ? list[0].code : ''
 }
+
+// ---- 上传参考文档（2026-10-19：按模板格式生成 / 仿写）----
+/**
+ * 用户上传一份文档后：① 可按该文档的模板格式生成新文档；② 可仿写该文档；
+ * 此时无需选择已有文种/模板（参考文档取代文种模板地位，界面隐藏选择器）。
+ * 参考文档只服务当前会话的多轮修改（不清空即可持续生效）；切换/打开历史
+ * 会话时清理（参考不随会话持久化，见 clearReference）。
+ */
+const reference = ref<DraftReferenceInfo | null>(null)
+const referenceMode = ref<ReferenceMode>('format')
+const refUploading = ref(false)
+const refFileInput = ref<HTMLInputElement | null>(null)
+
+/** 选择文件 → 上传并解析画像（后端同步返回版式/结构摘要） */
+async function onReferencePicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  refUploading.value = true
+  try {
+    const info = await uploadDraftReference(file)
+    if (info.status !== 'PARSED') {
+      ElMessage.error('参考文档解析失败：' + (info.error || '未知原因'))
+      return
+    }
+    reference.value = info
+    referenceMode.value = info.mode_default // 有版式→默认按格式；纯文本→默认仿写
+    ElMessage.success(`已上传参考文档《${info.filename}》`)
+  } catch (err: any) {
+    ElMessage.error('上传失败：' + (err?.response?.data?.detail || err.message))
+  } finally {
+    refUploading.value = false
+    if (input) input.value = '' // 允许重复选同一文件
+  }
+}
+
+function clearReference() {
+  reference.value = null
+}
+
+// 参考文档切换时同步默认用法（画像变化可能改变 format/imitate 建议值）
+watch(reference, (r) => {
+  if (r) referenceMode.value = r.mode_default
+})
 let timer: number | null = null
 let controller: AbortController | null = null
 let startedAt = 0
@@ -235,6 +282,8 @@ async function openConversation(id: string) {
     reactEnd.value = null
     phase.value = null
     stopPhaseTimer()
+    // 上传的参考文档不随会话持久化：切换会话即清理（格式/仿写来源需重新上传）
+    clearReference()
   } catch (e: any) {
     ElMessage.error('加载会话失败：' + (e?.response?.data?.detail || e.message))
   } finally {
@@ -248,6 +297,7 @@ function newConversation() {
   activeTitle.value = '新会话'
   history.value = []
   answer.value = ''
+  clearReference()
 }
 
 /** 拉取会话最新消息（done / stop 后刷新历史） */
@@ -297,8 +347,10 @@ async function generate() {
   controller = streamGenerate(
     {
       query: topic.value,
-      template_doc_type: docType.value,
-      template_code: selectedTemplate.value || undefined,
+      // 参考文档在场时：不选文种/模板（参考文档即格式与结构来源）；
+      // 否则按用户选择的文种 + 具体模板起草
+      template_doc_type: reference.value ? undefined : docType.value,
+      template_code: reference.value ? undefined : (selectedTemplate.value || undefined),
       conversation_id: activeId.value ?? undefined,
       caller_scope: caller.caller_scope,
       max_clearance: caller.max_clearance,
@@ -306,6 +358,9 @@ async function generate() {
       // null = 跟随后端配置（默认深度推理起草）；false = 单趟旧链路
       deep_reason: deepOn.value,
       react_mode: reactMode.value,
+      // 上传参考文档（2026-10-19）：按格式生成 / 仿写
+      reference_id: reference.value?.reference_id ?? null,
+      reference_mode: reference.value ? referenceMode.value : null,
     },
     {
       // 步骤计划：渲染 理解需求/收集依据/成稿/脱敏 时间线（过程可见）
@@ -511,6 +566,8 @@ async function confirmExport() {
       conversation_id: activeId.value,
       message_id: selectedVersionId.value,
       template_code: selectedTemplate.value || null,
+      // 上传参考文档的版式优先（2026-10-19）：这一稿的格式来源就是它
+      reference_id: reference.value?.reference_id ?? null,
     }
     await exportDocx(payload)
     exportDialog.value = false
@@ -567,22 +624,57 @@ async function confirmExport() {
         <span class="text-muted" style="font-size: 12px">当前会话：{{ activeTitle }}</span>
       </div>
       <div class="bar">
-        <el-select v-model="docType" style="width: 120px" placeholder="文种">
-          <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
-        </el-select>
-        <el-select
-          v-model="selectedTemplate"
-          style="width: 200px"
-          placeholder="选择具体模板"
-          :disabled="!typeTemplates.length"
-        >
-          <el-option v-for="t in typeTemplates" :key="t.code" :label="t.name" :value="t.code" />
-        </el-select>
+        <!-- 上传参考文档（2026-10-19）：按该文档模板格式生成 / 仿写；
+             在场时隐藏文种/模板选择（用户可不选已有文种结构） -->
+        <el-button size="default" :loading="refUploading" @click="refFileInput?.click()">
+          上传参考文档
+        </el-button>
+        <input
+          ref="refFileInput"
+          type="file"
+          accept=".docx,.pdf,.ofd,.txt,.md"
+          style="display: none"
+          @change="onReferencePicked"
+        />
+        <template v-if="reference">
+          <el-tag size="default" type="success" closable @close="clearReference">
+            {{ reference.filename }}
+          </el-tag>
+          <el-radio-group v-model="referenceMode" size="default">
+            <el-tooltip content="按参考文档的字体/红头/版式生成，导出同样遵该版式">
+              <el-radio-button value="format">按格式</el-radio-button>
+            </el-tooltip>
+            <el-tooltip content="模仿参考文档的结构、语气与条款组织方式">
+              <el-radio-button value="imitate">仿写</el-radio-button>
+            </el-tooltip>
+            <el-tooltip content="既遵循其版式，又模仿其结构行文">
+              <el-radio-button value="both">格式+仿写</el-radio-button>
+            </el-tooltip>
+          </el-radio-group>
+          <el-tooltip placement="bottom" :content="reference.profile.style_notes || '参考文档画像'">
+            <span class="ref-note text-muted">{{ reference.profile.style_notes || '' }}</span>
+          </el-tooltip>
+        </template>
+        <template v-else>
+          <el-select v-model="docType" style="width: 120px" placeholder="文种">
+            <el-option v-for="t in ['通知','通报','报告','请示','函','纪要','决定','意见']" :key="t" :label="t" :value="t" />
+          </el-select>
+          <el-select
+            v-model="selectedTemplate"
+            style="width: 200px"
+            placeholder="选择具体模板"
+            :disabled="!typeTemplates.length"
+          >
+            <el-option v-for="t in typeTemplates" :key="t.code" :label="t.name" :value="t.code" />
+          </el-select>
+        </template>
         <el-input
           v-model="topic"
-          :placeholder="deepOn !== false
-            ? '起草主题 / 修改意见（智能体将自主收集依据，Enter 发送）'
-            : '起草主题 / 修改意见（如：语气更严厉）'"
+          :placeholder="reference
+            ? '起草主题 / 修改意见（将按参考文档格式生成，Enter 发送）'
+            : deepOn !== false
+              ? '起草主题 / 修改意见（智能体将自主收集依据，Enter 发送）'
+              : '起草主题 / 修改意见（如：语气更严厉）'"
           style="flex: 1"
           @keyup.enter="generate"
         />
@@ -690,7 +782,10 @@ async function confirmExport() {
 .pad { padding: 16px; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 .ttl { font-size: 18px; color: var(--text-strong); }
-.bar { display: flex; gap: 10px; margin-bottom: 14px; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; align-items: center; }
+/* 参考文档画像摘要：单行省略，避免撑破工具栏 */
+.ref-note { max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 12px; cursor: help; }
 .stream-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; font-size: 13px; }
 .live { display: inline-flex; align-items: center; gap: 6px; color: var(--c-success); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-success); animation: pulse 1.2s infinite; }

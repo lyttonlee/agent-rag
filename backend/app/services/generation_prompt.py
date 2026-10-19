@@ -96,6 +96,7 @@ def build_generation_messages(
     template_name: str | None = None,
     history: list[tuple[str, str]] | None = None,
     process: str = "",
+    reference_instructions: str = "",
 ) -> list[dict]:
     """构造公文起草 messages。
 
@@ -117,6 +118,9 @@ def build_generation_messages(
             智能体在循环里自主收集了哪些依据、为什么收尾，透传给成稿模型，
             让它知道"我的同事已经查过什么"，避免重复劳动与依据遗漏；
             单趟链路传空串（不影响旧行为）。
+        reference_instructions: 上传参考文档的指令块（2026-10-19，由
+            services/reference_profile.render_reference_instructions 预渲染）：
+            按参考文档的模板格式生成和/或仿写其结构行文；空串=无参考文档。
     """
     system = _pick(
         templates,
@@ -132,6 +136,16 @@ def build_generation_messages(
     # 多轮修改：有历史（往轮草稿）时追加修订规则（独立于可配置模板）
     if history:
         system += _DRAFT_REVISION_RULE
+    # 上传参考文档（2026-10-19）：按参考文档的模板格式生成 / 仿写。
+    # 指令由 services/reference_profile.render_reference_instructions 预渲染，
+    # 此处只做拼装——提示词模块不依赖画像结构，便于单测与后续调整措辞。
+    reference_block = (
+        f"\n【参考文档要求】\n{reference_instructions}\n"
+        if (reference_instructions or "").strip()
+        else ""
+    )
+    if reference_block:
+        system += reference_block
 
     messages: list[dict] = [{"role": "system", "content": system}]
     # 历史轮次（assistant=往轮草稿放宽截断，user=修改意见从紧，见常量注释）

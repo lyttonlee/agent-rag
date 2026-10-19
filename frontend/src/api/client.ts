@@ -377,6 +377,8 @@ export interface ExportDocxRequest {
   conversation_id: string
   message_id?: string | null
   template_code?: string | null
+  /** 上传参考文档 ID（2026-10-19）：按该文档版式渲染 docx（字体/红头） */
+  reference_id?: string | null
 }
 
 /** 导出某一轮已生成的起草内容为 docx（按 conversation_id + message_id 定位）。 */
@@ -460,6 +462,38 @@ export async function uploadDocument(file: File, meta: UploadMeta): Promise<Inge
     if (v !== undefined && v !== null) form.append(k, String(v))
   })
   const r = await client.post<IngestionJob>('/documents/upload', form)
+  return r.data
+}
+
+// ---- 上传参考文档（2026-10-19：按模板格式生成 / 仿写）----
+
+/** 参考文档用法：按格式 / 仿写 / 两者 */
+export type ReferenceMode = 'format' | 'imitate' | 'both'
+
+/** 参考文档画像摘要（上传接口返回） */
+export interface DraftReferenceInfo {
+  reference_id: string
+  filename: string
+  format: string
+  size_bytes: number
+  status: 'PARSED' | 'FAILED'
+  /** 建议默认用法：有版式画像→format，仅文本→imitate */
+  mode_default: ReferenceMode
+  error?: string | null
+  profile: {
+    style_notes: string
+    outline: { level: number; text: string }[]
+    para_count: number
+    approx_words: number
+    has_real_layout: boolean
+  }
+}
+
+/** 上传起草参考文档（DOCX/PDF/OFD/TXT/MD，≤20MB），同步返回画像。 */
+export async function uploadDraftReference(file: File): Promise<DraftReferenceInfo> {
+  const form = new FormData()
+  form.append('file', file)
+  const r = await client.post<DraftReferenceInfo>('/generate/reference', form)
   return r.data
 }
 
@@ -640,6 +674,10 @@ export interface StreamGenerateOpts {
   deep_reason?: boolean | null
   /** 深度推理档位（仅 deep_reason 生效时使用；轮数不限，档位只影响召回广度） */
   react_mode?: ReactMode | null
+  /** 上传参考文档 ID（2026-10-19）：按该文档模板格式生成 / 仿写；此时可不选文种模板 */
+  reference_id?: string | null
+  /** 参考文档用法：format=按格式 / imitate=仿写 / both=两者；缺省按文档类型自动选 */
+  reference_mode?: ReferenceMode | null
 }
 
 /**
@@ -673,6 +711,9 @@ export function streamGenerate(opts: StreamGenerateOpts, handlers: StreamHandler
           // false=单趟旧链路；档位仅影响召回广度（轮数默认不限）
           deep_reason: opts.deep_reason ?? null,
           react_mode: opts.react_mode ?? null,
+          // 上传参考文档（2026-10-19）：按格式/仿写；参考在场时文种模板可缺省
+          reference_id: opts.reference_id ?? null,
+          reference_mode: opts.reference_mode ?? null,
         }),
         signal: controller.signal,
       })

@@ -228,6 +228,49 @@ class Template(Base, TimestampMixin):
     )
 
 
+class DraftReference(Base, TimestampMixin):
+    """起草参考文档（用户上传的「格式模板」与「仿写范文」，2026-10-19）。
+
+    与知识库文档（Document）**解耦**：参考文档只服务于起草这一件事，
+    不切分、不向量化、不进检索语料——避免把"参考格式的一次性文件"
+    变成检索噪音（用户 2026-10-19 需求：上传文档按模板格式生成/仿写）。
+
+    画像（profile JSON）由 services/reference_profile.py 解析：
+    - layout：docx 才有的版式画像（字体/字号/对齐/边距/红头），
+      供成稿提示词与导出渲染共用；
+    - outline / opening / closing / excerpt / style_notes：所有格式都有，
+      仿写模式据此模仿结构、语气与组织方式。
+
+    所有权（与空间/模板一致）：仅上传者本人（user）或其第三方客户端
+    （client）可引用；他人 reference_id → 404（不暴露存在性）。
+    """
+
+    __tablename__ = "draft_references"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    filename: Mapped[str] = mapped_column(String(512))
+    # 规范化格式：docx/pdf/ofd/txt/md（嗅探判定，不信任扩展名）
+    format: Mapped[str] = mapped_column(String(16), index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    # 原文对象键（存储抽象层，references/{id}.{ext}）
+    storage_key: Mapped[str] = mapped_column(String(512))
+    # 解析画像（layout/outline/excerpt/style_notes/para_count/approx_words…）
+    profile: Mapped[dict] = mapped_column(JSON, default=dict)
+    # PARSED=画像就绪可用；FAILED=解析失败（error 有原因，不可引用）
+    status: Mapped[str] = mapped_column(String(16), default="PARSED", index=True)
+    error: Mapped[str | None] = mapped_column(String(512))
+    # ---- 所有权（与 DocumentSpace/Template 同一套语义）----
+    owner_type: Mapped[str] = mapped_column(
+        String(16), default="user", server_default="user", index=True
+    )
+    owner_id: Mapped[str | None] = mapped_column(String(48), index=True)
+    owner_name: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        Index("ix_draft_references_owner", "owner_type", "owner_id"),
+    )
+
+
 class ConfigKV(Base, TimestampMixin):
     """配置中心 KV（敏感词、格式适配器、模型 Profile 等）。"""
 
