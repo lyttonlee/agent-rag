@@ -17,13 +17,16 @@
   兜底 + 末尾 AI 声明），引擎不做拒答判断。
 - **多轮上下文**：会话历史注入决策历史，模型能理解"它""上一步说的"等指代。
 
-护栏（防模型决策退化，任何一条触发即收敛，循环不可能无限悬空）：
-1. 轮数上限（档位决定 fast=2 / deep=5）；
-2. 全局时间预算（fast=60s / deep=180s，含理解/决策/检索全程）；
+护栏（防模型决策退化，任何一条触发即收敛）：
+1. 轮数上限：**默认不限**（``cfg.max_rounds=0``，2026-10-19 用户要求）；
+   运维可设正数作为硬闸，仅在"模型持续空转"的极端场景下兜底；
+2. 全局时间预算：**默认不限**（``cfg.budget_ms=0``），可按需设上限；
 3. 决策调用失败：连续 2 次退出（第 1 次注入重试提示继续）；
 4. 决策输出不可解析：连续 2 次退出（第 1 次回灌纠错提示）；
 5. query 去重：归一化相同的检索跳过真实工具调用（观察标注跳过）；
-6. 无进展收敛：连续 2 轮无新引用时注入提示（引导换角度或收尾，**不是拒答**）；
+6. **无进展强制收尾**：连续 ``cfg.no_progress_limit`` 轮无新引用 → 收尾
+   （先在第 N-1 轮注入"换角度或收尾"提示，再触发退出）。这是取消轮数
+   上限后**替代性的收敛保障**——不限轮 ≠ 允许无限空转；
 7. 未知工具：不执行，观察提示可用工具清单。
 """
 
@@ -62,14 +65,13 @@ logger = logging.getLogger(__name__)
 
 # 连续失败容忍上限（决策调用 / JSON 解析各自计数）
 _MAX_CONSECUTIVE_FAIL = 2
-# 连续无新引用的收敛提示阈值
-_NO_PROGRESS_LIMIT = 2
 
 # 停止原因 → 中文标签（SSE react_end 与落库 trace 共用）
 STOP_REASON_LABELS: dict[str, str] = {
     "final": "信息充分（模型主动结束）",
     "max_rounds": "达到轮数上限",
     "budget": "超出时间预算",
+    "no_progress": "连续多轮无新材料，已强制收尾",
     "parse_fail": "决策输出连续不可解析",
     "decision_fail": "决策调用连续失败",
 }
@@ -91,7 +93,9 @@ class ReactRunResult:
 
     citations: list[Citation] = field(default_factory=list)  # 全轮合并去重后的引用
     rounds: int = 0
-    stop_reason: str = "max_rounds"
+    # 默认 final：不限轮数（V1.2 起）时正常出口是模型主动 finish，
+    # 只有运维显式设了轮数硬闸才可能是 max_rounds。
+    stop_reason: str = "final"
     analysis: AnalysisResult = field(default_factory=AnalysisResult)
     rounds_log: list[dict] = field(default_factory=list)     # 每轮结构化记录（trace/前端回放）
     trace_text: str = ""                                      # TAO 全链文本（随消息落库）
@@ -143,8 +147,6 @@ async def run_react(
     db: AsyncSession,
     req,
     cfg: ReactConfig,
-    max_rounds: int,
-    budget_ms: int,
     result: ReactRunResult,
     caller=None,
     history: list[tuple[str, str]] | None = None,
@@ -154,15 +156,18 @@ async def run_react(
     Args:
         db: 数据库会话（工具执行用）。
         req: 问答请求（读取 space_ids/doc_types/caller_scope/max_clearance）。
-        cfg: 深度推理配置。
-        max_rounds: 本轮问答的轮数上限（按档位解析）。
-        budget_ms: 本轮问答的全局时间预算（毫秒）。
+        cfg: **已按档位派生**的生效配置（调用方先做 ``cfg.for_mode(mode)``），
+            其中 ``max_rounds=0`` 表示不限轮数、``budget_ms=0`` 表示不限时长。
         result: 结论收集器（调用方持有引用）。
         caller: 调用方（doc_lookup/read_document 空间可见性用；可为 None）。
         history: 会话历史 [(role, content)]，注入决策上下文支持多轮追问。
     """
     started = time.monotonic()
     gen = ModelProvider(role="gen")
+    # 轮数策略：0 = 不限（默认）。这里只做展示/文本注入，不做硬性判断，
+    # 真正的硬闸在循环里用 `max_rounds > 0` 判断——0 是"不限"而非"零轮"。
+    max_rounds = cfg.max_rounds
+    budget_ms = cfg.budget_ms
 
     # ---- 阶段播报（2026-10-16 新增，解决"页面像卡住了"）----
     # 背景：模型每次调用（理解/决策/生成）要 2-4 秒，此前这段完全静默——
@@ -173,6 +178,8 @@ async def run_react(
         "type": "react_start",
         "mode": "react",
         "max_rounds": max_rounds,
+        # 显式标记"不限轮数"，避免前端把 0 显示成"0 轮"
+        "unlimited_rounds": max_rounds <= 0,
         "total_budget_ms": budget_ms,
         "tools": tool_names(),
     }
@@ -181,12 +188,13 @@ async def run_react(
     # ---- 提问理解（轻量一次调用；**失败不阻断**，仅少一段参考）----
     # 注意：此处不做任何"单跳/多跳"路由，仅让模型复述诉求并自述是否需要
     # 查库，结果注入决策历史供参考——动作决定权仍在每轮决策里。
+    # 提示词可被配置中心整段覆盖（cfg.prompt_understand，空=内置默认）。
     analysis = AnalysisResult()
     try:
         raw = await asyncio.wait_for(
             gen.generate(
                 [
-                    {"role": "system", "content": _UNDERSTAND_SYSTEM},
+                    {"role": "system", "content": (cfg.prompt_understand or "").strip() or _UNDERSTAND_SYSTEM},
                     {"role": "user", "content": req.query[:500]},
                 ],
                 temperature=0,
@@ -195,6 +203,7 @@ async def run_react(
             ),
             timeout=cfg.analyze_timeout_ms / 1000,
         )
+
         parsed = parse_analysis(raw)
         if parsed is not None:
             analysis = parsed
@@ -223,24 +232,44 @@ async def run_react(
                   "你可以选择 knowledge_search / doc_lookup / read_document，" \
                   "也可以判断无需查库直接 finish。"
     history_msgs: list[dict] = [
-        {"role": "system", "content": build_decision_system(max_rounds, tool_lines())},
+        {
+            "role": "system",
+            "content": build_decision_system(max_rounds, tool_lines(), cfg.prompt_decision),
+        },
         {"role": "user", "content": first_hint},
     ]
     seen_queries: set[str] = set()
     parse_fail = 0
     decision_fail = 0
     no_progress = 0
-    result.stop_reason = "max_rounds"
+    # 默认停止原因：只有设置了轮数硬上限时才可能是 max_rounds，
+    # 不限轮数时正常退出路径是 final / no_progress / *_fail。
+    result.stop_reason = "final"
 
-    for round_no in range(1, max_rounds + 1):
+    # ---- TAO 主循环：**不限轮数**（默认），由模型自主决定何时 finish ----
+    # 用 while 而非 for range：``max_rounds=0`` 是"不限"的意思，不能被
+    # range(1, 1) 误判成 0 轮直接退出。硬上限仅在运维显式设置正数时生效。
+    round_no = 0
+    while True:
+        round_no += 1
+        if max_rounds and max_rounds > 0 and round_no > max_rounds:
+            result.stop_reason = "max_rounds"
+            logger.info("ReAct 达到轮数上限 %d，收敛", max_rounds)
+            break
         result.rounds = round_no
         round_started = time.monotonic()
-        # 预算闸口：每轮进入前检查，超预算立即收敛（预算含理解/决策/检索全程）
-        if (time.monotonic() - started) * 1000 > budget_ms:
+        # 预算闸口：每轮进入前检查（**仅在设置了预算时**；默认不限）
+        if budget_ms and budget_ms > 0 and (time.monotonic() - started) * 1000 > budget_ms:
             result.stop_reason = "budget"
             logger.info("ReAct 预算耗尽（%.0fms>%dms），收敛", (time.monotonic() - started) * 1000, budget_ms)
             break
-        yield {"type": "react_round", "round": round_no, "max_rounds": max_rounds}
+        yield {
+            "type": "react_round",
+            "round": round_no,
+            "max_rounds": max_rounds,
+            "unlimited_rounds": max_rounds <= 0,
+        }
+
         # 阶段播报：本轮模型正在推理决策（这段通常 1-4 秒，此前页面无任何提示）
         yield {
             "type": "phase", "phase": "decide", "round": round_no,
@@ -417,17 +446,25 @@ async def run_react(
                 "elapsed_ms": elapsed_ms,
             })
 
-        # ---- 无进展收敛提示：连续两轮没有新引用。
-        # 注意措辞：**引导换角度或基于通用知识收尾完成作答，不是劝退拒答**。
-        if no_progress >= _NO_PROGRESS_LIMIT:
+        # ---- 无进展收敛：取消轮数上限后，这是防止"无限空转"的主要保障。
+        # 语义分层（重要）：
+        #   - 达到 limit-1 轮：注入一次"换角度或收尾"提示（给模型纠偏机会）；
+        #   - 达到 limit 轮：**强制收尾**（stop_reason=no_progress），进入最终生成。
+        # 措辞红线：引导换角度或基于通用知识**完成作答**，不是劝退拒答。
+        limit = max(2, cfg.no_progress_limit)
+        if no_progress >= limit:
+            result.stop_reason = "no_progress"
+            logger.info("ReAct 连续 %d 轮无新引用，强制收尾", no_progress)
+            break
+        if no_progress >= limit - 1:
             history_msgs.append({
                 "role": "user",
-                "content": "[系统提示] 已连续两轮未获得新材料。请二选一："
+                "content": "[系统提示] 已连续多轮未获得新材料。请二选一："
                 "① 更换关键词/换角度再做最后一次尝试；"
                 "② 基于已有材料与通用公文知识 finish 完成作答"
                 "（**必须完成任务，不要拒答**）。",
             })
-            no_progress = 0  # 只提示一次，避免每轮重复打扰
+
 
     stop_label = STOP_REASON_LABELS.get(result.stop_reason, result.stop_reason)
     yield {

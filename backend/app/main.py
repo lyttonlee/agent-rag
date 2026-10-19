@@ -111,8 +111,9 @@ async def lifespan(app: FastAPI):
             logger.info("配置中心种子：新增 %d 项默认检索配置", added)
     except Exception as exc:
         logger.warning("配置中心种子失败：%s", exc)
-    # 深度推理（ReAct）配置种子：与检索配置同款语义（幂等、不覆盖已改值），
-    # 默认全开 + 双档位（fast 2轮/60s、deep 5轮/180s，用户 2026-10-16 确认）
+    # 深度推理（ReAct）配置种子：与检索配置同款语义（幂等、不覆盖已改值）。
+    # 默认全开；**轮数/时长默认不限**（2026-10-19 用户要求），
+    # 收敛由 no_progress 护栏保证；档位只影响检索广度。
     try:
         from app.services.agent.react_config import ensure_react_configs
 

@@ -25,6 +25,12 @@
 - Thought 是**显式结构化文本**（模型自主产出），前端逐轮展示——这是
   "完整推理思维链可见"的载体，与模型隐式 reasoning_content 无关。
 - prompt 里所有数值（轮数）由调用方注入，配置化不散落。
+- **2026-10-19**：轮数上限默认取消（``max_rounds=0`` 表示不限），
+  决策提示词里的收尾规则改写为"不设轮数上限，由你判断何时信息足够"；
+  三类提示词（理解/决策/最终生成）支持配置中心整段覆盖，覆盖文本中
+  仍可用 `{tool_lines}` / `{max_rounds}` / `{round_rule}` / `{material_rule}`
+  占位符由引擎注入（用 str.replace 而非 format，避免提示词内的 JSON
+  花括号触发 KeyError）。
 """
 
 from __future__ import annotations
@@ -56,6 +62,17 @@ UNDERSTAND_SYSTEM = (
 )
 
 # ---- 决策 system prompt（TAO 循环每轮）----
+# 收尾规则单独抽成一段，便于"不限轮数"与"有硬上限"两种形态复用。
+# 注意：{round_rule} 由 build_decision_system 注入，覆盖提示词里也可引用。
+DECISION_ROUND_RULE_LIMITED = (
+    "6. 信息足够就 finish，不要为问而问；本轮上限 {max_rounds} 轮。"
+)
+DECISION_ROUND_RULE_UNLIMITED = (
+    "6. 信息足够就 finish，不要为问而问。**不设轮数上限**——需要几轮就做几轮，"
+    "但禁止机械重复同一检索；若已连续多轮没有新材料，请换角度或直接基于现有"
+    "材料 finish 完成任务（不得拒答）。"
+)
+
 DECISION_SYSTEM_TMPL = (
     "你是企业公文知识库的「深度推理问答」智能体。你通过多轮调用工具收集证据，最后给出有依据的回答。\n"
     "每一轮你只能输出一个 JSON 对象，不得输出任何其他文字，三种形态：\n"
@@ -74,8 +91,9 @@ DECISION_SYSTEM_TMPL = (
     "4. 观察结果为空或不相关时，更换关键词或换角度重试，禁止原样重复；\n"
     "5. **任何情况下都不要放弃任务**：即使始终查不到材料，也必须基于通用知识"
     "完成任务并说明依据不足，最后由系统统一附加「AI 生成，请人工鉴别」声明；\n"
-    "6. 信息足够就 finish，不要为问而问；本轮上限 {max_rounds} 轮。"
+    "{round_rule}"
 )
+
 
 
 @dataclass
@@ -121,9 +139,52 @@ class Decision:
     query: str
 
 
-def build_decision_system(max_rounds: int, tool_lines: str) -> str:
-    """组装决策 system prompt（工具清单与轮数由配置注入）。"""
-    return DECISION_SYSTEM_TMPL.format(tool_lines=tool_lines, max_rounds=max_rounds)
+def _round_rule(max_rounds: int) -> str:
+    """收尾规则文本：``max_rounds <= 0`` 即不限轮数（默认形态）。"""
+    if max_rounds and max_rounds > 0:
+        return DECISION_ROUND_RULE_LIMITED.replace("{max_rounds}", str(max_rounds))
+    return DECISION_ROUND_RULE_UNLIMITED
+
+
+def _inject(template: str, variables: dict[str, str]) -> str:
+    """把运行时变量注入提示词（str.replace，不用 format）。
+
+    为什么不用 ``str.format``：提示词正文里含大量 JSON 花括号
+    （``{"thought": ...}``），format 会把它们当占位符并抛 KeyError。
+    replace 只认我们显式列出的 token，未识别的花括号原样保留。
+    """
+    text = template
+    for name, value in variables.items():
+        text = text.replace("{" + name + "}", value)
+    return text
+
+
+def build_decision_system(max_rounds: int, tool_lines: str, override: str = "") -> str:
+    """组装决策 system prompt（工具清单与收尾规则由配置注入）。
+
+    Args:
+        max_rounds: 轮数硬上限；``0`` 表示不限轮数（默认）。
+        tool_lines: 工具契约文本（由 react_tools.tool_lines() 生成）。
+        override: 配置中心的自定义提示词；非空则整段替换默认模板，
+            并注入 `{tool_lines}` / `{max_rounds}` / `{round_rule}` 三个变量。
+
+    Returns:
+        最终注入模型的 system 文本。
+    """
+    variables = {
+        "tool_lines": tool_lines,
+        "max_rounds": str(max_rounds) if max_rounds and max_rounds > 0 else "不限",
+        "round_rule": _round_rule(max_rounds),
+    }
+    if (override or "").strip():
+        text = _inject(override.strip(), variables)
+        # 自定义提示词若没引用 {tool_lines}，补一份工具清单——否则模型不知道
+        # 可用工具（这是自定义提示词最容易漏的一处，宁可重复也不缺）。
+        if "{tool_lines}" not in override and tool_lines not in text:
+            text = f"{text}\n\n可用工具：\n{tool_lines}"
+        return text
+    return _inject(DECISION_SYSTEM_TMPL, variables)
+
 
 
 def _extract_json_object(raw: str) -> dict | None:
@@ -282,39 +343,66 @@ def build_trace_text(*, analysis: AnalysisResult, rounds_log: list[dict], stop_r
     return "\n".join(lines)
 
 
+def _material_rule(has_material: bool) -> str:
+    """最终生成的材料使用规则（有材料/无材料两条分支）。
+
+    无材料分支是"不拒答"红线的落点：必须完成回答 + 标注依据不足，
+    而不是甩一句"无法回答"。
+    """
+    if has_material:
+        return (
+            "1. 事实性陈述必须标注引用 [n]（对应材料序号）；\n"
+            "2. 材料相互矛盾时并列指出，并说明通常以更新发布的规定/上级规定为准；\n"
+            "3. 材料未覆盖的内容注明「依据不足」，可以结合通用公文知识补全并说明；\n"
+        )
+    return (
+        "1. **本次未检索到可引用的知识库材料**。你必须基于自身通用公文知识"
+        "**完成对用户诉求的完整回答**，不得拒答、不得只回一句「无法回答」；\n"
+        "2. 对无法确认的部分明确标注「以下为通用规范建议，知识库暂无对应规定，"
+        "请以实际收到的正式文件为准」；\n"
+    )
+
+
+def build_final_system(has_material: bool) -> str:
+    """最终生成的 system prompt（默认形态，可被配置中心整段覆盖）。"""
+    return (
+        "你是企业公文知识库的深度推理问答助手。以下【引用材料】"
+        + ("来自多轮检索综合，" if has_material else "本次为空，")
+        + "请完成对用户诉求的回答，并遵守：\n"
+        + _material_rule(has_material)
+        + "4. 结合对话历史理解用户指代，保持上下文连贯；\n"
+        + "5. 结构清晰、结论明确、直接给出可执行结果，不要反问用户；\n"
+        + "6. 系统会在你的回答末尾统一附加「AI 生成，请人工鉴别」声明，你无需自己写。"
+    )
+
+
 def build_final_messages(
     query: str,
     history: list[tuple[str, str]],
     citations: list[Citation],
     rounds_log: list[dict],
+    system_override: str = "",
 ) -> list[dict]:
     """最终生成 messages：多轮材料综合 + 交叉验证 + 全局引用编号。
 
     citations 已由策略层按相关度去重排序并重编号 [1..N]。
+
+    Args:
+        system_override: 配置中心的自定义最终生成提示词；非空时整段替换，
+            支持 `{material_rule}` 占位符（按有无材料自动注入对应规则）。
+            注意：覆盖后"不拒答/AI 声明"等约束由运维自行保证。
     """
     has_material = bool(citations)
-    if has_material:
-        material_rule = (
-            "1. 事实性陈述必须标注引用 [n]（对应材料序号）；\n"
-            "2. 材料相互矛盾时并列指出，并说明通常以更新发布的规定/上级规定为准；\n"
-            "3. 材料未覆盖的内容注明「依据不足」，可以结合通用公文知识补全并说明；\n"
+    if (system_override or "").strip():
+        system = _inject(
+            system_override.strip(),
+            {
+                "material_rule": _material_rule(has_material),
+                "has_material": "有" if has_material else "无",
+            },
         )
     else:
-        material_rule = (
-            "1. **本次未检索到可引用的知识库材料**。你必须基于自身通用公文知识"
-            "**完成对用户诉求的完整回答**，不得拒答、不得只回一句「无法回答」；\n"
-            "2. 对无法确认的部分明确标注「以下为通用规范建议，知识库暂无对应规定，"
-            "请以实际收到的正式文件为准」；\n"
-        )
-    system = (
-        "你是企业公文知识库的深度推理问答助手。以下【引用材料】"
-        + ("来自多轮检索综合，" if has_material else "本次为空，")
-        + "请完成对用户诉求的回答，并遵守：\n"
-        + material_rule
-        + "4. 结合对话历史理解用户指代，保持上下文连贯；\n"
-        + "5. 结构清晰、结论明确、直接给出可执行结果，不要反问用户；\n"
-        + "6. 系统会在你的回答末尾统一附加「AI 生成，请人工鉴别」声明，你无需自己写。"
-    )
+        system = build_final_system(has_material)
     messages: list[dict] = [{"role": "system", "content": system}]
     for role, content in history:
         messages.append({"role": role, "content": content[:2000]})
@@ -332,48 +420,107 @@ def build_final_messages(
     return messages
 
 
-# ---- 提示词导出（前端「提示词管理」面板数据源）----
-def export_prompts(tool_lines: str, max_rounds: int) -> list[dict]:
-    """导出各阶段提示词全文，供前端提示词管理面板查看/复制。
 
-    运维在配置中心或本面板核对"模型到底被怎么指示的"，无需翻代码。
-    返回 [{key, name, stage, content, variables}]。
+# ---- 提示词导出（前端「提示词管理」面板数据源）----
+# 观察消息模板（工具结果 → 决策上下文）。它是**格式化逻辑**（format_observation），
+# 不是可整段替换的提示词，因此只读展示，避免运维改坏结构导致模型解析失败。
+OBSERVATION_TEMPLATE_PREVIEW = (
+    '[观察] 工具 {tool}，查询 "{query}"，命中 {n} 条：\n'
+    "[1] 《标题》（文号）片段…\n"
+    "质量信号：向量距离 …，关键词命中 …，top1 相关度 …\n"
+    "提示：…（命中为空时会追加「换角度重试或基于通用知识 finish」的提醒）"
+)
+
+
+def export_prompts(
+    tool_lines: str,
+    max_rounds: int,
+    prompts: dict[str, str] | None = None,
+) -> list[dict]:
+    """导出各阶段提示词全文，供前端提示词管理面板查看/编辑/复制。
+
+    返回的是**运行时实际生效的那份**（默认模板 + 已注入工具清单与收尾规则，
+    或配置中心的自定义覆盖），因此面板所见与模型实际收到的一致。
+
+    Args:
+        tool_lines: 工具契约文本。
+        max_rounds: 轮数硬上限；``0`` 表示不限（面板显示"不限"）。
+        prompts: 配置中心的三段覆盖值，键为 ``PROMPT_KEYS``；
+            缺省/空字符串表示使用默认。
+
+    Returns:
+        列表项字段：
+        - ``key`` 配置键（保存时用）
+        - ``name`` 中文名
+        - ``stage`` 触发时机说明
+        - ``content`` 当前生效全文
+        - ``default_content`` 代码内置默认全文（供"恢复默认"预览/对比）
+        - ``variables`` 可用的运行时占位符
+        - ``source`` ``custom``（已自定义）/ ``default``（内置默认）/ ``builtin``（只读）
+        - ``editable`` 是否允许在面板编辑保存
     """
+    p = prompts or {}
+
+    def _item(
+        *, key: str, name: str, stage: str, default: str, override: str,
+        variables: list[str], editable: bool = True, effective: str | None = None,
+    ) -> dict:
+        custom = bool((override or "").strip())
+        # effective 用于"覆盖文本需要注入运行时变量"的场景（如决策提示词）：
+        # 面板必须显示**真正发给模型的那份**，否则会与实跑不一致。
+        content = effective if effective is not None else (override.strip() if custom else default)
+        return {
+            "key": key,
+            "name": name,
+            "stage": stage,
+            "content": content,
+            "default_content": default,
+            "variables": variables,
+            "source": ("custom" if custom else "default") if editable else "builtin",
+            "editable": editable,
+        }
+
+    round_label = f"{max_rounds} 轮" if max_rounds and max_rounds > 0 else "不限轮数"
+    decision_default = build_decision_system(max_rounds, tool_lines)
+    decision_effective = build_decision_system(
+        max_rounds, tool_lines, p.get("deep_prompt_decision", "")
+    )
     return [
-        {
-            "key": "deep_prompt_understand",
-            "name": "提问理解",
-            "stage": "理解阶段（每轮问答 1 次，temperature=0）",
-            "content": UNDERSTAND_SYSTEM,
-            "variables": [],
-        },
-        {
-            "key": "deep_prompt_decision",
-            "name": "推理决策（TAO 每轮）",
-            "stage": f"决策阶段（每轮 1 次，当前档位上限 {max_rounds} 轮）",
-            "content": build_decision_system(max_rounds, tool_lines),
-            "variables": ["{tool_lines}", "{max_rounds}"],
-        },
-        {
-            "key": "deep_prompt_observation",
-            "name": "观察结果格式",
-            "stage": "工具执行后回灌给模型的观察消息模板",
-            "content": (
-                '[观察] 工具 {tool}，查询 "{query}"，命中 {n} 条：\n'
-                "[i] 《标题》（文号）片段…\n质量信号：…\n提示：…"
-            ),
-            "variables": ["{tool}", "{query}", "{n}"],
-        },
-        {
-            "key": "deep_prompt_final",
-            "name": "最终答案生成",
-            "stage": "循环结束后综合全部材料生成答案（无材料时走通用知识兜底）",
-            "content": (
-                "你是企业公文知识库的深度推理问答助手……\n"
-                "1. 有材料：事实性陈述必须标注引用 [n]；\n"
-                "2. 无材料：基于通用公文知识完成回答，不得拒答，标注「知识库暂无对应规定」；\n"
-                "6. 系统会在末尾统一附加「AI 生成，请人工鉴别」声明。"
-            ),
-            "variables": [],
-        },
+        _item(
+            key="deep_prompt_understand",
+            name="提问理解",
+            stage="理解阶段（每次问答 1 次，temperature=0；失败不阻断循环）",
+            default=UNDERSTAND_SYSTEM,
+            override=p.get("deep_prompt_understand", ""),
+            variables=[],
+        ),
+        _item(
+            key="deep_prompt_decision",
+            name="推理决策（TAO 每轮）",
+            stage=f"决策阶段（每轮 1 次；轮数策略：{round_label}）",
+            default=decision_default,
+            override=p.get("deep_prompt_decision", ""),
+            variables=["{tool_lines}", "{max_rounds}", "{round_rule}"],
+            effective=decision_effective,
+        ),
+
+        _item(
+            key="deep_prompt_final",
+            name="最终答案生成",
+            stage="循环结束后综合全部材料生成答案（无材料时走通用知识兜底）",
+            default=build_final_system(has_material=True) + "\n\n"
+                    "【无材料分支替换为】\n" + _material_rule(False),
+            override=p.get("deep_prompt_final", ""),
+            variables=["{material_rule}", "{has_material}"],
+        ),
+        _item(
+            key="deep_prompt_observation",
+            name="观察结果格式（只读）",
+            stage="工具执行后回灌给模型的观察消息模板（结构化逻辑，不建议改）",
+            default=OBSERVATION_TEMPLATE_PREVIEW,
+            override="",
+            variables=["{tool}", "{query}", "{n}"],
+            editable=False,
+        ),
     ]
+

@@ -334,13 +334,15 @@ async def _run_react(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
     - **多轮上下文**：会话历史注入决策上下文（引擎 history 参数）。
     """
     cfg = await load_react_config(ctx.db)
-    # 档位解析：请求级 react_mode > 配置中心默认档（fast/deep → 轮数/预算）
-    max_rounds, budget_ms = cfg.for_mode(getattr(ctx.req, "react_mode", None))
+    # 档位解析：请求级 react_mode > 配置中心默认档。
+    # 2026-10-19 起档位只影响**检索广度**，轮数/时长默认都不设上限
+    # （cfg.max_rounds=0 / cfg.budget_ms=0），由模型自主决定何时收尾。
+    cfg = cfg.for_mode(getattr(ctx.req, "react_mode", None))
     result = ReactRunResult()
 
     # TAO 主循环：SSE 事件原样透传，结论（引用/轮数/trace）写入 result
     async for evt in run_react(
-        ctx.db, ctx.req, cfg, max_rounds, budget_ms, result,
+        ctx.db, ctx.req, cfg, result,
         caller=ctx.caller, history=ctx.history,
     ):
         yield _sse(evt)
@@ -366,7 +368,11 @@ async def _run_react(ctx: _ChatCtx) -> AsyncGenerator[str, None]:
         "type": "phase", "phase": "answer",
         "label": "正在综合全部材料组织答案…",
     })
-    messages = build_react_final_messages(ctx.req.query, ctx.history, ctx.citations, result.rounds_log)
+    messages = build_react_final_messages(
+        ctx.req.query, ctx.history, ctx.citations, result.rounds_log,
+        # 提示词可配置：配置中心覆盖 deep_prompt_final 时整段替换（空=内置默认）
+        system_override=cfg.prompt_final,
+    )
     async for evt in _stream_model(ctx, messages, gen):
         yield evt
 

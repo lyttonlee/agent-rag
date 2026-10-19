@@ -727,6 +727,28 @@ export async function getReactPrompts(reactMode?: ReactMode | null): Promise<Rea
   return (await resp.json()) as ReactPromptsResp
 }
 
+/**
+ * 保存 / 恢复深度推理提示词（admin 权限）。
+ *
+ * 语义与后端一致：``content`` 非空 = 保存覆盖（立即生效）；空串 = 恢复默认。
+ * 后端整批校验后再落库，任何一段非法会整批 400——前端据此提示用户。
+ */
+export async function saveReactPrompts(
+  prompts: { key: string; content: string }[],
+): Promise<{ saved: { key: string; content: string; source: string }[]; message: string }> {
+  const resp = await fetch('/v1/chat/react/prompts', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+    },
+    body: JSON.stringify({ prompts }),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data?.detail || `HTTP ${resp.status}`)
+  return data
+}
+
 // ============================ 智能问答（SSE，多轮会话） ============================
 /** 深度推理档位：fast=快速模式（低延迟）/ deep=深度模式（质量优先） */
 export type ReactMode = 'fast' | 'deep'
@@ -787,15 +809,29 @@ export interface ReactAnalysis {
 export interface ReactPromptItem {
   key: string
   name: string
+  /** 触发时机说明（理解一次 / 每轮决策 / 收尾生成 / 只读模板） */
   stage: string
+  /** 当前**生效**全文（已注入工具清单等运行时变量；自定义时为覆盖文本） */
   content: string
+  /** 代码内置默认全文（"恢复默认"与 diff 对比用） */
+  default_content: string
   variables: string[]
+  /** custom=已自定义 / default=内置默认 / builtin=只读（结构化逻辑） */
+  source: 'custom' | 'default' | 'builtin'
+  editable: boolean
 }
 
 export interface ReactPromptsResp {
   mode: string
+  /** 0 = 不限轮数（2026-10-19 起默认） */
   max_rounds: number
+  unlimited_rounds: boolean
+  /** 0 = 不限时长 */
   total_budget_ms: number
+  /** 连续 N 轮无新引用即强制收尾（取消轮数上限后的收敛护栏） */
+  no_progress_limit: number
+  retrieve_top_n: number
+  obs_hits: number
   tools: { name: string; description: string }[]
   prompts: ReactPromptItem[]
 }
@@ -829,7 +865,12 @@ export interface ChatHandlers {
   onReasoning?: (text: string) => void
   // ---- 深度推理（ReAct）事件：TAO 时间线数据源 ----
   /** ReAct 循环启动（档位参数与可用工具清单） */
-  onReactStart?: (info: { max_rounds: number; total_budget_ms: number; tools: string[] }) => void
+  onReactStart?: (info: {
+    max_rounds: number
+    unlimited_rounds?: boolean
+    total_budget_ms: number
+    tools: string[]
+  }) => void
   /** 提问理解结果（模型复述诉求 + 自述是否需要查库 + 候选方向） */
   onAnalysis?: (info: ReactAnalysis) => void
   /** 新一轮开始（时间线追加容器） */
@@ -974,7 +1015,9 @@ export function streamChat(opts: StreamChatOpts, handlers: ChatHandlers): AbortC
             // ---- 深度推理（ReAct）事件：老客户端无此分支，自动忽略 ----
             case 'react_start':
               handlers.onReactStart?.({
-                max_rounds: evt.max_rounds ?? 4,
+                max_rounds: evt.max_rounds ?? 0,
+                // 0 = 不限轮数（后端默认，2026-10-19）；老后端无该字段时按 0 推断
+                unlimited_rounds: evt.unlimited_rounds ?? (evt.max_rounds ?? 0) <= 0,
                 total_budget_ms: evt.total_budget_ms ?? 0,
                 tools: evt.tools ?? [],
               })

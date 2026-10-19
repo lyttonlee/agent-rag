@@ -78,14 +78,16 @@ def _install_base(monkeypatch, *, agent_enabled: bool = True, react_enabled: boo
         )
 
     async def fake_react_cfg(db):
-        # 用真实 ReactConfig（保留 for_mode 档位逻辑），仅改轮数/预算加速测试
+        # 用真实 ReactConfig（保留 for_mode 档位派生逻辑）。
+        # 2026-10-19 起轮数默认不限（0），这里**显式给硬上限**避免测试脚本
+        # 弹尽后无限重复最后一个决策导致用例挂死。
         from dataclasses import replace
 
         from app.services.agent.react_config import ReactConfig
 
         return replace(
             ReactConfig(), enabled=react_enabled,
-            fast_max_rounds=5, deep_max_rounds=5,
+            max_rounds=5,
         )
 
     monkeypatch.setattr(chat_service, "load_agent_config", fake_agent_cfg)

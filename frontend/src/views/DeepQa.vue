@@ -109,7 +109,13 @@ let controller: AbortController | null = null
 const listRef = ref<HTMLElement | null>(null)
 
 // ---- ReAct 状态（SSE 事件驱动）----
-const reactInfo = ref<{ max_rounds: number; total_budget_ms: number; tools: string[] } | null>(null)
+const reactInfo = ref<{
+  max_rounds: number
+  /** true = 不限轮数（后端默认 max_rounds=0） */
+  unlimited_rounds?: boolean
+  total_budget_ms: number
+  tools: string[]
+} | null>(null)
 const analysis = ref<ReactAnalysis | null>(null)
 const rounds = ref<ReactRound[]>([])
 const reactEnd = ref<{ rounds: number; stop_reason: string; stop_label?: string; citations_total: number; total_ms?: number } | null>(null)
@@ -429,13 +435,13 @@ onBeforeUnmount(() => {
         <span class="mode-chip" :class="{ off: !deepOn }">{{ deepOn ? '深度推理' : '普通问答' }}</span>
         <div class="spacer" />
 
-        <!-- 双档位：快速（低延迟）/ 深度（质量优先） -->
+        <!-- 双档位：轮数都不限，只影响检索广度（快速=窄召回，深度=宽召回） -->
         <el-radio-group
           v-model="reactMode" size="small" :disabled="!deepOn"
           @change="savePrefs"
         >
-          <el-radio-button value="fast">快速 2 轮</el-radio-button>
-          <el-radio-button value="deep">深度 5 轮</el-radio-button>
+          <el-radio-button value="fast">快速</el-radio-button>
+          <el-radio-button value="deep">深度</el-radio-button>
         </el-radio-group>
         <!-- 总开关：关闭即切回普通单轮检索直答 -->
         <el-tooltip content="关闭后走普通问答（单轮检索直答）" placement="top">
@@ -572,7 +578,7 @@ onBeforeUnmount(() => {
           :autosize="{ minRows: 1, maxRows: 4 }"
           resize="none"
           :placeholder="deepOn
-            ? `深度推理（${reactMode === 'fast' ? '快速 2 轮' : '深度 5 轮'}）：智能体自主决定是否检索与调用哪些工具，Enter 发送`
+            ? `深度推理（${reactMode === 'fast' ? '快速' : '深度'}·不限轮数）：智能体自主决定是否检索、调用哪些工具、何时收尾，Enter 发送`
             : '普通问答：输入问题，Enter 发送，Shift+Enter 换行'"
           @keyup.enter.exact.prevent="send()"
         />

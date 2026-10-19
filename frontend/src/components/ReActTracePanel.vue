@@ -24,7 +24,13 @@ const props = defineProps<{
   /** 循环收尾信息 */
   end?: { rounds: number; stop_reason: string; stop_label?: string; citations_total: number; total_ms?: number } | null
   /** 档位参数（来自 react_start） */
-  info?: { max_rounds: number; total_budget_ms: number; tools: string[] } | null
+  info?: {
+    max_rounds: number
+    /** true = 不限轮数（2026-10-19 起默认），前端据此显示"不限"而非比例 */
+    unlimited_rounds?: boolean
+    total_budget_ms: number
+    tools: string[]
+  } | null
   /** 历史 TAO 全链文本（与 rounds 二选一，用于消息回看） */
   traceText?: string | null
   /** 是否流式进行中（当前轮呼吸点 + 面板高亮） */
@@ -44,6 +50,7 @@ const STOP_LABEL: Record<string, string> = {
   final: '信息充分（模型主动结束）',
   max_rounds: '达到轮数上限',
   budget: '超出时间预算',
+  no_progress: '连续多轮无新材料，已强制收尾',
   parse_fail: '决策输出连续不可解析',
   decision_fail: '决策调用连续失败',
 }
@@ -144,6 +151,25 @@ const lastRunning = computed(() => {
   const rs = displayRounds.value
   return !!(rs.length && rs[rs.length - 1].running)
 })
+
+/**
+ * 是否不限轮数（2026-10-19 起后端默认 max_rounds=0）。
+ * 优先看后端显式标记，兼容旧后端只看 0 值——避免把"不限"显示成"0 轮"。
+ */
+const unlimitedRounds = computed(
+  () => props.info?.unlimited_rounds === true || (props.info?.max_rounds ?? 1) <= 0,
+)
+
+/** 轮数展示文案：不限轮数时不显示 "N/0"，只显示实际轮数 */
+const roundsText = computed(() => {
+  const total = endInfo.value?.rounds ?? displayRounds.value.length
+  if (unlimitedRounds.value || !props.info) return `${total} 轮`
+  return `${total}/${props.info.max_rounds} 轮`
+})
+
+/** 是否设置了时间预算（0 = 不限，不显示倒计时） */
+const hasBudget = computed(() => (props.info?.total_budget_ms ?? 0) > 0)
+
 </script>
 
 <template>
@@ -157,8 +183,9 @@ const lastRunning = computed(() => {
         </svg>
       </span>
       <span class="rp-ttl">深度推理过程</span>
-      <span v-if="endInfo" class="rp-count mono">
-        {{ endInfo.rounds }}/{{ info?.max_rounds ?? endInfo.rounds }} 轮
+      <span v-if="endInfo || info" class="rp-count mono">
+        {{ roundsText }}
+        <span v-if="unlimitedRounds" class="rp-unlimited">不限轮数</span>
         <i v-if="lastRunning" class="live-dot" />
       </span>
     </div>
@@ -198,7 +225,9 @@ const lastRunning = computed(() => {
       >
         <span class="tool-chip">{{ toolLabel(t) }}</span>
       </el-tooltip>
-      <span class="rp-budget text-muted">预算 {{ Math.round((info.total_budget_ms || 0) / 1000) }}s</span>
+      <span v-if="hasBudget" class="rp-budget text-muted">
+        预算 {{ Math.round((info?.total_budget_ms || 0) / 1000) }}s
+      </span>
     </div>
 
     <!-- ② TAO 轮次时间线：思考 / 行动 / 观察，全部完整多行展示 -->
@@ -293,6 +322,11 @@ const lastRunning = computed(() => {
 }
 .rp-ttl { color: var(--text-strong); font-weight: 600; }
 .rp-count { margin-left: auto; color: var(--text-faint); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+/* "不限轮数"徽标：悬停说明"由模型自行决定何时收尾" */
+.rp-unlimited {
+  padding: 0 5px; border-radius: 4px; font-size: 10.5px;
+  background: var(--brand-soft); color: var(--brand); font-family: var(--font-sans, inherit);
+}
 .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--brand); display: inline-block; animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 

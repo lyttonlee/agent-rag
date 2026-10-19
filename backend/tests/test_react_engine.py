@@ -81,12 +81,30 @@ def test_parse_analysis():
 
 
 def test_react_config_for_mode():
-    """档位解析：fast/deep 各自返回轮数与预算；非法档回落默认。"""
+    """档位解析（2026-10-19 语义变更）：档位只影响检索广度，轮数默认不限。
+
+    历史实现按档位给 2 轮/5 轮 + 60s/180s；取消轮数上限后档位改为
+    fast=窄召回、deep=宽召回，max_rounds/budget_ms 两档一致（默认 0=不限）。
+    """
     cfg = ReactConfig()
-    assert cfg.for_mode("fast") == (cfg.fast_max_rounds, cfg.fast_budget_ms)
-    assert cfg.for_mode("deep") == (cfg.deep_max_rounds, cfg.deep_budget_ms)
-    assert cfg.for_mode(None) == cfg.for_mode(cfg.default_mode)
-    assert cfg.for_mode("不存在的档位") == cfg.for_mode(cfg.default_mode)
+    fast, deep = cfg.for_mode("fast"), cfg.for_mode("deep")
+    # 轮数与预算不随档位变化（默认都不限）
+    assert fast.max_rounds == deep.max_rounds == 0
+    assert fast.budget_ms == deep.budget_ms == 0
+    # 档位差异体现在检索广度
+    assert fast.retrieve_top_n < deep.retrieve_top_n
+    assert fast.obs_hits < deep.obs_hits
+    # 缺省/非法档位回落默认档
+    assert cfg.for_mode(None).retrieve_top_n == cfg.for_mode(cfg.default_mode).retrieve_top_n
+    assert cfg.for_mode("不存在的档位").retrieve_top_n == cfg.for_mode(cfg.default_mode).retrieve_top_n
+    assert cfg.resolved_mode("不存在的档位") == cfg.default_mode
+
+
+def test_react_config_defaults_unlimited():
+    """红线（2026-10-19）：默认不设轮数/时长上限——0 表示"不限"，不是"零轮"。"""
+    cfg = ReactConfig()
+    assert cfg.max_rounds == 0 and cfg.budget_ms == 0
+    assert cfg.no_progress_limit >= 2, "取消轮数上限后必须有替代的收敛护栏"
 
 
 def test_normalize_query_strips_punctuation():
@@ -166,6 +184,15 @@ def _types(events: list[dict]) -> list[str]:
     return [e["type"] for e in events]
 
 
+def _cfg(max_rounds: int = 0, budget_ms: int = 0, **kw) -> ReactConfig:
+    """构造测试用配置。
+
+    注意语义（2026-10-19）：``max_rounds=0`` / ``budget_ms=0`` 表示**不限**，
+    不是"立刻结束"。护栏类测试必须显式给正数，否则循环不会因为该护栏退出。
+    """
+    return ReactConfig(max_rounds=max_rounds, budget_ms=budget_ms, **kw)
+
+
 @pytest.mark.asyncio
 async def test_react_two_round_finish(monkeypatch):
     """标准两轮：search → finish，事件序列与引用聚合正确。"""
@@ -187,7 +214,7 @@ async def test_react_two_round_finish(monkeypatch):
     cfg = ReactConfig()
     req = ChatRequest(query="对比 A 和 B 在华东区的销售")
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, req, cfg, 5, 180000, result)]
+    events = [e async for e in engine.run_react(None, req, _cfg(5, 180000), result)]
 
     # 事件序列：react_start → analysis → 轮1(round/thought/action/observation) → 轮2(round/thought) → react_end
     types = _types(events)
@@ -226,7 +253,10 @@ async def test_react_max_rounds_guard(monkeypatch):
 
     cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 3, 180000, result)]
+    # no_progress_limit 抬高，隔离本测试关注的"轮数硬闸"
+    events = [e async for e in engine.run_react(
+        None, ChatRequest(query="q"), _cfg(3, 180000, no_progress_limit=50), result
+    )]
 
     assert result.stop_reason == "max_rounds"
     assert result.rounds == 3
@@ -238,14 +268,42 @@ async def test_react_max_rounds_guard(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_react_budget_guard(monkeypatch):
-    """护栏：预算耗尽（budget_ms=0）在首轮前即收敛。"""
+    """护栏：**显式设置**预算且已超时 → 首轮前即收敛（stop=budget）。
+
+    注意：``budget_ms=0`` 现在的语义是"不限时长"，因此本测试改用极小预算 +
+    假时钟（每次取样 +10s），避免依赖真实耗时导致抖动。
+    """
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        clock["t"] += 10.0
+        return clock["t"]
+
+    monkeypatch.setattr(engine.time, "monotonic", fake_monotonic)
     _install(monkeypatch, [json.dumps({"restate": "单一事实查询", "needs_knowledge": True})])
-    cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 0, result)]
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 500), result)]
     assert result.stop_reason == "budget"
     assert _types(events).count("react_round") == 0  # 未进入任何轮次
     assert result.citations == []
+
+
+@pytest.mark.asyncio
+async def test_react_budget_zero_means_unlimited(monkeypatch):
+    """红线：budget_ms=0 表示不限时长（不能像旧实现那样"首轮即停"）。"""
+
+    async def tool(tool_name, args):
+        return engine.ToolResult(tool=tool_name, query=args["query"], hits=[_hit(1)])
+
+    _install(monkeypatch, [
+        json.dumps({"restate": "单一事实查询", "needs_knowledge": True}),
+        _decision("knowledge_search", "q1"),
+        _decision("finish", thought="够了"),
+    ], tool_impl=tool)
+    result = ReactRunResult()
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(0, 0), result)]
+    assert result.stop_reason == "final"
+    assert _types(events).count("react_round") == 2
 
 
 @pytest.mark.asyncio
@@ -254,7 +312,7 @@ async def test_react_parse_fail_guard(monkeypatch):
     _install(monkeypatch, [json.dumps({"restate": "单一事实查询", "needs_knowledge": True}), "非 JSON 输出 A", "非 JSON 输出 B"])
     cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 180000, result)]
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 180000), result)]
     assert result.stop_reason == "parse_fail"
     assert result.rounds == 2  # 失败两轮后退出
     # 第二次失败前执行过一次纠错回灌（provider 被调用 3 次：分析 + 2 轮决策）
@@ -267,7 +325,7 @@ async def test_react_decision_fail_guard(monkeypatch):
     _install(monkeypatch, [json.dumps({"restate": "单一事实查询", "needs_knowledge": True}), RuntimeError("boom"), RuntimeError("boom")])
     cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 180000, result)]
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 180000), result)]
     assert result.stop_reason == "decision_fail"
     assert result.citations == []
 
@@ -287,7 +345,7 @@ async def test_react_unknown_tool_and_missing_query(monkeypatch):
 
     cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 180000, result)]
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 180000), result)]
     notes = [e.get("note", "") for e in events if e["type"] == "observation"]
     assert any("未知工具" in n for n in notes)
     assert any("缺少 query" in n for n in notes)
@@ -308,7 +366,7 @@ async def test_react_tool_exception_is_note(monkeypatch):
 
     cfg = ReactConfig()
     result = ReactRunResult()
-    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 180000, result)]
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 180000), result)]
     notes = [e.get("note", "") for e in events if e["type"] == "observation"]
     assert any("工具执行异常" in n for n in notes)
     assert result.stop_reason == "final"
@@ -327,7 +385,7 @@ async def test_react_first_decision_sees_user_query(monkeypatch):
     ])
     cfg = ReactConfig()
     result = ReactRunResult()
-    [e async for e in engine.run_react(None, ChatRequest(query="安全生产通知的审批流程是什么"), cfg, 2, 60000, result)]
+    [e async for e in engine.run_react(None, ChatRequest(query="安全生产通知的审批流程是什么"), _cfg(2, 60000), result)]
 
     # 第一次决策调用（calls[1]）的历史中必须含用户原始问题
     first_decision_history = provider.calls[1]
@@ -337,7 +395,7 @@ async def test_react_first_decision_sees_user_query(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_react_no_progress_converges(monkeypatch):
-    """护栏：连续两轮无新命中后向决策历史注入收敛提示（引导 finish）。"""
+    """护栏：连续无新命中时先注入收敛提示（给模型纠偏机会）。"""
 
     async def empty_tool(tool_name, args):
         return engine.ToolResult(tool=tool_name, query=args["query"], hits=[], note="未检索到相关内容")
@@ -351,12 +409,73 @@ async def test_react_no_progress_converges(monkeypatch):
 
     cfg = ReactConfig()
     result = ReactRunResult()
-    [e async for e in engine.run_react(None, ChatRequest(query="q"), cfg, 5, 180000, result)]
+    [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(5, 180000), result)]
 
     # 第 3 次决策调用（即第 2 轮之后）的历史里应出现收敛提示
     last_decision_history = provider.calls[-1]
     joined = " ".join(m["content"] for m in last_decision_history)
-    assert "连续两轮未获得新材料" in joined and "不要拒答" in joined
+    assert "连续多轮未获得新材料" in joined and "不要拒答" in joined
+
+
+@pytest.mark.asyncio
+async def test_react_no_progress_hard_stop(monkeypatch):
+    """护栏（2026-10-19 新增）：取消轮数上限后，连续 N 轮无新材料必须强制收尾。
+
+    这是"不限轮 ≠ 无限空转"的保险丝：模型持续换关键词但一无所获时，
+    达到 no_progress_limit 即停（stop=no_progress），随后进入最终生成
+    （仍要完成任务、不拒答，由策略层保证）。
+    """
+
+    async def empty_tool(tool_name, args):
+        return engine.ToolResult(tool=tool_name, query=args["query"], hits=[], note="未检索到相关内容")
+
+    # 模型永远换关键词检索、永不 finish；无进展护栏必须兜住
+    _install(monkeypatch, [
+        json.dumps({"restate": "单一事实查询", "needs_knowledge": True}),
+        _decision("knowledge_search", "q1"),
+        _decision("knowledge_search", "q2"),
+        _decision("knowledge_search", "q3"),
+        _decision("knowledge_search", "q4"),
+        _decision("knowledge_search", "q5"),
+    ], tool_impl=empty_tool)
+
+    result = ReactRunResult()
+    events = [e async for e in engine.run_react(
+        None, ChatRequest(query="q"), _cfg(0, 0, no_progress_limit=3), result
+    )]
+    assert result.stop_reason == "no_progress"
+    assert result.rounds == 3, "第 3 轮达到无进展上限即收尾"
+    end = next(e for e in events if e["type"] == "react_end")
+    assert end["stop_reason"] == "no_progress" and "强制收尾" in end["stop_label"]
+    assert "无新材料" in result.trace_text
+
+
+@pytest.mark.asyncio
+async def test_react_unlimited_rounds_runs_until_finish(monkeypatch):
+    """红线（2026-10-19）：默认不限轮数——模型需要多少轮就做多少轮。
+
+    旧实现 fast=2/deep=5 会在第 2/5 轮硬截断；现在只有模型自己 finish
+    （或护栏触发）才停。本测试让模型连续检索 6 轮后 finish。
+    """
+    counter = {"n": 0}
+
+    async def tool(tool_name, args):
+        counter["n"] += 1
+        return engine.ToolResult(tool=tool_name, query=args["query"], hits=[_hit(counter["n"])])
+
+    script = [json.dumps({"restate": "多步排查", "needs_knowledge": True})]
+    script += [_decision("knowledge_search", f"q{i}") for i in range(1, 7)]
+    script += [_decision("finish", thought="材料已足够")]
+    _install(monkeypatch, script, tool_impl=tool)
+
+    result = ReactRunResult()
+    events = [e async for e in engine.run_react(None, ChatRequest(query="q"), _cfg(), result)]
+    assert result.stop_reason == "final"
+    assert result.rounds == 7, "第 7 轮才 finish，不限轮数时不能被提前截断"
+    assert _types(events).count("react_round") == 7
+    # react_start 必须显式告知客户端"不限轮数"
+    start = next(e for e in events if e["type"] == "react_start")
+    assert start["max_rounds"] == 0 and start["unlimited_rounds"] is True
 
 
 def test_build_trace_text_handles_failed_round():
@@ -404,7 +523,7 @@ async def test_react_history_injected_into_decision_prompt(monkeypatch):
     history = [("user", "安全生产有哪些要求"), ("assistant", "有三条规定")]
 
     async for _ in engine.run_react(
-        None, ChatRequest(query="第二条的具体要求是什么"), cfg, 3, 60000, result, history=history
+        None, ChatRequest(query="第二条的具体要求是什么"), _cfg(3, 60000), result, history=history
     ):
         pass
 
@@ -432,7 +551,7 @@ async def test_react_model_can_finish_without_any_tool(monkeypatch):
     result = ReactRunResult()
 
     events = [e async for e in engine.run_react(
-        None, ChatRequest(query="公文标题怎么写"), cfg, 5, 60000, result
+        None, ChatRequest(query="公文标题怎么写"), _cfg(5, 60000), result
     )]
 
     assert tool_calls == [], "模型未要求检索时不应调用任何工具"
@@ -466,7 +585,7 @@ async def test_react_model_can_read_document(monkeypatch):
     result = ReactRunResult()
 
     async for _ in engine.run_react(
-        None, ChatRequest(query="安全生产通知具体怎么规定的"), cfg, 3, 60000, result
+        None, ChatRequest(query="安全生产通知具体怎么规定的"), _cfg(3, 60000), result
     ):
         pass
 
@@ -489,7 +608,7 @@ async def test_react_understand_failure_does_not_block_loop(monkeypatch):
     result = ReactRunResult()
 
     events = [e async for e in engine.run_react(
-        None, ChatRequest(query="安全生产规定"), cfg, 3, 60000, result
+        None, ChatRequest(query="安全生产规定"), _cfg(3, 60000), result
     )]
 
     types = [e["type"] for e in events]
@@ -517,16 +636,71 @@ def test_analysis_never_gates_the_loop():
 
 
 def test_export_prompts_covers_all_stages():
-    """提示词管理面板数据源：四个阶段提示词齐全且含工具清单。"""
+    """提示词管理面板数据源：四个阶段齐全、含工具清单、区分来源与可编辑性。"""
     from app.services.agent.react_prompt import export_prompts
 
-    items = export_prompts("- knowledge_search：检索", 5)
+    items = export_prompts("- knowledge_search：检索", 0)
     keys = [i["key"] for i in items]
     assert keys == [
         "deep_prompt_understand", "deep_prompt_decision",
-        "deep_prompt_observation", "deep_prompt_final",
+        "deep_prompt_final", "deep_prompt_observation",
     ]
     decision = next(i for i in items if i["key"] == "deep_prompt_decision")
     assert "knowledge_search：检索" in decision["content"]
-    assert "5 轮" in decision["content"]
-    assert all(i["content"].strip() for i in items)
+    # 默认不限轮数：提示词里应写"不设轮数上限"而不是"5 轮"
+    assert "不设轮数上限" in decision["content"]
+    assert "5 轮" not in decision["content"]
+    # 每项都带默认值 + 来源 + 可编辑标记（前端"恢复默认"依赖它）
+    assert all(i["content"].strip() and i["default_content"].strip() for i in items)
+    assert decision["source"] == "default" and decision["editable"] is True
+    obs = next(i for i in items if i["key"] == "deep_prompt_observation")
+    assert obs["editable"] is False and obs["source"] == "builtin"
+
+
+def test_export_prompts_reflects_custom_override():
+    """配置覆盖后：面板返回覆盖文本并标注 source=custom（所见即所跑）。"""
+    from app.services.agent.react_prompt import export_prompts
+
+    items = export_prompts(
+        "- knowledge_search：检索",
+        0,
+        {
+            "deep_prompt_understand": "自定义理解提示",
+            "deep_prompt_decision": "自定义决策：{tool_lines}",
+            "deep_prompt_final": "",
+        },
+    )
+    by_key = {i["key"]: i for i in items}
+    assert by_key["deep_prompt_understand"]["content"] == "自定义理解提示"
+    assert by_key["deep_prompt_understand"]["source"] == "custom"
+    # 决策覆盖里的 {tool_lines} 必须被注入（否则模型不知道有哪些工具）
+    assert "- knowledge_search：检索" in by_key["deep_prompt_decision"]["content"]
+    assert by_key["deep_prompt_decision"]["source"] == "custom"
+    # 未覆盖的仍为默认
+    assert by_key["deep_prompt_final"]["source"] == "default"
+
+
+def test_decision_prompt_injects_round_rule_for_limited_and_unlimited():
+    """决策提示词的收尾规则：不限轮数 vs 设了硬上限，措辞必须不同。"""
+    from app.services.agent.react_prompt import build_decision_system
+
+    unlimited = build_decision_system(0, "- tool", "")
+    assert "不设轮数上限" in unlimited and "{round_rule}" not in unlimited
+    limited = build_decision_system(5, "- tool", "")
+    assert "本轮上限 5 轮" in limited
+
+
+def test_final_prompt_override_and_material_rule():
+    """最终生成提示词可覆盖；{material_rule} 按有无材料注入不同规则。"""
+    from app.services.agent.react_prompt import build_final_messages
+
+    no_material = build_final_messages("问题", [], [], [], system_override="规则：{material_rule}")
+    sys_no = no_material[0]["content"]
+    assert "不得拒答" in sys_no and "规则：" in sys_no
+
+    has_material = build_final_messages(
+        "问题", [], [Citation(chunk_id="c", document_id="d", title="T", snippet="s", score=1.0)],
+        [], system_override="规则：{material_rule}",
+    )
+    sys_yes = has_material[0]["content"]
+    assert "必须标注引用" in sys_yes and "不得拒答" not in sys_yes

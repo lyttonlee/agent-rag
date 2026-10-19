@@ -360,8 +360,9 @@ class ChatRequest(BaseModel):
     deep_reason: bool | None = Field(
         None, description="深度推理问答（ReAct TAO 循环）；缺省走配置中心开关（默认开启）"
     )
-    # 档位：fast=快速模式（2 轮/60s）/ deep=深度模式（5 轮/180s）；
-    # 缺省取配置中心 deep_default_mode。仅 deep_reason 生效时使用。
+    # 档位：fast=快速（检索广度小、低延迟）/ deep=深度（召回更宽、质量优先）；
+    # 缺省取配置中心 deep_default_mode。**轮数默认不限**（2026-10-19 起），
+    # 档位只影响每轮召回/注入条数，不影响轮数。仅 deep_reason 生效时使用。
     react_mode: str | None = Field(
         None, description="深度推理档位：fast（快速）/ deep（深度）；缺省取配置中心默认档"
     )

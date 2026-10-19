@@ -9,20 +9,26 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.contracts import ChatRequest
-from app.services.agent.react_config import load_react_config
+from app.services.agent.react_config import (
+    PROMPT_KEYS,
+    load_react_config,
+    save_react_prompt,
+)
 from app.services.agent.react_prompt import export_prompts
 from app.services.agent.react_tools import TOOL_DESCRIPTIONS, tool_lines
 from app.services.audit import actor_from_request
-from app.services.auth import Caller, get_caller
+from app.services.auth import Caller, get_caller, require_admin
 from app.services.chat import stream_chat
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
 
 
 @router.post("/stream", dependencies=[Depends(get_caller)])
@@ -72,25 +78,102 @@ async def chat_stream(
     )
 
 
-@router.get("/react/prompts", summary="深度推理提示词清单（提示词管理面板）")
+class ReactPromptPatch(BaseModel):
+    """单段提示词保存请求。
+
+    - ``content`` 为空字符串 = **恢复默认**（删除配置覆盖）；
+    - 长度上限 20000 字符（与服务端 ``PROMPT_MAX_CHARS`` 一致）。
+    """
+
+    key: str = Field(..., description="提示词键：deep_prompt_understand / deep_prompt_decision / deep_prompt_final")
+    content: str = Field("", description="提示词全文；空字符串表示恢复默认")
+
+
+class ReactPromptPatchBody(BaseModel):
+    """批量保存载荷（一次提交多段，原子性由逐条写入保证）。"""
+
+    prompts: list[ReactPromptPatch] = Field(..., description="待保存的提示词列表", min_length=1)
+
+
+@router.get(
+    "/react/prompts",
+    summary="深度推理提示词与运行参数（提示词管理面板）",
+    dependencies=[Depends(get_caller)],
+)
 async def react_prompts(
     react_mode: str | None = Query(None, description="档位 fast/deep；缺省用配置中心默认档"),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """返回深度推理各阶段提示词全文 + 可用工具清单。
+    """返回深度推理各阶段提示词全文 + 可用工具清单 + 生效运行参数。
 
-    供前端「提示词管理」面板展示：运维/用户可直接查看"模型到底被如何
-    指示"，无需翻代码。提示词为**运行时实际使用的那份**（工具清单与轮数
-    已按当前档位注入），因此面板内容与真实请求完全一致。
+    供前端「提示词管理」面板展示/编辑：运维可直接查看并调整"模型到底被
+    如何指示"，无需翻代码。提示词为**运行时实际生效的那份**（工具清单、
+    收尾规则已注入；若配置中心有自定义覆盖则返回覆盖版并标注
+    ``source="custom"``），因此面板内容与真实请求完全一致。
+
+    轮数语义（2026-10-19）：``max_rounds=0`` 表示**不限轮数**，
+    同时返回 ``unlimited_rounds=true`` 便于前端直接展示"不限"。
     """
     cfg = await load_react_config(db)
-    max_rounds, budget_ms = cfg.for_mode(react_mode)
+    mode = cfg.resolved_mode(react_mode)
+    eff = cfg.for_mode(mode)  # 档位派生：检索广度（轮数/时长不受档位影响）
     return {
-        "mode": (react_mode or cfg.default_mode),
-        "max_rounds": max_rounds,
-        "total_budget_ms": budget_ms,
+        "mode": mode,
+        "max_rounds": eff.max_rounds,          # 0 = 不限
+        "unlimited_rounds": eff.max_rounds <= 0,
+        "total_budget_ms": eff.budget_ms,      # 0 = 不限
+        "no_progress_limit": eff.no_progress_limit,
+        "retrieve_top_n": eff.retrieve_top_n,
+        "obs_hits": eff.obs_hits,
         "tools": [
             {"name": name, "description": desc} for name, desc in TOOL_DESCRIPTIONS.items()
         ],
-        "prompts": export_prompts(tool_lines(), max_rounds),
+        "prompts": export_prompts(
+            tool_lines(),
+            eff.max_rounds,
+            {
+                "deep_prompt_understand": eff.prompt_understand,
+                "deep_prompt_decision": eff.prompt_decision,
+                "deep_prompt_final": eff.prompt_final,
+            },
+        ),
     }
+
+
+@router.put(
+    "/react/prompts",
+    summary="保存 / 恢复深度推理提示词（admin）",
+    dependencies=[Depends(require_admin)],
+)
+async def update_react_prompts(body: ReactPromptPatchBody, db: AsyncSession = Depends(get_db)) -> dict:
+    """保存提示词覆盖（admin 专用）。
+
+    语义：
+    - ``content`` 非空 → upsert 到配置中心 ``category=agent``，**保存即生效**
+      （下次问答读取，无需重启）；
+    - ``content`` 为空 → 删除覆盖，**恢复代码内置默认**；
+    - 单段最长 20000 字符；未知 key 直接 400（防任意键污染配置库）。
+
+    失败语义：**任一段非法则整批不落库**（先全量校验，再逐条写入），
+    避免运维看到"部分保存成功"的中间态。
+    """
+    # 先全量校验（不写库），任何一段非法立即返回 400
+    for item in body.prompts:
+        if item.key not in PROMPT_KEYS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知提示词键：{item.key}（可用：{'、'.join(PROMPT_KEYS)}）",
+            )
+        if len(item.content or "") > 20000:
+            raise HTTPException(
+                status_code=400,
+                detail=f"提示词过长：{item.key} 共 {len(item.content)} 字符，上限 20000",
+            )
+
+    saved: list[dict] = []
+    for item in body.prompts:
+        try:
+            saved.append(await save_react_prompt(db, item.key, item.content))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"saved": saved, "message": "提示词已保存，立即生效"}
