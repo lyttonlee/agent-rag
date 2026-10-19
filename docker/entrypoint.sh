@@ -15,8 +15,8 @@ if command -v envsubst >/dev/null 2>&1; then
         < /etc/nginx/templates-default.conf \
         > /etc/nginx/conf.d/default.conf
 else
-    # 兜底：alpine 无 envsubst 时用 sed
-    sed "s|__BACKEND_UPSTREAM__|${BACKEND_UPSTREAM}|g" \
+    # 兜底：alpine 无 envsubst 时用 sed（转义 $ 防止被 shell 展开）
+    sed "s|\${BACKEND_UPSTREAM}|${BACKEND_UPSTREAM}|g" \
         /etc/nginx/templates-default.conf \
         > /etc/nginx/conf.d/default.conf
 fi

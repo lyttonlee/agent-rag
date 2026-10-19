@@ -16,19 +16,21 @@
 FROM node:22-bookworm-slim AS builder
 
 # pnpm 走淘宝镜像（可构建时 --build-arg PNPM_REGISTRY= 覆盖回官方源）
+# 注意：registry 实际由仓库 frontend/.npmrc 指定（与本机开发一致），此处 env 仅用于
+# corepack 下载 pnpm 本身；直接 `pnpm config set` 在含 pnpm-workspace.yaml 的目录会报
+# "packages field missing or empty"，故删去该命令。
 ARG PNPM_REGISTRY=https://registry.npmmirror.com
 ENV PNPM_REGISTRY=$PNPM_REGISTRY \
     COREPACK_NPM_REGISTRY=$PNPM_REGISTRY
 
-# corepack 从上述镜像下载 pnpm@9（lockfileVersion 9.0 对应 pnpm 9 系列）
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+# pnpm 与开发机同版本（本机 11.23.0，lockfileVersion 9.0 由其维护）
+RUN corepack enable && corepack prepare pnpm@11.23.0 --activate
 
 WORKDIR /build
-# 先拷依赖清单，命中层缓存（改业务代码不重装依赖）
-# pnpm-workspace.yaml 为构建脚本白名单配置，随依赖清单一起拷贝保持一致
-COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN pnpm config set registry $PNPM_REGISTRY \
-    && pnpm install --frozen-lockfile
+# 先拷依赖清单（含 .npmrc 的国内镜像配置），命中层缓存（改业务代码不重装依赖）
+# pnpm-workspace.yaml 为构建脚本白名单（allowBuilds），随包一起拷贝保持一致
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml frontend/.npmrc ./
+RUN pnpm install --frozen-lockfile
 
 # 再拷源码构建（vue-tsc --noEmit 类型门禁 + vite build）
 COPY frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts frontend/index.html ./
